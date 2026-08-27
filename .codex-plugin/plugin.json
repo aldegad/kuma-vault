@@ -1,0 +1,19 @@
+{
+  "name": "kuma-vault",
+  "version": "0.1.0",
+  "description": "Repo-agnostic knowledge-base compiler: frontmatter sync, lint (git pre-commit drift gate), search, FTS, sidecar, and provider-injected enrich. Bundles the retrieval and first-run-setup skills plus the `vault` CLI.",
+  "author": {
+    "name": "kuma-vault authors",
+    "url": "https://github.com/aldegad/kuma-vault"
+  },
+  "homepage": "https://github.com/aldegad/kuma-vault",
+  "repository": "https://github.com/aldegad/kuma-vault",
+  "license": "UNLICENSED",
+  "keywords": ["knowledge-base", "vault", "frontmatter", "search", "enrich"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "kuma-vault",
+    "shortDescription": "Knowledge-base compiler + retrieval",
+    "category": "Productivity"
+  }
+}

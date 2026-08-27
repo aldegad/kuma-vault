@@ -1,0 +1,403 @@
+#!/bin/bash
+# kuma-vault CLI — repo-agnostic knowledge-base compiler.
+#
+# Human surface: search/timeline/get/ingest/sync/lint/hook/index/<domain>. Engine-backed verbs are
+# dispatched to src/cli/cli.mjs as `vault-<verb>`; the git pre-commit drift gate and the
+# read-only domain/index shortcuts are handled here in pure bash (fs/git only, no engine).
+set -euo pipefail
+
+# Resolve the real location of this script (following symlinks) so the package root and its
+# own bin path are stable regardless of how `vault` was invoked (PATH, symlink, npm bin).
+SCRIPT_PATH="$(node -e 'const fs = require("node:fs"); process.stdout.write(fs.realpathSync(process.argv[1]));' "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+PKG_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CLI_MJS="$PKG_ROOT/src/cli/cli.mjs"
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+require_file() {
+  [ -f "$1" ] || die "not found: $1"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  kuma-vault search <query>        (or: vault search <query>)
+  kuma-vault timeline <query>
+  kuma-vault get <id|path> [more ids...]
+  kuma-vault ingest [source] [--section <s>] [--page <p>] [--project <slug>] [--bypass] [--dry-run] [--vault-dir <path>]
+  kuma-vault sync [--check] [--enrich] [--enrich-limit <n>] [--root <path>] [--profile <id>]
+  kuma-vault lint [--mode fast|full] [--root <path>] [--profile <id>] [--json] [files...]
+  kuma-vault hook install|uninstall|status --root <repo>
+  kuma-vault setup [--provider claude|codex] [--model <id>] [--star] [--repo <owner/repo>] [--yes]
+  kuma-vault graph [--out <path>] [--open]   Render the vault topology as an interactive HTML graph
+  kuma-vault index
+  kuma-vault <path>          Print a vault page (a file, <path>.md, or <dir>/README.md)
+
+Options:
+  --vault-dir <path>   Override the vault root (default for search/get/index: ~/.kuma/vault
+                       or KUMA_VAULT_DIR. sync/lint have NO default — they resolve the
+                       tree's root vault.config.json declaration, walking up from the cwd)
+  --root <path>        Repo-agnostic alias for --vault-dir (the tree to sync/lint)
+  --profile <id>       Contract override for an UNDECLARED tree only (kuma-vault | docs).
+                       A tree with a vault.config.json owns its contract; a disagreeing
+                       --profile is an error
+  --limit <n>          Max hits for search/timeline (default: 20)
+  --engine <e>         search/timeline engine: auto (default) | fts | scan
+  --format <f>         search/timeline output: text (default) | json
+  --mode <m>           vault lint: fast | full (default: full)
+  --check              vault sync: gate the tracked tree — report index/sidecar drift and
+                       would-enrich targets without writing tracked files. The out-of-tree
+                       `.fts/` search cache is NOT gated: a stale cache self-heals (rebuild)
+  --enrich             vault sync: fill missing/stale leaf frontmatter `description` via the configured provider
+  --enrich-limit <n>   vault sync: cap how many pages one enrich run may (re)generate
+  --json               Print results as JSON
+EOF
+}
+
+# Generic domain/page shortcut: `vault <path>` resolves a page under the vault root. A
+# directory maps to its README.md; a bare name falls back to <name>.md below. No hardcoded
+# topic aliases — the tree owns its own topology.
+resolve_domain_path() {
+  local alias="${1:?domain alias required}"
+  if [ -d "$VAULT_DIR/$alias" ]; then
+    printf '%s/%s/README.md\n' "$VAULT_DIR" "$alias"
+  else
+    printf '%s/%s\n' "$VAULT_DIR" "$alias"
+  fi
+}
+
+run_search_command() {
+  local mode="${1:?search mode required}"
+  shift
+  local search_engine=""
+  local -a query_parts=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --limit)
+        [ $# -ge 2 ] || die "vault $mode: --limit requires a value"
+        SEARCH_LIMIT="$2"
+        shift 2
+        ;;
+      --engine)
+        [ $# -ge 2 ] || die "vault $mode: --engine requires a value"
+        search_engine="$2"
+        shift 2
+        ;;
+      --json)
+        SEARCH_FORMAT="json"
+        shift
+        ;;
+      --format)
+        [ $# -ge 2 ] || die "vault $mode: --format requires a value"
+        SEARCH_FORMAT="$2"
+        shift 2
+        ;;
+      --vault-dir|--root)
+        [ $# -ge 2 ] || die "vault $mode: $1 requires a value"
+        VAULT_DIR="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        query_parts+=("$@")
+        break
+        ;;
+      --*)
+        die "vault $mode: unknown option '$1' (use -- before a query term that starts with --)"
+        ;;
+      *)
+        query_parts+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  [ ${#query_parts[@]} -gt 0 ] || die "$mode query required"
+  local -a engine_args=()
+  [ -n "$search_engine" ] && engine_args=(--engine "$search_engine")
+  node "$CLI_MJS" vault-search --vault-dir "$VAULT_DIR" --format "$SEARCH_FORMAT" --mode "$mode" \
+    --limit "$SEARCH_LIMIT" ${engine_args[@]+"${engine_args[@]}"} "--query=${query_parts[*]}"
+}
+
+VAULT_DIR="${KUMA_VAULT_DIR:-$HOME/.kuma/vault}"
+VAULT_DIR_EXPLICIT=""
+PROFILE=""
+SEARCH_FORMAT="text"
+SEARCH_LIMIT="20"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vault-dir|--root)
+      VAULT_DIR="${2:?vault dir required}"
+      VAULT_DIR_EXPLICIT="1"
+      shift 2
+      ;;
+    --profile)
+      PROFILE="${2:?profile id required}"
+      shift 2
+      ;;
+    --limit)
+      SEARCH_LIMIT="${2:?limit required}"
+      shift 2
+      ;;
+    --json)
+      SEARCH_FORMAT="json"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+[ $# -ge 1 ] || {
+  usage >&2
+  exit 1
+}
+
+COMMAND="$1"
+shift || true
+
+case "$COMMAND" in
+  search)
+    run_search_command search "$@"
+    ;;
+  timeline)
+    run_search_command timeline "$@"
+    ;;
+  get)
+    [ $# -ge 1 ] || die "get requires at least one id or path"
+    node "$CLI_MJS" vault-get --vault-dir "$VAULT_DIR" --format "$SEARCH_FORMAT" "$@"
+    ;;
+  ingest)
+    # The compiler implementation lives in the node CLI as `vault-ingest`; the shell
+    # wrapper owns the human `vault ingest` surface so it must not fall through to the
+    # generic page shortcut.
+    node "$CLI_MJS" vault-ingest --vault-dir "$VAULT_DIR" "$@"
+    ;;
+  sync)
+    SYNC_CHECK=""
+    SYNC_JSON=""
+    SYNC_ENRICH=""
+    SYNC_ENRICH_LIMIT=""
+    # Honor --root/--vault-dir/--profile after the subcommand (the natural position for
+    # `vault sync --check --root <path> --profile <id>`). Unrecognized args are fail-loud
+    # rather than silently dropped (No Silent Fallback).
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --check)
+          SYNC_CHECK="--check"
+          shift
+          ;;
+        --json)
+          SYNC_JSON="--json"
+          shift
+          ;;
+        --enrich)
+          SYNC_ENRICH="--enrich"
+          shift
+          ;;
+        --enrich-limit)
+          SYNC_ENRICH_LIMIT="--enrich-limit ${2:?enrich-limit required}"
+          shift 2
+          ;;
+        --vault-dir|--root)
+          VAULT_DIR="${2:?vault dir required}"
+          VAULT_DIR_EXPLICIT="1"
+          shift 2
+          ;;
+        --profile)
+          PROFILE="${2:?profile id required}"
+          shift 2
+          ;;
+        -h|--help)
+          # A help request must print usage and exit — never fall through to a write
+          # sync against the default vault (No Silent Fallback).
+          usage
+          exit 0
+          ;;
+        *)
+          die "vault sync: unexpected argument '$1' (run 'vault --help')"
+          ;;
+      esac
+    done
+    SYNC_PROFILE=""
+    [ -n "$PROFILE" ] && SYNC_PROFILE="--profile $PROFILE"
+    # sync has NO default root: only forward --vault-dir when explicitly given, so the
+    # node side resolves the tree's own vault.config.json declaration (walking up from
+    # the cwd) and fails loud when there is none (No Silent Fallback).
+    SYNC_ROOT=()
+    [ -n "$VAULT_DIR_EXPLICIT" ] && SYNC_ROOT=(--vault-dir "$VAULT_DIR")
+    node "$CLI_MJS" vault-sync ${SYNC_ROOT[@]+"${SYNC_ROOT[@]}"} $SYNC_CHECK $SYNC_JSON $SYNC_ENRICH $SYNC_ENRICH_LIMIT $SYNC_PROFILE
+    ;;
+  lint)
+    LINT_JSON=""
+    LINT_MODE=""
+    LINT_FILES=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --json)
+          LINT_JSON="--json"
+          shift
+          ;;
+        --mode)
+          LINT_MODE="--mode ${2:?mode required}"
+          shift 2
+          ;;
+        --vault-dir|--root)
+          VAULT_DIR="${2:?vault dir required}"
+          VAULT_DIR_EXPLICIT="1"
+          shift 2
+          ;;
+        --profile)
+          PROFILE="${2:?profile id required}"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        --*)
+          # Unknown flags are fail-loud. Non-flag arguments are legitimate file paths and
+          # still fall through to LINT_FILES below.
+          die "vault lint: unknown option '$1' (run 'vault --help')"
+          ;;
+        *)
+          LINT_FILES+=("$1")
+          shift
+          ;;
+      esac
+    done
+    LINT_PROFILE=""
+    [ -n "$PROFILE" ] && LINT_PROFILE="--profile $PROFILE"
+    # Same declaration-first resolution as sync: no default root for lint.
+    LINT_ROOT=()
+    [ -n "$VAULT_DIR_EXPLICIT" ] && LINT_ROOT=(--vault-dir "$VAULT_DIR")
+    node "$CLI_MJS" vault-lint ${LINT_ROOT[@]+"${LINT_ROOT[@]}"} $LINT_MODE $LINT_JSON $LINT_PROFILE ${LINT_FILES[@]+"${LINT_FILES[@]}"}
+    ;;
+  hook)
+    HOOK_ACTION="${1:-status}"
+    [ $# -ge 1 ] && shift || true
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --vault-dir|--root)
+          VAULT_DIR="${2:?vault dir required}"
+          VAULT_DIR_EXPLICIT="1"
+          shift 2
+          ;;
+        --profile)
+          PROFILE="${2:?profile id required}"
+          shift 2
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+    [ -n "$VAULT_DIR_EXPLICIT" ] || die "vault hook requires --root <repo> (the git repo to install the drift gate into)"
+    # The contract comes from the tree's own vault.config.json declaration — the hook
+    # never bakes a profile flag (declaration = SSoT; a baked flag could go stale).
+    [ -z "$PROFILE" ] || die "vault hook: --profile is retired — the contract comes from the tree's root vault.config.json declaration"
+    git -C "$VAULT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$VAULT_DIR is not a git repository"
+    HOOK_PATH="$(git -C "$VAULT_DIR" rev-parse --git-path hooks/pre-commit)"
+    case "$HOOK_PATH" in /*) : ;; *) HOOK_PATH="$VAULT_DIR/$HOOK_PATH" ;; esac
+    HOOK_MARKER="# kuma-vault-sync-hook"
+    VAULT_BIN_ABS="$SCRIPT_DIR/vault"
+    case "$HOOK_ACTION" in
+      install)
+        [ -f "$VAULT_DIR/vault.config.json" ] || die "no vault.config.json declaration at $VAULT_DIR — declare the tree's contract before installing the drift gate"
+        if [ -e "$HOOK_PATH" ] && ! grep -q "$HOOK_MARKER" "$HOOK_PATH" 2>/dev/null; then
+          die "pre-commit hook already exists at $HOOK_PATH and was not installed by vault hook. Move it aside or merge manually."
+        fi
+        # The declared tree may be a subdirectory of the git repo (e.g. kuma-brain/vault).
+        # Bake only the tree's structural path *relative to the git toplevel* so the hook
+        # follows the repo if it moves, while still pointing sync at the declared root.
+        GIT_TOP="$(git -C "$VAULT_DIR" rev-parse --show-toplevel)"
+        VAULT_DIR_PHYS="$(cd "$VAULT_DIR" && pwd -P)"
+        case "$VAULT_DIR_PHYS" in
+          "$GIT_TOP") TREE_REL="" ;;
+          "$GIT_TOP"/*) TREE_REL="${VAULT_DIR_PHYS#"$GIT_TOP"}" ;;
+          *) die "declared tree $VAULT_DIR_PHYS is not inside its git toplevel $GIT_TOP" ;;
+        esac
+        mkdir -p "$(dirname "$HOOK_PATH")"
+        cat > "$HOOK_PATH" <<HOOK
+#!/bin/sh
+$HOOK_MARKER — regenerate via: vault hook install --root <tree>
+# Idempotent knowledge-base drift gate: blocks a commit when a TRACKED derivation would change
+# — a folder README vault-index region or a binary sidecar (\`vault sync --check\`). Run
+# \`vault sync --root <tree>\` to regenerate them, then re-commit. The out-of-tree \`.fts/\`
+# search cache is not gated: it self-heals in place, so another session's edit never blocks
+# this commit. The tree's contract comes from its root vault.config.json declaration.
+ROOT="\$(git rev-parse --show-toplevel)$TREE_REL"
+exec "$VAULT_BIN_ABS" sync --check --root "\$ROOT"
+HOOK
+        chmod +x "$HOOK_PATH"
+        printf 'Installed pre-commit drift gate: %s (contract: vault.config.json declaration)\n' "$HOOK_PATH"
+        # The gate heals the `.fts/` search cache in place, so it writes there on every commit
+        # attempt. A tree that does not ignore that path would see the cache turn up as untracked
+        # repo noise — say so at install time rather than let it be discovered mid-commit.
+        if ! git -C "$VAULT_DIR" check-ignore -q ".fts/" 2>/dev/null; then
+          printf 'note: %s/.fts/ is not git-ignored. The gate rebuilds that derived search cache in place — add `%s.fts/` to .gitignore so it stays out of the repo.\n' \
+            "$VAULT_DIR" "${TREE_REL#/}${TREE_REL:+/}" >&2
+        fi
+        ;;
+      uninstall)
+        if [ -e "$HOOK_PATH" ] && grep -q "$HOOK_MARKER" "$HOOK_PATH" 2>/dev/null; then
+          rm -f "$HOOK_PATH"
+          printf 'Removed vault-sync pre-commit hook: %s\n' "$HOOK_PATH"
+        else
+          printf 'No vault-sync pre-commit hook to remove at %s\n' "$HOOK_PATH"
+        fi
+        ;;
+      status)
+        if [ -e "$HOOK_PATH" ] && grep -q "$HOOK_MARKER" "$HOOK_PATH" 2>/dev/null; then
+          printf 'installed: %s\n' "$HOOK_PATH"
+          grep "$HOOK_MARKER" "$HOOK_PATH"
+        else
+          printf 'not installed: %s\n' "$HOOK_PATH"
+          exit 1
+        fi
+        ;;
+      *)
+        die "vault hook: unknown action '$HOOK_ACTION' (install|uninstall|status)"
+        ;;
+    esac
+    ;;
+  setup)
+    # Interactive plugin-style setup. Forward the remaining flags verbatim to the node CLI,
+    # which owns the readline prompts (TTY passes through inherited stdio) and the config
+    # write. (The hook-install step takes no profile — the contract comes from the target
+    # repo's vault.config.json declaration.)
+    node "$CLI_MJS" vault-setup "$@"
+    ;;
+  graph)
+    # Render the vault topology as an interactive node-link graph (self-contained HTML).
+    # Forwards --out/--open verbatim; defaults to <vault>/.graph/topology.html.
+    node "$CLI_MJS" vault-graph --vault-dir "$VAULT_DIR" "$@"
+    ;;
+  index)
+    require_file "$VAULT_DIR/README.md"
+    cat "$VAULT_DIR/README.md"
+    ;;
+  *)
+    DOMAIN_PATH="$(resolve_domain_path "$COMMAND")"
+    if [ ! -f "$DOMAIN_PATH" ] && [ -f "${DOMAIN_PATH}.md" ]; then
+      DOMAIN_PATH="${DOMAIN_PATH}.md"
+    fi
+    require_file "$DOMAIN_PATH"
+    cat "$DOMAIN_PATH"
+    ;;
+esac
