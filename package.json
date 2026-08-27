@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "description": "Compiler vault engine: a repo-agnostic knowledge-base compiler (frontmatter parser, sync, lint, search, FTS, sidecar, enrich) with a git pre-commit drift gate.",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
+  "author": "Soohong Kim <aldegad@gmail.com> (https://github.com/aldegad)",
   "private": true,
   "engines": {
     "node": ">=22.5"
