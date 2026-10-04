@@ -389,7 +389,7 @@ const LAYER_META = [
     why: "`type`(special/decisions·special/dispatch-log·sidecar·tech…)·`kind` 스키마 분류 필드.",
     role: "문서의 '종류/역할'로 묶음 — 결정·디스패치로그·사이드카 같은 특수 파일 계약을 드러낸다." },
   { key: "project", label: "프로젝트", color: "#3f7fd6", rest: 66, k: 0.03, on: false,
-    why: "`project:` frontmatter — 이 산출물이 속한 프로젝트 슬러그 (kuma-studio·farmers-story…).",
+    why: "`project:` frontmatter — 이 산출물이 속한 프로젝트 슬러그 (acme-app·acme-ops…).",
     role: "프로젝트별 산출물을 한 허브로 묶는다. plans 서브트리가 서로 연결되는 주 경로." },
   { key: "planline", label: "플랜 계보 (parent_plan)", color: "#22a06b", rest: 52, k: 0.04, on: false,
     why: "`parent_plan:` — 플랜이 자신의 부모 플랜을 가리키는 체인 (plan id `<project>/<stem>`).",

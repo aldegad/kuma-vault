@@ -4,6 +4,11 @@ Read `inbox/` (or an explicit source), file it under the right canonical owner, 
 
 > **Core invariant:** canonical-owner-first. New material is never dropped into a top-level `raw/`. If the owner is unclear, put it in `inbox/` with owner/TTL/next-action; results are preserved in the `results/` evidence archive; `projects/<slug>.md` is a thin summary.
 
+For facts verified during search, apply the claim-level source, freshness and
+history-preservation rules in [information retrieval](info-retrieval.md#4-answer-then-refresh-reusable-knowledge).
+A document's `updated` field does not replace a claim's `verified_at`. Refresh
+only successfully checked claims, including their timestamps when still unchanged.
+
 ## Usage
 
 ```
@@ -30,24 +35,7 @@ vault ingest --bypass                     unattended mode. no questions, best gu
 | `--signal task-done` | Send a signal on completion (enables guarded-ingest mode) |
 | `--stamp-dir <path>` | Stamp directory used to de-duplicate ingest |
 
-## Vault directory structure
-
-```
-<vault>/                  (default ~/.kuma/vault, or $KUMA_VAULT_DIR)
-├── memos/                User favorites (not a background-ingest target)
-├── inbox/                Staging with owner/TTL/next-action, awaiting triage
-├── results/              Dispatch result / evidence archive
-├── domains/              Domain knowledge
-├── projects/             Thin canonical project summaries
-│   └── <slug>.project-decisions.md   Per-project decision memory (special file)
-├── learnings/            Repeatable insights, debugging patterns
-├── docs/                 Reference docs (model specs, etc.)
-├── images/               Image archive
-├── README.md             Topology entry point — folder README generated vault-index (ingest regenerates it)
-├── log.md                Append-only change history (updated)
-├── schema.md             Operating rules (SSoT — always consult on ingest, if present)
-└── [Root support files]  architecture.md / decisions.md / dispatch-log.md (runtime ledger)
-```
+Tree layout and special-file ownership: [layout](layout.md).
 
 ## Ingest procedure (fixed order)
 
@@ -73,16 +61,6 @@ Read the content and choose a target directory by these criteria.
 | the vault owner's operational rules / debugging patterns | rules live outside the vault (the host repo's decision log for decisions, the owning skill for procedures) · `learnings/` (repeatable insights/debugging) |
 | benchmarks / performance measurements | `learnings/` |
 | system ontology / design principles | `learnings/` (a dedicated page) |
-
-### Quick-classification examples
-
-| Incoming source | Preferred target | Why |
-|-----------------|------------------|-----|
-| "research this site" write-up | `domains/<slug>.md` | SSoT about a specific external service/company/product |
-| "how far did this project get?" result | `projects/<slug>.md` | keep only the current-state summary as canonical |
-| "this incident's root cause / recovery steps" | `learnings/` | a reusable debugging pattern / operating insight |
-| "code style, QA principles, browser-use rules" | host repo `docs/operations/` | public, repeatedly executed operating rules |
-| a doc mixing domain explanation and project status | `projects/<slug>.md` first, extract only the reusable domain knowledge | keep the project canonical so execution context is not lost; promote only the reusable part to a domain |
 
 ### Step 3 — decide whether to promote to a canonical page
 
@@ -131,7 +109,7 @@ source_grade: {foundation|supporting|exploratory|historical}   # optional — re
 `index.md` is retired. Topology is expressed by each folder's `README.md` `<!-- vault-index:start/end -->` generated region, and the ingest tooling (`rewriteIndex`) **regenerates** the affected regions automatically:
 - a new/updated page must be reachable from its parent folder `README.md`. A canonical page is picked up by the generated `vault-index`; exceptions needing curated prose links (runtime ledgers, etc.) get a direct prose link.
 - a result archive is preserved as `results/` evidence only. Do not build a flat cross-reference dump in the root README (retired).
-- broken links / stale regions are repaired by re-running `vault curate` or `rewriteIndex`.
+- repair broken links using [curate](curate.md); regenerate stale regions with `vault sync --root <absolute-target-tree>`.
 
 ### Step 5 — append to log.md
 
@@ -153,6 +131,7 @@ log.md append: {one line}
 
 - Top-level `raw/` is removed. New and existing evidence go owner-local (`_assets`/`_sources`/`_evidence`), into `results/`, or into a TTL'd `inbox/` only.
 - **Do not delete** existing page content — though a legacy ingest block that breaks the project-summary contract is a removal target.
+- Ingest into an **existing** page owns only `## Summary / ## Details / ## Related`. Everything else the page already holds — prose above the first `##`, an H1, tables, and any other `##` section — is carried forward verbatim in its original order; the managed sections the page lacked are appended after it. Preserved text is carried line for line: blank lines at a section's edges are dropped, indentation (an indented code block on a section's first line) is kept. A body the tool cannot rewrite losslessly is **refused before any write** with a non-zero exit — nothing is snapshotted, logged, or scaffolded. Refused shapes: duplicate `##` headings; a `## ` line inside a code fence (``` or ~~~, managed or not — the splitter is not fence-aware and would treat it as a real section); a code fence that is never closed. Fences that contain no `## ` line are preserved as ordinary text. `inspectExistingPageBodyShape(body)` is the read-only inspector behind that decision.
 - Special files (`dispatch-log.md`, `decisions.md`) are not overwritten by ingest — dispatch-log is owned by the lifecycle hook, decisions is `user-direct` only.
 - `<vault>/memos/` is the user-owned favorites layer. Background ingest does not write there.
 - A file pulled from `inbox/` is removed or marked with a `_done` suffix after ingest. TTL-expired entries are not left dangling; they are reported as a failure state.
@@ -161,17 +140,13 @@ log.md append: {one line}
 
 ## Current implementation notes
 
-- The `vault-ingest` CLI supports `result-file`, `result <task-id>`, batch `inbox/` processing, a plain file, a `URL`, and direct `raw text` ingest.
+- The `vault ingest` CLI supports `result-file`, `result <task-id>`, batch `inbox/` processing, a plain file, a `URL`, and direct `raw text` ingest.
 - `--full-auto` is the default (omitting the flag behaves identically). When routing is ambiguous it shows candidates (up to 3) and asks for a number. In a non-TTY environment (pipe, worker) it throws automatically — you must pass `--bypass` or an explicit `--section`/`--page`. Unattended workers/cron pass `--bypass` to proceed without questions.
 - When an ingest actually writes, it runs an automatic `fast lint` right after on the updated page and the affected folder README / `log.md`.
 - Result auto-ingest is evidence-preserving. The default path updates only `results/`, the affected folder README `vault-index`, and `log.md`; it does not grow `projects/<slug>.md` on its own.
 - Manual canonical promotion is allowed only with an explicit override: `--page ...` or `--section ...`.
 - Target classification runs in the order: **explicit override (`--section`, `--page`) > project detection > learnings/domains heuristic**.
 - The auto-classification is a keyword / project-id heuristic, not an LLM judgment. In `--full-auto` it confirms ambiguous hits with the user; in `--bypass` it applies the best guess directly.
-- Repairing broken source paths, duplicate pages, and canonical re-org in the existing vault is the `curate` subcommand's scope (see `references/curate.md`).
+- Repairing broken source paths, duplicate pages, and canonical re-org in the existing vault is the `curate` operating procedure's scope (see [curate](curate.md)).
 - Skill docs are SSoT in their source repo; no managed skill mirror is auto-created in the vault.
-- Routine post-ingest checks are done with `vault-lint --mode full`.
-
-## Tools
-
-Read, Edit, Write, Glob, Grep, Bash(date)
+- Routine post-ingest checks use `vault lint --mode full --root <absolute-target-tree>`, with the same target tree used for ingest.

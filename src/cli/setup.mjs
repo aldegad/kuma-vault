@@ -1,6 +1,9 @@
 // `kuma-vault setup` — interactive, plugin-style setup for the kuma-vault distribution.
 // `vault setup` remains a short alias for the same binary.
 //
+// Storage (`--storage local|oracle|remote`, `--add-store <id>`) runs first and only from flags;
+// it lives in setup-storage.mjs. The provider and star steps below are unchanged.
+//
 // Two surfaces, one deterministic core (see docs/design.md §9 and docs/setup.md):
 //   - A human runs `kuma-vault setup` in a TTY: node:readline/promises prompts present the
 //     choices (enrich provider, GitHub star, optional git-hook install).
@@ -25,6 +28,7 @@ import {
 } from "../enrich-adapters/provider-adapter.mjs";
 import { resolveEnrichConfigPath } from "./enrich-config.mjs";
 import { readOptionalString } from "./cli-options.mjs";
+import { parseStorageOptions, runStorageSetup } from "./setup-storage.mjs";
 
 // The kuma-vault distribution's own canonical GitHub repo — the target of the optional
 // star-ask. This is the TOOL's identity, not the consumer's cwd repo: starring the cwd
@@ -159,11 +163,23 @@ function installPrecommitHook({ root, runCommand = defaultRunCommand }) {
 
 export async function commandVaultSetup(
   options = {},
-  { input = process.stdin, output = process.stdout, runCommand = defaultRunCommand } = {},
+  { input = process.stdin, output = process.stdout, runCommand = defaultRunCommand, env = process.env } = {},
 ) {
   const out = (line = "") => output.write(`${line}\n`);
   const configPath = readOptionalString(options, "config") ?? resolveEnrichConfigPath();
   const interactive = Boolean(input?.isTTY) && options.yes !== true;
+
+  // Storage first: where the vault lives. A storage-only run (no provider, non-interactive) ends here.
+  const storagePlan = parseStorageOptions(options);
+  let storage = null;
+  if (storagePlan) {
+    storage = await runStorageSetup(storagePlan, { env, log: out });
+    if (storagePlan.dryRun || (!interactive && !readOptionalString(options, "provider"))) {
+      if (!storagePlan.dryRun && !storage.already) out("Storage set up. Choose the enrich provider next: kuma-vault setup --provider <claude|codex> --yes");
+      return { storage };
+    }
+    out("");
+  }
 
   let provider = readOptionalString(options, "provider");
   let model = readOptionalString(options, "model");
@@ -212,8 +228,8 @@ export async function commandVaultSetup(
     // Non-interactive (agent / CI): the provider must be explicit — no silent default.
     if (!provider) {
       throw new Error(
-        "kuma-vault setup (non-interactive): --provider <" + SETUP_PROVIDERS.join("|") + "> is required. " +
-          "Run in a terminal for interactive setup, or pass --provider.",
+        "kuma-vault setup (non-interactive): --provider <" + SETUP_PROVIDERS.join("|") + "> or --storage <" +
+          "local|oracle|remote> is required. Run in a terminal for interactive setup, or pass the flags.",
       );
     }
     wantStar = options.star === true; // star only on an explicit opt-in flag

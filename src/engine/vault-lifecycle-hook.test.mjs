@@ -8,6 +8,7 @@ import { runVaultLifecycleHook, parseTaskFileMetadata } from "./vault-lifecycle-
 import { parseFrontmatterDocument } from "./vault-ingest.mjs";
 
 async function writeVaultLifecycleStubFiles(vaultDir) {
+  await writeFile(join(vaultDir, "vault.config.json"), JSON.stringify({ profile: "kuma-vault" }), "utf8");
   await writeFile(
     join(vaultDir, "dispatch-log.md"),
     `---
@@ -49,7 +50,7 @@ fixture
 
 async function createTaskFile(taskPath, overrides = {}) {
   const fm = {
-    id: "tookdaki-20260409-180729",
+    id: "nova-20260409-180729",
     project: "acme-app",
     initiator: "surface:1",
     worker: "surface:18",
@@ -83,12 +84,12 @@ describe("runVaultLifecycleHook", { timeout: 20000 }, () => {
     const root = await mkdtemp(join(tmpdir(), "kuma-vault-hook-"));
     tempRoots.push(root);
     const taskPath = join(root, "demo.task.md");
-    await createTaskFile(taskPath, { id: "tookdaki-20260413-045000" });
+    await createTaskFile(taskPath, { id: "nova-20260413-045000" });
 
     const metadata = parseTaskFileMetadata(taskPath);
     expect(metadata).toMatchObject({
       taskFile: taskPath,
-      id: "tookdaki-20260413-045000",
+      id: "nova-20260413-045000",
       project: "acme-app",
       worker: "surface:18",
       thread_id: "discord:thread-123",
@@ -123,7 +124,7 @@ describe("runVaultLifecycleHook", { timeout: 20000 }, () => {
 
     const dispatchLog = await readFile(join(vaultDir, "dispatch-log.md"), "utf8");
 
-    expect(dispatchLog).toContain("task_id=tookdaki-20260409-180729");
+    expect(dispatchLog).toContain("task_id=nova-20260409-180729");
     expect(dispatchLog).toContain("state=dispatched");
     expect(dispatchLog).toContain("state=worker-done");
     expect(dispatchLog).toContain("state=awaiting-qa");
@@ -187,7 +188,7 @@ describe("runVaultLifecycleHook", { timeout: 20000 }, () => {
     const taskPath = join(root, "warn.task.md");
     await mkdir(vaultDir, { recursive: true });
     await writeVaultLifecycleStubFiles(vaultDir);
-    await createTaskFile(taskPath, { id: "tookdaki-20260409-190014", signal: "acme-app-warn-done", thread_id: "discord:thread-warn", channel_id: "discord:thread-warn" });
+    await createTaskFile(taskPath, { id: "nova-20260409-190014", signal: "acme-app-warn-done", thread_id: "discord:thread-warn", channel_id: "discord:thread-warn" });
 
     // Corrupt decisions.md boot_priority so fast-lint produces a warning.
     await writeFile(
@@ -220,7 +221,26 @@ fixture
     expect(warnings.some((warning) => warning.message.includes("fast lint failed for decisions.md"))).toBe(true);
 
     const dispatchLog = await readFile(join(vaultDir, "dispatch-log.md"), "utf8");
-    expect(dispatchLog).toContain("task_id=tookdaki-20260409-190014");
+    expect(dispatchLog).toContain("task_id=nova-20260409-190014");
+  });
+
+  // The hook passes no contract: its fast lint (the special files) reads the tree's own
+  // declaration, so a tree it cannot resolve a contract for is a warning, never a quiet pass.
+  it("reports a tree with no declaration as a lint runtime warning, not a pass", async () => {
+    const root = await mkdtemp(join(tmpdir(), "kuma-vault-hook-"));
+    tempRoots.push(root);
+
+    const vaultDir = join(root, "vault");
+    const taskPath = join(root, "undeclared.task.md");
+    await mkdir(vaultDir, { recursive: true });
+    await writeVaultLifecycleStubFiles(vaultDir);
+    await rm(join(vaultDir, "vault.config.json"));
+    await createTaskFile(taskPath, { id: "nova-20260409-190014" });
+
+    const { warnings } = await runVaultLifecycleHook({ event: "dispatched", taskFile: taskPath, vaultDir });
+
+    const runtime = warnings.find((warning) => warning.key === "fast-lint:runtime-error");
+    expect(runtime?.message).toMatch(/No vault\.config\.json declaration at .* and no contract given/u);
   });
 
   it("short-circuits when KUMA_DISABLE_VAULT_HOOK=1 is set", async () => {
@@ -231,7 +251,7 @@ fixture
     const taskPath = join(root, "disabled.task.md");
     await mkdir(vaultDir, { recursive: true });
     await writeVaultLifecycleStubFiles(vaultDir);
-    await createTaskFile(taskPath, { id: "tookdaki-20260409-190014" });
+    await createTaskFile(taskPath, { id: "nova-20260409-190014" });
 
     const previous = process.env.KUMA_DISABLE_VAULT_HOOK;
     process.env.KUMA_DISABLE_VAULT_HOOK = "1";
@@ -251,7 +271,7 @@ fixture
     }
 
     const dispatchLog = await readFile(join(vaultDir, "dispatch-log.md"), "utf8");
-    expect(dispatchLog).not.toContain("tookdaki-20260409-190014");
+    expect(dispatchLog).not.toContain("nova-20260409-190014");
   });
 
   it("ignores unknown events without writing vault files", async () => {
@@ -272,6 +292,6 @@ fixture
 
     expect(result).toEqual({ warnings: [] });
     const dispatchLog = await readFile(join(vaultDir, "dispatch-log.md"), "utf8");
-    expect(dispatchLog).not.toContain("tookdaki-20260409-180729");
+    expect(dispatchLog).not.toContain("nova-20260409-180729");
   });
 });

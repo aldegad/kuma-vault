@@ -1,7 +1,7 @@
 // Project attribution (engine-owned, pure).
 //
 // The host used to supply project ids by reading its own `~/.kuma/projects.json`
-// registry + package.json + configured defaults (the C4 seam). That data source is
+// registry + package.json + configured defaults (the project-registry seam). That data source is
 // host-specific, so the engine takes the *resolved* list of known project ids as an
 // injected parameter instead. On a generic tree the list is empty and no source is
 // attributed to a project. The host passes its own resolved list in.

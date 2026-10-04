@@ -42,6 +42,7 @@ describe("cross-store pointer lint", () => {
   async function writeSourceVault(root, body) {
     const vaultDir = join(root, "src-vault");
     await mkdir(vaultDir, { recursive: true });
+    await writeFile(join(vaultDir, "vault.config.json"), JSON.stringify({ profile: "kuma-vault" }), "utf8");
     await writeFile(
       join(vaultDir, "note.md"),
       `---\ntitle: Note\ncreated: 2026-07-29T10:00:00Z\nupdated: 2026-07-29T10:00:00Z\n---\n\n## Body\n\n${body}\n`,
@@ -118,7 +119,7 @@ describe("cross-store pointer lint", () => {
       "URL `https://example.com/a/b`, aspect `16:9`, time `12:30`, config `key: value`.",
       // Real-world classes seen in the trees: mail headers and URI schemes whose
       // value merely looks path-like must NOT be treated as cross-store pointers.
-      "Mail `to:alex@example.com`, `from:partner.example`, `forward:x@gmail.com`.",
+      "Mail `to:user@example.com`, `from:partner.example`, `forward:x@gmail.com`.",
       "URI `file:../../shared-skills`, `data:image/png;base64,AAAA`.",
       "A real one resolves: `acme-ops:people/인명록.md`.",
       "",

@@ -51,6 +51,7 @@ async function scaffoldVault() {
   const tempRoot = await mkdtemp(join(tmpdir(), "kuma-vault-sidecar-"));
   const vaultDir = join(tempRoot, "vault");
   await mkdir(join(vaultDir, "domains", "tools"), { recursive: true });
+  await writeFile(join(vaultDir, "vault.config.json"), JSON.stringify({ profile: "kuma-vault" }), "utf8");
   await writeFile(
     join(vaultDir, "README.md"),
     "---\ntitle: Kuma Vault\nstatus: active\n---\n\n# Kuma Vault\n\n## Vault Index\n\n<!-- vault-index:start -->\n\n<!-- vault-index:end -->\n",

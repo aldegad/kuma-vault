@@ -198,13 +198,25 @@ export function stringifyFrontmatter(frontmatter) {
   return `---\n${lines.join("\n")}\n---`;
 }
 
-function splitSections(body) {
-  const normalized = normalizeLineEndings(body).trim();
-  if (!normalized) {
+// Drops blank lines at both edges of a line list but never touches the lines that remain —
+// unlike `String#trim()`, which also strips the indentation of the first and last line and
+// so turns an indented code block on a section's first line into plain prose.
+function stripBlankEdgeLines(lines) {
+  let start = 0;
+  let end = lines.length;
+  while (start < end && lines[start].trim() === "") start += 1;
+  while (end > start && lines[end - 1].trim() === "") end -= 1;
+  return lines.slice(start, end);
+}
+
+function splitSections(body, { preserveIndent = false } = {}) {
+  const finish = (lines) => (preserveIndent ? stripBlankEdgeLines(lines).join("\n") : lines.join("\n").trim());
+  const normalized = normalizeLineEndings(body);
+  const lines = preserveIndent ? stripBlankEdgeLines(normalized.split("\n")) : normalized.trim().split("\n");
+  if (lines.length === 0 || (lines.length === 1 && lines[0] === "")) {
     return [];
   }
 
-  const lines = normalized.split("\n");
   const sections = [];
   let current = { heading: null, lines: [] };
 
@@ -214,7 +226,7 @@ function splitSections(body) {
       if (current.heading || current.lines.length > 0) {
         sections.push({
           heading: current.heading,
-          content: current.lines.join("\n").trim(),
+          content: finish(current.lines),
         });
       }
       current = { heading: headingMatch[1].trim(), lines: [] };
@@ -226,10 +238,43 @@ function splitSections(body) {
 
   sections.push({
     heading: current.heading,
-    content: current.lines.join("\n").trim(),
+    content: finish(current.lines),
   });
 
   return sections;
+}
+
+// Fenced code blocks (``` or ~~~, CommonMark rules: up to three spaces of indent, a closing
+// fence of the same character at least as long as the opener). `splitSections` treats every
+// `## ` line as a heading regardless of fences, so a `## Summary` pasted inside a fence would
+// be handled as the managed section — the closing fence and whatever follows it were then
+// rewritten away with exit 0 (2026-09-12). This scan does not make the splitter fence-aware;
+// it only reports what would make a keyed rewrite lossy so the writer can refuse.
+function findFenceHazards(lines) {
+  const hazards = [];
+  let fence = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (fence) {
+      const close = line.match(/^ {0,3}(`{3,}|~{3,})\s*$/u);
+      if (close && close[1][0] === fence.char && close[1].length >= fence.length) {
+        fence = null;
+        continue;
+      }
+      if (/^##\s+\S/u.test(line)) {
+        hazards.push(`"${line.trim()}" at body line ${index + 1} sits inside the code fence opened at body line ${fence.line} — the splitter would read it as a section heading`);
+      }
+      continue;
+    }
+    const open = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/u);
+    if (open && !(open[1][0] === "`" && open[2].includes("`"))) {
+      fence = { char: open[1][0], length: open[1].length, line: index + 1 };
+    }
+  }
+  if (fence) {
+    hazards.push(`code fence opened at body line ${fence.line} is never closed — every later line, including managed sections, is fenced text`);
+  }
+  return hazards;
 }
 
 function sectionsToMap(body) {
@@ -242,12 +287,79 @@ function sectionsToMap(body) {
   return sections;
 }
 
-function formatSections(sectionMap) {
-  const orderedHeadings = ["Summary", "Details", "Related"];
-  return orderedHeadings
-    .map((heading) => `## ${heading}\n${String(sectionMap.get(heading) ?? "").trim() || "(비어 있음)"}`)
-    .join("\n\n")
-    .trim();
+// The three H2 sections ingest owns on a knowledge page. Everything else in an existing
+// body (H1, tables, prose before the first H2, any other `##` heading) is the page owner's
+// content: ingest carries it forward verbatim or refuses — it never rebuilds the page from
+// these three alone (2026-09-12: `--page` re-ingest of a nonstandard ledger — frontmatter +
+// H1 + table + `## 출처` — exited 0, passed fast-lint, and had silently dropped every row).
+const INGEST_MANAGED_HEADINGS = ["Summary", "Details", "Related"];
+
+function renderManagedSection(heading, sectionMap) {
+  return `## ${heading}\n${String(sectionMap.get(heading) ?? "").trim() || "(비어 있음)"}`;
+}
+
+// Read-only. Describes an existing page body in the terms the writer needs: what precedes
+// the first H2 (`preamble`), every `##` segment in document order, which of those ingest
+// manages, which it must preserve, and why the body cannot be rewritten losslessly
+// (`unsupported`, empty when it can). Pure over the body text — no filesystem access.
+export function inspectExistingPageBodyShape(body = "") {
+  const segments = splitSections(body, { preserveIndent: true });
+  const preamble = segments.find((segment) => segment.heading === null)?.content ?? "";
+  const headed = segments.filter((segment) => segment.heading !== null);
+  const preservedHeadings = [];
+  const managedHeadings = [];
+  const seen = new Map();
+  const unsupported = findFenceHazards(normalizeLineEndings(body).split("\n"));
+  for (const segment of headed) {
+    seen.set(segment.heading, (seen.get(segment.heading) ?? 0) + 1);
+    if (INGEST_MANAGED_HEADINGS.includes(segment.heading)) {
+      managedHeadings.push(segment.heading);
+    } else {
+      preservedHeadings.push(segment.heading);
+    }
+  }
+  for (const [heading, count] of seen) {
+    if (count > 1) {
+      unsupported.push(`duplicate H2 heading "## ${heading}" (${count}x) — a keyed rewrite cannot tell which one owns the content`);
+    }
+  }
+  return {
+    preamble,
+    segments: headed.map(({ heading, content }) => ({ heading, content })),
+    managedHeadings,
+    preservedHeadings,
+    unsupported,
+  };
+}
+
+// Reassembles a page body from its inspected shape plus the next values of the managed
+// sections: preamble first, then every original H2 in its original order (managed ones
+// replaced, all others verbatim), then any managed section the page lacked, appended in
+// canonical order. A page with no prior body degenerates to the canonical three.
+function renderPageBody(shape, sectionMap) {
+  const blocks = [];
+  // Preserved text is re-emitted line for line (blank edges dropped, indentation kept):
+  // trimming here would strip the indent of an indented code block on a segment's first line.
+  const preserved = (text) => stripBlankEdgeLines(String(text ?? "").split("\n")).join("\n");
+  if (String(shape?.preamble ?? "").trim()) {
+    blocks.push(preserved(shape.preamble));
+  }
+  const emitted = new Set();
+  for (const segment of shape?.segments ?? []) {
+    if (INGEST_MANAGED_HEADINGS.includes(segment.heading)) {
+      blocks.push(renderManagedSection(segment.heading, sectionMap));
+      emitted.add(segment.heading);
+    } else {
+      const content = preserved(segment.content);
+      blocks.push(content ? `## ${segment.heading}\n${content}` : `## ${segment.heading}`);
+    }
+  }
+  for (const heading of INGEST_MANAGED_HEADINGS) {
+    if (!emitted.has(heading)) {
+      blocks.push(renderManagedSection(heading, sectionMap));
+    }
+  }
+  return blocks.join("\n\n");
 }
 
 function sanitizeSlug(value) {
@@ -1076,12 +1188,24 @@ async function ingestDocumentMeta({
       .filter(Boolean)
     : [];
 
-  await ensureVaultScaffold(activeVaultDir);
-  await mkdir(join(activeVaultDir, target.section), { recursive: true });
-
   const pageExists = existsSync(pagePath);
   const existingContent = pageExists ? await readFile(pagePath, "utf8") : "";
   const existingPage = parsePageDocument(existingContent);
+  // Data-loss boundary: decide whether the existing body can be rewritten losslessly BEFORE
+  // anything is written (the `_sources/` snapshot below is already a mutation). A body this
+  // writer cannot carry forward verbatim is refused loudly, never rebuilt from the managed
+  // sections alone (No Silent Fallback).
+  const existingShape = inspectExistingPageBodyShape(existingPage.body);
+  if (existingShape.unsupported.length > 0) {
+    throw new Error(
+      `vault-ingest refused to rewrite ${target.relativePath.replace(/\\/gu, "/")}: existing body cannot be preserved losslessly — ` +
+      `${existingShape.unsupported.join("; ")}. Nothing was written; curate the page by hand or pick another --page.`,
+    );
+  }
+
+  await ensureVaultScaffold(activeVaultDir);
+  await mkdir(join(activeVaultDir, target.section), { recursive: true });
+
   // `domain:` is a DEPRECATED frontmatter field (2026-07-05 폐기 결정): membership is declared
   // by the vault path (topology), cross-cutting classification by `tags`. Ingest must NOT stamp
   // it — otherwise every re-ingest would re-insert the field the vault-lint now rejects and the
@@ -1149,7 +1273,7 @@ async function ingestDocumentMeta({
     buildRelatedSection(existingPage.sections.get("Related") ?? "", target, effectiveMeta),
   );
 
-  const pageContent = `${stringifyFrontmatter(frontmatter)}\n\n${formatSections(nextSections)}\n`;
+  const pageContent = `${stringifyFrontmatter(frontmatter)}\n\n${renderPageBody(existingShape, nextSections)}\n`;
   const relativePagePath = target.relativePath.replace(/\\/gu, "/");
   const operation = pageExists
     ? (target.section === "projects" ? "UPDATE" : (detailsUpdate.action === "updated" ? "UPDATE" : "INGEST"))
@@ -1284,7 +1408,7 @@ export function isSidecarPath(relativePath, profile = VAULT_PROFILE) {
 export function resolveGitTrackedDirs(root) {
   let output;
   try {
-    output = execFileSync("git", ["-C", root, "ls-files", "-z"], {
+    output = execFileSync("git", ["--no-optional-locks", "-C", root, "ls-files", "-z"], {
       encoding: "utf8",
       maxBuffer: 256 * 1024 * 1024,
     });

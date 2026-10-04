@@ -23,15 +23,18 @@
   "files": [
     "src",
     "!src/**/*.test.mjs",
+    "!src/**/*.fixture.mjs",
     "bin",
     "skills",
     "docs",
-    ".claude-plugin",
-    ".codex-plugin"
+    "packaging",
+    "scripts/package-plugin.mjs"
   ],
   "scripts": {
     "test": "vitest run --passWithNoTests",
-    "repro:drift-gate": "node scripts/repro-precommit-drift-race.mjs"
+    "repro:drift-gate": "node scripts/repro-precommit-drift-race.mjs",
+    "package:plugin": "node scripts/package-plugin.mjs",
+    "test:packaging": "node --test scripts/package-plugin.test.mjs"
   },
   "devDependencies": {
     "vitest": "^4.1.9"

@@ -7,9 +7,7 @@ import { PassThrough } from "node:stream";
 import {
   normalizeProviderChoice,
   isAffirmative,
-  defaultModelForProvider,
   resolveStarRepo,
-  buildStarApiArgs,
   writeProviderConfig,
   starRepository,
   commandVaultSetup,
@@ -60,11 +58,6 @@ describe("pure helpers", () => {
     for (const no of ["", "n", "no", "sure", "1", undefined]) expect(isAffirmative(no)).toBe(false);
   });
 
-  it("defaultModelForProvider mirrors the adapter SSoT", () => {
-    expect(defaultModelForProvider("claude")).toBe("claude-sonnet-5");
-    expect(defaultModelForProvider("codex")).toBe("gpt-5.4-mini");
-  });
-
   it("resolveStarRepo prefers flag > config > built-in default, and rejects malformed", () => {
     expect(resolveStarRepo({})).toBe(DEFAULT_STAR_REPO);
     expect(resolveStarRepo({ configStarRepo: "org/mirror" })).toBe("org/mirror");
@@ -73,14 +66,6 @@ describe("pure helpers", () => {
     expect(resolveStarRepo({ repoFlag: "a/b/c" })).toBeNull();
   });
 
-  it("buildStarApiArgs builds the documented PUT /user/starred path", () => {
-    expect(buildStarApiArgs("aldegad/kuma-vault")).toEqual([
-      "api",
-      "--method",
-      "PUT",
-      "/user/starred/aldegad/kuma-vault",
-    ]);
-  });
 });
 
 describe("writeProviderConfig", () => {

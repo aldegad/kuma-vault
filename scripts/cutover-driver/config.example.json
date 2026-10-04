@@ -1,0 +1,187 @@
+{
+  "_about": "cutover driver configuration . Placeholders (the upper-case to-do marker) are filled by the cutover plan on the day; the driver refuses to start (pre no-go) while any remains. Copy into workDir with `driver.py stage`.",
+  "workDir": "~/Documents/workspace/.kuma/work/c8",
+  "plan": "TODO: cutover plan id kuma-vault/<stem>",
+  "freezeReason": "vault cutover cutover ",
+  "launchdLabel": "ai.kuma-vault.cutover-driver",
+  "gate": "~/.kuma/vault/projects/<project>/remote/c8-gate.json",
+  "env": {
+    "PATH": "/Users/you/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  },
+  "mac": {
+    "repo": "~/Documents/workspace/personal/old-vault",
+    "engine": "~/Documents/workspace/personal/agent-extensions/kuma-vault",
+    "toolsSha256": "~/.kuma/vault/projects/<project>/remote/brain-rewrite-tools.sha256",
+    "vault": [
+      "/Users/you/.local/bin/vault"
+    ],
+    "git": "/opt/homebrew/bin/git",
+    "freezeFile": "~/.kuma/vault-freeze.json",
+    "rsync": "/usr/bin/rsync",
+    "newClone": "~/.kuma/vaults/main-vault",
+    "links": [
+      {
+        "path": "~/.kuma/vault",
+        "target": "/Users/you/.kuma/vaults/main-vault/vault"
+      },
+      {
+        "path": "~/.kuma/plans",
+        "target": "/Users/you/.kuma/vaults/main-vault/vault/plans"
+      }
+    ],
+    "storesFile": "~/.kuma/vault-stores.json",
+    "beforeFreeze": [
+      [
+        "/Users/you/.local/bin/vault",
+        "sync",
+        "--root",
+        "~/Documents/workspace/personal/old-vault/vault"
+      ]
+    ],
+    "storeCommands": [
+      [
+        "store",
+        "rename",
+        "old-vault",
+        "main-vault",
+        "--root",
+        "~/.kuma/vaults/main-vault/vault"
+      ],
+      [
+        "store",
+        "set",
+        "main-vault",
+        "--mode",
+        "remote",
+        "--server",
+        "http://brain.example.ts.net:7741",
+        "--remote-store",
+        "main-vault",
+        "--search",
+        "remote",
+        "--lfs-cache-max-gb",
+        "10",
+        "--default"
+      ]
+    ],
+    "cloneUrl": "http://brain.example.ts.net:7741/v1/stores/main-vault.git",
+    "cloneTokenFile": null,
+    "projectsJson": "~/.kuma/projects.json",
+    "kumaStudio": "~/Documents/workspace/personal/kuma-studio",
+    "daemonInstall": [
+      [
+        "/Users/you/.local/bin/vault",
+        "sync",
+        "install",
+        "--repo",
+        "~/.kuma/vaults/main-vault"
+      ]
+    ],
+    "backupRetarget": [],
+    "_backupRetarget": "empty on purpose: old-vault-backup.sh backs up the vault-stores.json v2 default store, which step 10 (store set --default) points at the new clone; the undo of step 10 restores the file"
+  },
+  "prereq": {
+    "studioBackupCommit": "980cff752",
+    "studioMainRef": "main",
+    "c4cLandedSha": "aea639c73",
+    "launcherVersionCmd": [
+      "kuma",
+      "control",
+      "launcher-version",
+      "--json"
+    ],
+    "coreVersionCmd": [
+      "kuma",
+      "control",
+      "core-version"
+    ],
+    "engineMasterRef": "master",
+    "checks": [
+      "security find-generic-password -s <backup keychain item> -a password -w >/dev/null",
+      "ssh -o BatchMode=yes -o ConnectTimeout=20 brain-server true"
+    ],
+    "checkTimeoutSeconds": 60
+  },
+  "c14d": {
+    "summary": "~/Documents/workspace/.kuma/work/intermediates-reconcile/c8-2/out/summary.json",
+    "commands": [],
+    "maxAgeHours": 3,
+    "_note": "the orchestrator runs intermediates-reconcile 7 (run.sh c8-1, apply_delete.py, run.sh c8-2 c8-1) before installing the start; the driver reads the summary and refuses one older than maxAgeHours"
+  },
+  "core": {
+    "statusCmd": [
+      "kuma",
+      "status"
+    ],
+    "controlStatusCmd": [
+      "kuma",
+      "control",
+      "status"
+    ],
+    "waitMinutes": 30,
+    "pollSeconds": 30,
+    "stopCmd": "KUMA_CORE_RESTART_OVERRIDE='cutover driver, step 2 , core stop at the freeze' kuma control stop-core",
+    "startCmd": [
+      "kuma",
+      "control",
+      "start"
+    ],
+    "aliveCmd": [
+      "kuma",
+      "status",
+      "--count"
+    ]
+  },
+  "backup3b": {
+    "command": "bash ~/Documents/workspace/personal/kuma-studio/scripts/ops/old-vault-backup.sh",
+    "snapshotPattern": "SNAPSHOT_ID: ([0-9a-f]{8,64})",
+    "timeoutSeconds": 3600,
+    "checks": [
+      "export AWS_ACCESS_KEY_ID=$(security find-generic-password -s old-vault-restic-r2 -a access-key-id -w) AWS_SECRET_ACCESS_KEY=$(security find-generic-password -s old-vault-restic-r2 -a secret-access-key -w) RESTIC_PASSWORD=$(security find-generic-password -s old-vault-restic -a password -w); restic -r \"s3:$(security find-generic-password -s old-vault-restic-r2 -a endpoint -w)/old-vault-backup\" tag --add pre-cutover \"$cutover_SNAPSHOT\"",
+      "grep -q -- '--keep-tag pre-cutover' ~/Documents/workspace/personal/kuma-studio/scripts/ops/old-vault-backup.sh"
+    ]
+  },
+  "server": {
+    "ssh": "brain-server",
+    "work": "/data/work/TODO-stem",
+    "snapshot": "/data/old-vault",
+    "store": "main-vault",
+    "owner": "you@example.com",
+    "allowedRemote": "http://brain.example.ts.net:7741/v1/stores/main-vault.git",
+    "commitMapRel": "projects/<project>/remote/commit-map.tsv",
+    "rejectRel": "projects/<project>/remote/binaries-reject.json",
+    "extraDeletePathsRel": "vault/projects/<project>/remote/rewrite-extra-delete-paths.txt",
+    "filterRepo": "/data/work/rewrite-rehearsal/bin-git-filter-repo",
+    "workRoot": "/data/work",
+    "receipts": "/data/work/_receipts/TODO-stem",
+    "ignoreTokenIds": [],
+    "cleanAbsent": [
+      "/data/work/rewrite-rehearsal/rehearsal/snap",
+      "/data/work/rewrite-rehearsal/rehearsal/src.git",
+      "/data/work/rewrite-rehearsal/rehearsal/cas",
+      "/data/work/rewrite-rehearsal/rehearsal/clone",
+      "/data/work/rewrite-rehearsal/rehearsal/tree"
+    ],
+    "backup": {
+      "repository": "s3:TODO-R2-endpoint/old-vault-backup",
+      "host": "brain",
+      "credentialFiles": [
+        "restic-password",
+        "s3-access-key-id",
+        "s3-secret-access-key"
+      ]
+    }
+  },
+  "smoke": {
+    "planFile": "vault/plans/kuma-vault/TODO-stem.md",
+    "logFile": "vault/projects/<project>/remote/_evidence/c8-smoke.md",
+    "searchQuery": "원격 브레인",
+    "blobPath": "TODO: a small tracked LFS-extension file in HEAD (repo-relative)",
+    "rejectPath": "vault/projects/generator/_assets/c8-smoke/review/c8-smoke-tmp.png",
+    "bigPath": "vault/projects/<project>/remote/_evidence/c8-too-big.txt",
+    "launchdRestart": true
+  },
+  "notify": {
+    "command": "TODO: kuma dispatch command that reaches the orchestrator; gets cutover_OUTCOME, cutover_REPORT_FILE, cutover_REPORT_JSON in its environment"
+  }
+}

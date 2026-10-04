@@ -5,16 +5,26 @@
 // non-`--` tokens accumulate in `_` (positionals).
 
 const BOOLEAN_FLAGS = new Set([
+  "adopt",
   "all-stores",
   "bypass",
   "check",
+  "commit",
+  "default",
   "dry-run",
   "enrich",
   "full-auto",
   "help",
   "json",
+  "keep-data",
+  "local",
+  "no-daemon",
+  "no-fts",
   "open",
+  "purge",
+  "reverse",
   "star",
+  "write",
   "yes",
 ]);
 

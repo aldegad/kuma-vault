@@ -41,6 +41,8 @@ const STRING_LIST_KEYS = Object.freeze([
   // May be `[]`: frontmatter stays enforced while no body section is demanded
   // (heterogeneous knowledge repos — evaluation reports, verbatim originals).
   "genericPageSections",
+  // Tree-relative `domains/<name>.md` paths of the tree's persona-memory pages.
+  "personaMemoryPages",
 ]);
 const OVERRIDABLE_KEYS = Object.freeze([
   ...BOOLEAN_KEYS,
@@ -50,7 +52,15 @@ const OVERRIDABLE_KEYS = Object.freeze([
   "navScope",
   "schema",
 ]);
-const DECLARATION_KEYS = Object.freeze(["id", "profile", ...OVERRIDABLE_KEYS]);
+// Not a profile override: `binaries.reject` lists the tree's intermediate places (gitignore
+// syntax, relative to this tree). The sync daemon reads it for its `rejectResidue` alarm and
+// keeps those binaries out of autosave; the generated .gitignore block carries the same list.
+// Storage policy (not profile overrides either): `visibility` ("private" = the tree holds secrets
+// and must never reach a public host), `remotes.allowed` (the only push URLs the pre-push hook
+// lets through), and `commitMap` (tree-relative path of the old-sha -> new-sha map a history
+// rewrite left behind, read by `vault commit-map`).
+const POLICY_KEYS = Object.freeze(["visibility", "remotes", "commitMap"]);
+const DECLARATION_KEYS = Object.freeze(["id", "profile", "binaries", ...POLICY_KEYS, ...OVERRIDABLE_KEYS]);
 
 function declarationError(configPath, detail) {
   return new Error(`Invalid vault declaration at ${configPath}: ${detail}`);
@@ -86,6 +96,12 @@ function validateDeclaration(parsed, configPath) {
       }
     }
   }
+  if ("personaMemoryPages" in parsed) {
+    const bad = parsed.personaMemoryPages.filter((entry) => !/^domains\/[^/]+\.md$/u.test(entry) || entry === "domains/README.md");
+    if (bad.length > 0) {
+      throw declarationError(configPath, `"personaMemoryPages" entries must be top-level domains/<name>.md pages other than domains/README.md (got ${bad.join(", ")}).`);
+    }
+  }
   if ("plansSlotRoot" in parsed && parsed.plansSlotRoot !== null && typeof parsed.plansSlotRoot !== "string") {
     throw declarationError(configPath, '"plansSlotRoot" must be a string or null.');
   }
@@ -94,6 +110,41 @@ function validateDeclaration(parsed, configPath) {
   }
   if ("navScope" in parsed && !["all", "git-tracked"].includes(parsed.navScope)) {
     throw declarationError(configPath, '"navScope" must be "all" or "git-tracked".');
+  }
+  if ("visibility" in parsed && !["private", "public"].includes(parsed.visibility)) {
+    throw declarationError(configPath, '"visibility" must be "private" or "public".');
+  }
+  if ("remotes" in parsed) {
+    const remotes = parsed.remotes;
+    if (!remotes || typeof remotes !== "object" || Array.isArray(remotes)) {
+      throw declarationError(configPath, '"remotes" must be an object.');
+    }
+    const bad = Object.keys(remotes).filter((key) => key !== "allowed");
+    if (bad.length > 0) {
+      throw declarationError(configPath, `"remotes" has unknown key(s) ${bad.join(", ")} (allowed: allowed).`);
+    }
+    if (!Array.isArray(remotes.allowed) || remotes.allowed.some((entry) => typeof entry !== "string" || !entry.trim())) {
+      throw declarationError(configPath, '"remotes.allowed" must be an array of non-empty URL strings.');
+    }
+  }
+  if ("commitMap" in parsed) {
+    const value = parsed.commitMap;
+    if (typeof value !== "string" || !value.trim() || value.startsWith("/") || value.split("/").includes("..")) {
+      throw declarationError(configPath, '"commitMap" must be a tree-relative path.');
+    }
+  }
+  if ("binaries" in parsed) {
+    const binaries = parsed.binaries;
+    if (!binaries || typeof binaries !== "object" || Array.isArray(binaries)) {
+      throw declarationError(configPath, '"binaries" must be an object.');
+    }
+    const bad = Object.keys(binaries).filter((key) => key !== "reject");
+    if (bad.length > 0) {
+      throw declarationError(configPath, `"binaries" has unknown key(s) ${bad.join(", ")} (allowed: reject).`);
+    }
+    if ("reject" in binaries && (!Array.isArray(binaries.reject) || binaries.reject.some((entry) => typeof entry !== "string" || !entry.trim()))) {
+      throw declarationError(configPath, '"binaries.reject" must be an array of non-empty strings.');
+    }
   }
   if ("schema" in parsed) {
     const schema = parsed.schema;
@@ -126,13 +177,18 @@ export function loadVaultDeclaration(rootDir) {
   if (!existsSync(configPath)) {
     return null;
   }
+  return parseVaultDeclaration(readFileSync(configPath, "utf8"), configPath);
+}
+
+/** Parse + validate declaration text (a file, or a blob read from git). Throws when invalid. */
+export function parseVaultDeclaration(text, label = VAULT_CONFIG_FILENAME) {
   let parsed;
   try {
-    parsed = JSON.parse(readFileSync(configPath, "utf8"));
+    parsed = JSON.parse(text);
   } catch (error) {
-    throw declarationError(configPath, error instanceof Error ? error.message : String(error));
+    throw declarationError(label, error instanceof Error ? error.message : String(error));
   }
-  validateDeclaration(parsed, configPath);
+  validateDeclaration(parsed, label);
   return parsed;
 }
 
@@ -187,6 +243,57 @@ function assertFlagMatchesDeclaration(flagProfile, resolved, rootDir) {
       `(declared contract: ${resolved.id}). The declaration owns the contract — drop --profile.`,
     );
   }
+}
+
+// Order-independent structural equality of two contract profiles (plain JSON values).
+function canonicalContract(value) {
+  if (Array.isArray(value)) return value.map(canonicalContract);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalContract(value[key])]));
+  }
+  return value;
+}
+
+function sameContract(left, right) {
+  return JSON.stringify(canonicalContract(left)) === JSON.stringify(canonicalContract(right));
+}
+
+/**
+ * The contract an engine pass runs under for a known tree root. Every lint/sync entry that takes
+ * `{ vaultDir, profile }` resolves through here, so a caller that names no contract gets the one
+ * the tree declares — never a built-in default that drops what the tree declared (its
+ * persona-memory pages, its overrides).
+ *
+ * - declaration at the root: the declared contract. A `profile` passed alongside must BE that
+ *   contract — an id equal to the declared id, or an object equal to the declared profile —
+ *   else throw (the declaration owns the contract, as in `resolveVaultContract`).
+ * - no declaration: `profile` (an engine built-in id, or a contract object) is required; none →
+ *   throw (No Silent Fallback — no default contract).
+ * - a declaration that cannot be read or is invalid throws (`loadVaultDeclaration`).
+ */
+export function resolveTreeContract(rootDir, profile) {
+  const resolvedRoot = resolve(rootDir);
+  const declaration = loadVaultDeclaration(resolvedRoot);
+  const given = typeof profile === "string" ? (profile.trim() || undefined) : (profile ?? undefined);
+  if (declaration) {
+    const declared = resolveDeclaredProfile(declaration);
+    if (typeof given === "string") {
+      assertFlagMatchesDeclaration(given, declared, resolvedRoot);
+    } else if (given !== undefined && !sameContract(given, declared)) {
+      throw new Error(
+        `The contract passed for ${resolvedRoot} (${given.id ?? "unnamed"}) is not the one its ${VAULT_CONFIG_FILENAME} ` +
+        `declares (${declared.id}). The declaration owns the contract — pass none, or the declared one.`,
+      );
+    }
+    return declared;
+  }
+  if (given === undefined) {
+    throw new Error(
+      `No ${VAULT_CONFIG_FILENAME} declaration at ${resolvedRoot} and no contract given. ` +
+      `Add a ${VAULT_CONFIG_FILENAME} to the tree root (preferred), or pass a profile explicitly.`,
+    );
+  }
+  return resolveProfile(given);
 }
 
 /**

@@ -1,67 +1,173 @@
-# Information Retrieval Order
+# Information retrieval and freshness
 
-## Summary
-쿠마가 **사실·지식·인용·개념 설명을 요구받을 때** 의 정보 조회 순서는 고정이다. vault 우선, 외부 검색은 vault 에 없을 때만. 기억이나 추정으로 단언 금지.
+This is the search procedure entered by [kuma-vault](../SKILL.md). The skill
+routes research; `vault search` itself queries registered knowledge stores and
+does not search the internet. Browser mechanics belong to the host's browser
+skill — in Kuma Studio, `kuma-computer-use`; below, "the browser skill".
 
-### Why
-쿠마는 amnesiac 전제로 동작한다. 모델 weight 에 녹아있는 지식은 출처 검증 없이 꺼내면 할루시네이션 위험이 크다 (실제로 2026-04-23 세션에서 Haraway ↔ Nagel 혼동, Aristotle 인용 과잉 대입 등 발생). canonical 지식은 vault 에 있고, vault 에 없으면 외부 1차 소스로 실시간 확인해야 한다.
+## 1. Resolve the question and search the vault
 
-### How to apply
-모든 사실형 질의에 대해 아래 순서를 그대로 따른다. 순서를 건너뛰고 기억에서 답하지 않는다.
+Identify the fact needed, its scope (version, region, account, hardware), and
+whether the user wants a present fact or a historical answer. Follow the root
+skill's `search → timeline → get` order, expanding only useful hits.
 
-## Rules
+For no hits, shorten a compound query to its distinctive public term or a known
+alias. Then continue to the appropriate source. An unrelated hit is still a miss;
+a partial answer requires checking the missing part. Do not keep searching only
+the vault or ask the user to explain a public acronym before external discovery.
+Search the public acronym plus the task context, open credible candidates, and
+ask a focused question only if materially different candidates remain.
 
-### R1 — 정보 조회 순서 (고정)
+Honor explicit source restrictions: an offline or vault-only request stays within
+that boundary, with any uncertainty stated. A request to search the web or verify
+must actually reach external sources even when the vault has a plausible answer.
+Before any external query, remove private context, names, credentials, internal
+URLs and identifiers that the user has not authorized disclosing. Use public
+product terms; resolve private facts locally or through the authorized service.
 
-1. **Vault 조회 (L1 → L2 → L3)**
-   - `vault search <q>` 로 hits 확인 (L1)
-   - 매칭이 보이면 `vault timeline <q>` 로 주변 스니펫 확인 (L2)
-   - 해당 문서 지목되면 `vault get <path>` 로 전문 로드 (L3)
-   - 이 조회 엔진은 vault tree 를 직접 걷는다. root/folder README topology 는 사람이 탐색하고 lint 가 reachability 를 검증하는 진입점이며, `search → timeline → get` 순서는 바뀌지 않는다.
-   - 이 단계에서 답이 나오면 끝. 외부 검색으로 넘어가지 않는다.
-2. **외부 웹 검색 (vault 에 없을 때만)**
-   - 기본은 `WebSearch` / `WebFetch`.
-   - 블록·WAF·차단 사이트거나 소셜 플랫폼(X/Twitter, Threads, Reddit, Naver blog 등)이면 **insane-search** 스킬 사용.
-   - 검색 결과를 답변에 인용할 때는 URL·저자·연도를 함께 명기한다.
-3. **출처 확인 불가 시**
-   - "모른다" 또는 "확인 필요" 로 답한다. 추정·기억으로 단언하지 않는다.
-   - 필요하면 사용자에게 추가 힌트를 요청한다.
+### Query shape and canonical priority
 
-### R2 — 새로 확인한 사실은 vault 로 승격 고려
-- 외부에서 확인된 사실이 재사용될 만하면 `domains/` 또는 `learnings/` 로 ingest 한다 (archive-first, canonical 승격은 명시적으로).
-- 특히 철학·역사·인물·전문 분야 인용은 `domains/engineering/philosophy-reference.md` 같은 출처 확정 페이지에 append 한다. 저자·저작·연도 3요소 확인 규칙 유지.
+**Query shape** — `search`/`timeline` are **not semantic search**: they are phrase-substring plus entity matching.
 
-### R3 — 사실형·논지형이 아닌 질의
-- 코드 수정, 디자인 판단, 유저와의 가벼운 자유 대화는 R1·R5 대상이 아니다.
-- 다만 유저가 "그거 출처 뭐야", "정확한 용어 뭐야" 같이 사실형 질문을 섞으면 그 부분만 R1 을 적용한다.
+- Do not throw a whole fuzzy sentence. Start with the single most distinctive token (proper noun, coined term, file stem, handle, date); drop emoji and symbols.
+- **0 hits on a multi-word query is not "it does not exist."** Reduce one token at a time before concluding NOT FOUND — search brittleness is not absence (No Silent Fallback).
+- A specific artifact name may live only in a page body or its `## Related` line — `get` the page or `timeline` a distinctive token.
+- When ingesting, put the phrases a user would actually type into frontmatter `aliases`; a phrase-substring search only hits once an alias contains that phrase.
 
-### R4 — 할루시네이션 체크 지점
-- 쿠마가 "아마", "대략", "~인 걸로 기억" 같은 표현을 쓰고 있으면 **이미 R1 을 건너뛴 상태**다. 그 시점에 vault 조회 또는 외부 검색으로 전환한다.
-- 전문 인용을 단언할 때는 최소 **저자 + 저작명** 중 하나라도 vault/외부에서 확인돼야 한다.
+**Priority for canonical truth:** decision/principle docs → `calendar/` (time/place-bound) → `projects/<slug>.md` → `memos/` → `learnings/`·`domains/` → `results/` and owner-local `_assets`·`_sources`·`_evidence`. Result reports, the dispatch log, and classification reports are evidence layers, not the policy SSoT.
 
-### R5 — 논지·의견·주장형 질의 트리거
+**Anti-patterns:** skipping the vault because the word "vault" was not used · fetching chat history first · grepping the codebase before the vault · expecting a full-body dump from `search`.
 
-알렉스가 "어떻게 생각해", "내 생각엔 X 인데 너는?", "이거 맞아?", "~에 대한 의견", "철학적으로 어때" 같은 발화를 던지면 그 자리에서 즉답하지 말고 다음 순서를 거친다.
+## 2. Choose the authoritative source and freshness rule
 
-1. **vault 철학·도메인 우선 조회**
-   - `~/.kuma/vault/domains/engineering/philosophy-reference.md` 에서 관련 인물·개념·인용 카드 확인.
-   - 주제와 매칭되는 `domains/<topic>.md` (예: `model-frontier.md`, `analytics.md`) 도 함께 로드.
-   - 알렉스가 이전에 이 주제로 내린 결정·선호가 `decisions.md` 또는 `projects/*.project-decisions.md` 에 있는지 확인.
-2. **확장 사고로 응답**
-   - 단편 답이 아니라 vault 에서 끌어온 어휘·인용·이전 결정을 기반으로 입체 답변.
-   - 알렉스 vocabulary (예: "thin core / thin adapter", "no academic over-attribution") 를 우선 활용.
-3. **새 사실은 R2 처럼 vault 승격 고려**
-   - 응답 중 알렉스가 새로 가르쳐준 입장·주장은 적절한 vault 페이지에 ingest 후보로 표시.
+| Kind of claim | Where to verify | When |
+|---|---|---|
+| Vendor behavior, model availability, version support, prices, API/CLI contracts, hardware requirements | Official docs, release notes, official repository/model card, or the relevant account console | Last claim verification is at least 24 hours old, missing, invalid, future-dated, or lacks its source |
+| Explicit current/latest/verify request, conflicting evidence, or rapidly changing state such as live availability | Appropriate authoritative source | Now, even if the stored claim is younger than 24 hours |
+| Current local machine, installed version, repository or session state | Read-only local/remote observation in the authorized environment | Measure live state now; a vendor page cannot verify a particular machine |
+| Stable definitions, dated historical facts, archived experiments | Original source/evidence | Reuse when relevant and sourced; recheck gaps or conflicts, not merely age |
+| User decisions, preferences, private records | User-owned decision record or authorized original service | Never replace them with web claims; ask only if their meaning remains unclear |
 
-R5 가 R1 (사실형) 과 다른 점: R1 은 "정답 찾기", R5 는 "맥락 갖춘 입체 응답". 둘 다 vault 우선이지만 출력 형태가 다르다.
+Freshness is per **claim**, not per file. File `updated`, filesystem mtime, an
+index rebuild, or another paragraph's timestamp does not prove verification.
+Use a timezone-aware ISO timestamp for the last successful source check. Treat a
+date-only stamp conservatively as unknown for the 24-hour boundary. At exactly
+24 hours, recheck. This is an on-demand procedure for facts needed by this task,
+not a daily sweep of the vault. High-stakes or faster-changing facts may need a
+stricter rule. A check younger than 24 hours is never a guarantee of correctness.
 
-#### 안티패턴
-- ❌ vault 안 보고 모델 weight 만으로 의견 작성 ("AI slop" 의 전형).
-- ❌ 알렉스 vocabulary 무시하고 일반론 답.
-- ❌ 사실형 질의처럼 "출처 + 정의" 만 던지고 끝 (R5 는 입체 응답이 본질).
+## 3. Retrieve the actual source, cheapest sufficient method first
 
-## Source
-- Alex direct instruction (2026-04-23, 하네스 엔지니어링 담론 정리 중 쿠마 할루시네이션 발생 후)
+Search discovers pages; open the source that supports the claim. Prefer official
+material for technical facts, original research for research claims, and the
+original record for historical claims. Secondary sources can identify leads;
+label claims that only secondary sources support. Do not treat search snippets,
+an AI summary, a page title or HTTP 200 as verification.
 
-## Related
-- [philosophy-reference.md](~/.kuma/vault/domains/engineering/philosophy-reference.md) — 철학 인용 canonical 목록
+Define the expected evidence before choosing a tool: a supported-model row, a
+price with currency/billing period, a versioned requirement, or the relevant
+passage. Use available web search and a lightweight fetch (`curl`/web read) first
+when suitable. Existing authorized service connectors can directly provide the
+record; a host's service skill (in Kuma Studio, `kuma-apps`) routes service workflows.
+
+| Observed result or task | Next action |
+|---|---|
+| Source contains the required passage/data | Extract it with URL, scope and check time; stop escalating |
+| Empty HTML shell, hydration payload, CSR, placeholder, async or lazy loading | Read the browser skill, select its public browser route, wait for the expected content and inspect the rendered result |
+| Data behind tabs, filters, pagination, infinite scroll or a separate console route | Navigate the relevant controls, inspect each resulting state, and record coverage/selection; do not call the first page exhaustive |
+| Login redirect, expired session or account chooser | Use the authenticated browser route below; verify identity and the requested record after login |
+| Permission denied, subscription required or missing entitlement | Report the actual access boundary; a login alone does not establish permission, and research does not authorize buying access or changing roles |
+| Explicit bot challenge, CAPTCHA or repeated redirect loop | Use the browser skill's challenge handling and its stop/handoff rules; do not repeat a rejected challenge or silently switch profiles |
+| 429, network failure or server error | Honor retry guidance, make a bounded retry or use another authoritative source, and retain the failed-check evidence |
+| PDF, screenshot, canvas, iframe or download hides the evidence | Use the appropriate document reader or the browser's supported inspection; verify the relevant page/content, origin and version |
+| User specifies a selected/open tab | Use the browser skill's selected-tab route for that target; do not replace it with an unrelated session |
+
+Wait for an observable condition (expected text, row, completed loading indicator)
+with a bounded timeout. A fixed sleep or network-idle alone does not establish
+that the requested information loaded. Re-snapshot after navigation or rerender;
+verify what changed, and stop with a precise limitation if data never appears.
+A rendered screenshot is useful for visual-only evidence; ordinary text should
+remain traceable to the source. Avoid irrelevant personal data in captures.
+
+### Browser identity and authentication
+
+Load the browser skill and the relevant documents it links **before** browser
+actions. Its current surface, input, concurrency and login contracts own
+the implementation; do not copy cookie extraction, browser-launch flags or an
+alternative automation stack into this skill.
+
+- Public dynamic pages use its unauthenticated scratch/render path. Do not leak
+  logged-in state to arbitrary research sites.
+- Account-specific pages use its authorized robot-browser/login path. Reuse
+  existing authenticated sessions or stored credentials through that skill's
+  credential mechanism. Choose the intended account/workspace/tenant and verify
+  that login actually reaches the requested content. Persistent login belongs to
+  the skill's login owner, not an improvised disposable profile.
+- A selected user tab uses the picker contract. Borrowing the user's local browser
+  authentication for reading/downloading requires the explicitly selected
+  borrowed-session workflow; a failed fetch or connector does not authorize it.
+- Login forms, OAuth consent, MFA and challenges follow the owning skill's rules.
+  Do not invent an approval requirement for ordinary authorized login, nor assume
+  permission to create/reset credentials, use recovery codes or expand access.
+- Distinguish login required, expired login, wrong account, missing permission,
+  challenge and loading failure. When human input is genuinely required, report
+  the attempted route and exact remaining input; do not claim generic "needs a
+  person" merely because a browser is needed.
+- Research authorizes navigation and reading within scope. It does not authorize
+  sending messages, submitting orders, changing account settings or other writes.
+  Open the minimum tabs needed; close only task-owned temporary sessions through
+  the browser lifecycle. Preserve the user's tabs and durable login profile.
+- Keep passwords, session cookies, authorization headers, OTPs and signed download
+  tokens out of queries, evidence and vault summaries. Record stable sanitized
+  source links. Verify downloads by actual content, not a successful transfer that
+  saved an HTML login page as a PDF.
+
+For region-, account-, currency-, plan- or version-specific results, record that
+scope and do not generalize them to everyone. Official documentation and observed
+runtime behavior can disagree: report both, with their versions and dates.
+
+Browser extraction, authentication and challenge policy stay with the browser
+skill and its linked procedures. A specialized retrieval helper the host may
+offer works within those boundaries; it is not a mandatory step for every URL,
+nor permission to bypass access controls. A platform the host routes to a
+dedicated research path (for example X/Twitter) follows that path. If the
+required tool is unavailable, report that limitation; never claim to have browsed.
+
+## 4. Answer, then refresh reusable knowledge
+
+State the supported conclusion, direct source links, relevant verification date
+and limits. Separate source statements, measurements and your inference. If the
+source is inaccessible or contradictory, say exactly what is unverified; an old
+vault claim can be given as dated context, not as confirmed current information.
+
+For reusable verified facts, follow [ingest](ingest.md) and [layout](layout.md):
+
+1. Find the existing canonical page; refresh the relevant claim instead of making
+   a second page. Select the owner explicitly for a new reusable fact.
+2. Record the claim's supporting source, timezone-aware `verified_at`, and any
+   version/account/region scope. A body table or adjacent citation is sufficient;
+   this is provenance, not a new required frontmatter schema.
+3. After successfully rechecking an unchanged claim, advance its verification
+   stamp. After a failed check, preserve its old value and mark currentness as
+   unverified separately. Never refresh unrelated claims' timestamps.
+4. Replace stale present-tense wording while retaining relevant dated history and
+   evidence. Conflicts remain explicit until resolved. Do not overwrite original
+   measurements, user decisions or preferences. Decision files are user-direct.
+5. Run the existing ingest/curate sync and lint procedure. Respect a read-only or
+   no-save request; one-off live state and unverified guesses need no canonical
+   page. If persistence fails, distinguish a verified answer from an unsaved update.
+
+Example provenance (synthetic):
+
+| Claim | Scope | Source | verified_at |
+|---|---|---|---|
+| Feature A is supported | Product Q v2, Linux | https://example.com/docs/feature-a | 2026-10-02T09:00:00Z |
+
+## Opinions and non-research work
+
+Code edits, design judgment and casual conversation do not require web research
+unless they rely on uncertain or changeable facts. For opinion questions, load
+relevant domain context and prior user decisions; consult the vault's philosophy
+reference when making philosophical attributions. Distinguish your judgment from
+factual premises and verify those premises through this procedure. User positions
+are candidates for user-owned decision records, never automatically ingested.

@@ -1,6 +1,7 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
+import { withFileCommitLock } from "./file-commit-lock.mjs";
 import { parseFrontmatterDocument } from "./vault-ingest.mjs";
 import { lintVaultFiles } from "./vault-lint.mjs";
 import { selfHealStaleIndex } from "./vault-sync-triggers.mjs";
@@ -164,8 +165,22 @@ function ledgerLine(timestamp, fields) {
   return `- ${timestamp} | ${ordered.join(" | ")}`;
 }
 
-function writeDispatchLog({ vaultDir, task, event, blockerArg, noteArg, now, warnings }) {
-  const path = join(vaultDir, "dispatch-log.md");
+// The ledger is also appended to by host writers (kuma-studio dispatch broker / gc / abandon),
+// which serialize on the shared file-commit lock. This writer rewrites the whole file, so it must
+// hold the same lock across read -> rewrite, or an append landing in between is lost. Without
+// the lock (held elsewhere past the timeout) the event is not written and the warning says so.
+function writeDispatchLog(args) {
+  const path = join(args.vaultDir, "dispatch-log.md");
+  const outcome = withFileCommitLock(path, () => writeDispatchLogLocked(args, path));
+  if (!outcome.locked) {
+    args.warnings.push({
+      key: "dispatch-log.md:locked",
+      message: `${path} is locked by ${outcome.holder} (${outcome.lockPath}); the ${args.event} entry for ${args.task.id} was not written`,
+    });
+  }
+}
+
+function writeDispatchLogLocked({ task, event, blockerArg, noteArg, now, warnings }, path) {
   const file = loadManagedFile(path, warnings);
   if (!file) return;
 
@@ -204,9 +219,11 @@ function writeDispatchLog({ vaultDir, task, event, blockerArg, noteArg, now, war
   }
 
   file.frontmatter.updated = now;
-  writeFileSync(path, renderMarkdown(file.frontmatter, [
+  const temp = `${path}.${process.pid}.tmp`;
+  writeFileSync(temp, renderMarkdown(file.frontmatter, [
     ["Entries", renderLedgerLines(lines, "(비어 있음 — lifecycle hook 연결 전)")],
   ]), "utf8");
+  renameSync(temp, path);
 }
 
 export async function runVaultLifecycleHook({

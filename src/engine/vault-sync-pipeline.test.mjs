@@ -4,7 +4,7 @@
 // host CLI). Everything they may vary goes through these seams, so this file pins what the
 // seams promise — a host that folds its fork onto them is relying on exactly this.
 //
-//   1. `createGenerateDescription` is LAZY. kuma-studio's Moonbi generator reads team config at
+//   1. `createGenerateDescription` is LAZY. kuma-studio's generator reads team config at
 //      CONSTRUCTION time and throws when the tool profile is absent, so a factory called
 //      eagerly would break plain `vault sync` for a tree that never asked to enrich.
 //   2. `enrichFields` must match what the injected generator actually returns. A description-only
@@ -13,6 +13,7 @@
 //      fields forever after. The negative control below is that harm, pinned, so nobody
 //      "simplifies" the two CLIs onto one field set without seeing what it costs.
 
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -30,14 +31,14 @@ afterEach(async () => {
 });
 
 // A declared tree with one leaf page that has no description — the only enrich target.
-async function makeVault() {
+async function makeVault(declaration = { id: "pipeline-fixture", profile: "kuma-vault" }) {
   const tempRoot = await mkdtemp(join(tmpdir(), "kuma-vault-sync-pipeline-"));
   tempRoots.push(tempRoot);
   const vaultDir = join(tempRoot, "vault");
   await mkdir(join(vaultDir, "domains"), { recursive: true });
   await writeFile(
     join(vaultDir, "vault.config.json"),
-    JSON.stringify({ id: "pipeline-fixture", profile: "kuma-vault" }),
+    JSON.stringify(declaration),
     "utf8",
   );
   await writeFile(
@@ -52,7 +53,7 @@ async function readAlpha(vaultDir) {
   return parseFrontmatterDocument(await readFile(join(vaultDir, "domains", "alpha.md"), "utf8")).frontmatter;
 }
 
-// A generator that returns a bare synopsis string — the shape kuma-studio's Moonbi prompt
+// A generator that returns a bare synopsis string — the shape kuma-studio's prompt
 // produces (one line, no labeled TAGS/ALIASES sections).
 function descriptionOnlyGenerator(text = "Alpha streams the alpha payload.") {
   const calls = [];
@@ -70,7 +71,6 @@ describe("runVaultSync — consumer injection seams", () => {
     let constructed = 0;
     const report = await runVaultSync({
       vaultDir,
-      profile: "kuma-vault",
       createGenerateDescription: () => {
         constructed += 1;
         throw new Error("team config missing — construction must not happen here");
@@ -89,7 +89,6 @@ describe("runVaultSync — consumer injection seams", () => {
     let constructed = 0;
     const report = await runVaultSync({
       vaultDir,
-      profile: "kuma-vault",
       check: true,
       enrich: true,
       createGenerateDescription: () => {
@@ -110,7 +109,6 @@ describe("runVaultSync — consumer injection seams", () => {
 
     const report = await runVaultSync({
       vaultDir,
-      profile: "kuma-vault",
       enrich: true,
       enrichFields: ["description"],
       createGenerateDescription: () => {
@@ -128,7 +126,6 @@ describe("runVaultSync — consumer injection seams", () => {
     const vaultDir = await makeVault();
     const report = await runVaultSync({
       vaultDir,
-      profile: "kuma-vault",
       enrich: true,
       enrichFields: ["description"],
       generateDescription: descriptionOnlyGenerator(),
@@ -150,7 +147,6 @@ describe("runVaultSync — consumer injection seams", () => {
     const vaultDir = await makeVault();
     await runVaultSync({
       vaultDir,
-      profile: "kuma-vault",
       enrich: true,
       enrichFields: ENRICH_FIELDS_ALL,
       generateDescription: descriptionOnlyGenerator(),
@@ -165,8 +161,8 @@ describe("runVaultSync — consumer injection seams", () => {
     expect(typeof frontmatter.aliases_hash).toBe("string");
   });
 
-  it("threads the resolved profile into the derived passes, not just the index pass", async () => {
-    const vaultDir = await makeVault();
+  it("threads the tree's declared contract into the derived passes, not just the index pass", async () => {
+    const vaultDir = await makeVault({ id: "pipeline-fixture", profile: "kuma-vault", archiveTreeDirs: [] });
     // `docs/` is an archive tree under the built-in vault contract but a normal nav folder for
     // a tree that declares its own archiveTreeDirs. If a derived pass silently fell back to the
     // built-in profile, this page would be excluded from the enrich walk.
@@ -177,10 +173,8 @@ describe("runVaultSync — consumer injection seams", () => {
       "utf8",
     );
 
-    const declared = { ...(await import("./vault-profile.mjs")).VAULT_PROFILE, id: "pipeline-fixture", archiveTreeDirs: [] };
     const report = await runVaultSync({
       vaultDir,
-      profile: declared,
       check: true,
       enrich: true,
     });
@@ -196,7 +190,7 @@ describe("formatVaultSyncReport — the header must describe what check mode act
   // nothing lands in the tracked tree, the search cache still self-heals.
   it("says no TREE writes and names the cache that still heals", async () => {
     const vaultDir = await makeVault();
-    const report = await runVaultSync({ vaultDir, profile: "kuma-vault", check: true });
+    const report = await runVaultSync({ vaultDir, check: true });
     const header = formatVaultSyncReport(report).split("\n")[0];
 
     expect(header).toContain("no tree writes");
@@ -206,7 +200,7 @@ describe("formatVaultSyncReport — the header must describe what check mode act
 
   it("leaves the write-mode header alone", async () => {
     const vaultDir = await makeVault();
-    const report = await runVaultSync({ vaultDir, profile: "kuma-vault" });
+    const report = await runVaultSync({ vaultDir });
     expect(formatVaultSyncReport(report).split("\n")[0]).toBe("vault sync — write");
   });
 });
@@ -215,8 +209,8 @@ describe("vaultSyncExitCode", () => {
   it("does not gate on the FTS cache in either mode", async () => {
     const vaultDir = await makeVault();
     // Converge the tree, then confirm a healed cache never contributes to the exit code.
-    await runVaultSync({ vaultDir, profile: "kuma-vault" });
-    const report = await runVaultSync({ vaultDir, profile: "kuma-vault", check: true });
+    await runVaultSync({ vaultDir });
+    const report = await runVaultSync({ vaultDir, check: true });
 
     expect(report.fts).not.toBeNull();
     expect(vaultSyncExitCode(report)).toBe(0);
@@ -224,15 +218,24 @@ describe("vaultSyncExitCode", () => {
     expect(report.fts.wouldRebuild).toBeUndefined();
   });
 
+  it("fts: false (--no-fts) skips the search cache and keeps the tracked derivations", async () => {
+    const vaultDir = await makeVault();
+    const report = await runVaultSync({ vaultDir, fts: false });
+    expect(report.fts).toBeNull();
+    expect(existsSync(join(vaultDir, ".fts"))).toBe(false);
+    expect(vaultSyncExitCode(report)).toBe(0);
+    expect(vaultSyncExitCode(await runVaultSync({ vaultDir, check: true, fts: false }))).toBe(0);
+  });
+
   it("still refuses tracked drift in check mode", async () => {
     const vaultDir = await makeVault();
-    await runVaultSync({ vaultDir, profile: "kuma-vault" });
+    await runVaultSync({ vaultDir });
     // Break a tracked derivation: wipe a generated index region.
     const readmePath = join(vaultDir, "domains", "README.md");
     const readme = await readFile(readmePath, "utf8");
     await writeFile(readmePath, readme.replace(/<!-- vault-index:start -->[\s\S]*?<!-- vault-index:end -->/u, "<!-- vault-index:start -->\n\n<!-- vault-index:end -->"), "utf8");
 
-    const report = await runVaultSync({ vaultDir, profile: "kuma-vault", check: true });
+    const report = await runVaultSync({ vaultDir, check: true });
     expect(report.changedCount).toBeGreaterThan(0);
     expect(vaultSyncExitCode(report)).toBe(1);
   });

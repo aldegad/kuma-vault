@@ -57,7 +57,7 @@ function buildPdf() {
 
 // A git repo declaring the full contract bounded to the tracked layer — the
 // acme-ops shape: tracked handbook + untracked vendored/secret subtrees.
-async function scaffoldTrackedRepo() {
+async function scaffoldTrackedRepo(overrides = {}) {
   const repo = await mkdtemp(join(tmpdir(), "kuma-vault-scope-"));
   git(repo, "init", "-q");
 
@@ -70,6 +70,7 @@ async function scaffoldTrackedRepo() {
     canonicalChecks: false,
     genericPageSections: [],
     schema: { path: "schema.md", validateSpecialFiles: false, autoScaffold: false },
+    ...overrides,
   }, null, 2)}\n`, "utf8");
 
   await writeFile(
@@ -185,12 +186,8 @@ describe("lint parity + genericPageSections knob", () => {
   });
 
   it("default profiles keep the historical Summary/Details/Related demand", async () => {
-    const { repo, profile } = await scaffoldTrackedRepo();
-    const result = lintVaultFiles({
-      vaultDir: repo,
-      mode: "full",
-      profile: { ...profile, genericPageSections: ["Summary", "Details", "Related"] },
-    });
+    const { repo } = await scaffoldTrackedRepo({ genericPageSections: ["Summary", "Details", "Related"] });
+    const result = lintVaultFiles({ vaultDir: repo, mode: "full" });
     const sectionIssues = result.issues.filter((issue) => issue.file === "notes/page.md" && issue.code === "missing-section");
     expect(sectionIssues.length).toBe(3);
   });

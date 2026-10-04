@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Cutover step 8: compare a test clone of the new repo with the old worktree.
+
+ Old-worktree paths are compared in NFC, read under their on-disk names.
+ (i)   every old-worktree file outside LFS extensions (not ignored, not in
+       delete-paths, still present) equals the P commit's file byte for byte
+       (git blob sha1 of the file, symlink target for links) with the same mode;
+ (ii)  only paths in --allowed-changes may differ between P and HEAD
+       (step 6 commits; the rehearsal has none, so HEAD == P);
+ (iii) paths only in the new HEAD are the root .gitattributes and --allowed-changes;
+ (iv)  LFS-extension paths hold pointer oid == final-map sha256 (size 0: empty blob);
+ and the clone's checked-out files equal the HEAD tree (pointers stay pointers:
+ the clone has no lfs filter), with an empty `git status --porcelain`.
+
+  stage8_compare.py --old-worktree OLDWT --clone CLONE --run RUN [--p-ref P] [--allowed-changes F] --report r.json
+"""
+
+import argparse
+import os
+import stat
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import brainrw as B  # noqa: E402
+
+
+def file_entry(full):
+    st = os.lstat(full)
+    if stat.S_ISLNK(st.st_mode):
+        return b"120000", B.git_blob_sha1(os.readlink(full))
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    with open(full, "rb") as f:
+        data = f.read()
+    return (b"100755" if st.st_mode & 0o100 else b"100644"), B.git_blob_sha1(data)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--old-worktree", required=True)
+    ap.add_argument("--clone", required=True)
+    ap.add_argument("--run", required=True)
+    ap.add_argument("--p-ref", help="P commit (default: the commit whose message starts with the P subject, HEAD if none)")
+    ap.add_argument("--allowed-changes")
+    ap.add_argument("--report", required=True)
+    a = ap.parse_args()
+    T = B.Timer()
+    errs = []
+    dp = B.DeletePaths(os.path.join(a.run, "delete-paths.txt"))
+    rows = {r["path"]: r for r in B.read_final_map(os.path.join(a.run, "final-map.tsv"))}
+    allowed = set()
+    if a.allowed_changes:
+        allowed = set(l.rstrip(b"\n") for l in open(a.allowed_changes, "rb") if l.strip())
+    p_ref = a.p_ref or B.load_json(os.path.join(a.run, "pointer-commit.json"))["p"]
+    head = B.git(a.clone, "rev-parse", "HEAD").strip().decode()
+    ptree = B.ls_tree(a.clone, p_ref)
+    htree = B.ls_tree(a.clone, head)
+
+    # (i)
+    owt = os.fsencode(os.path.abspath(a.old_worktree))
+    disk_of = B.worktree_paths(a.old_worktree, B.split_z(B.git(a.old_worktree, "ls-files", "-z", "--cached",
+                                                                 "--others", "--exclude-standard")))
+    old_paths = sorted(disk_of)  # NFC, as the rewrite records them
+    old_text, old_all = {}, set()
+    skipped = dict(deletePaths=0, missing=0, other=0)
+    for p in old_paths:
+        if dp.matches(p):
+            skipped["deletePaths"] += 1
+            continue
+        full = os.path.join(owt, disk_of[p])
+        if not os.path.lexists(full):
+            skipped["missing"] += 1
+            continue
+        old_all.add(p)
+        if B.is_lfs_path(p) and not os.path.islink(full):
+            continue
+        if B.is_lfs_path(p) and os.path.islink(full):
+            continue  # LFS-extension symlinks are checked under (iv) via final-map
+        e = file_entry(full)
+        if e is None:
+            skipped["other"] += 1
+            continue
+        old_text[p] = e
+    p_text = {p: v for p, v in ptree.items() if not B.is_lfs_path(p) and p != b".gitattributes"}
+    if set(p_text) != set(old_text):
+        errs.append("(i) text path sets differ: only old %d, only P %d, e.g. %r / %r" % (
+            len(set(old_text) - set(p_text)), len(set(p_text) - set(old_text)),
+            sorted(set(old_text) - set(p_text))[:3], sorted(set(p_text) - set(old_text))[:3]))
+    diff_i = [p for p in set(p_text) & set(old_text) if p_text[p] != old_text[p]]
+    if diff_i:
+        errs.append("(i) %d text files differ, e.g. %r" % (len(diff_i), sorted(diff_i)[:3]))
+    T.mark("i")
+
+    # (ii) and (iii)
+    changed = set(B.split_z(B.git(a.clone, "diff", "--name-only", "-z", "--no-renames", p_ref, head)))
+    if changed - allowed:
+        errs.append("(ii) P..HEAD changes outside allowed list: %r" % sorted(changed - allowed)[:5])
+    only_new = set(htree) - old_all - {b".gitattributes"} - allowed
+    if only_new:
+        errs.append("(iii) paths only in new HEAD: %d, e.g. %r" % (len(only_new), sorted(only_new)[:5]))
+    T.mark("ii-iii")
+
+    # (iv)
+    cat = B.CatFile(a.clone)
+    bad_iv = []
+    for p, (mode, oid) in htree.items():
+        if not B.is_lfs_path(p):
+            continue
+        r = rows.get(p)
+        if r is None:
+            bad_iv.append(p)
+            continue
+        if r["kind"] == "symlink":
+            ok = mode == b"120000" and oid == r["blob_sha1"]
+        elif r["kind"] == "empty":
+            ok = oid == B.EMPTY_BLOB
+        else:
+            ok = B.parse_pointer(cat.get(oid)[1] or b"") == (r["sha256"], r["size"])
+        if not ok:
+            bad_iv.append(p)
+    cat.close()
+    lfs_in_head = sum(1 for p in htree if B.is_lfs_path(p))
+    if bad_iv or lfs_in_head != len(rows):
+        errs.append("(iv) %d LFS paths wrong, HEAD has %d LFS paths vs final-map %d" % (len(bad_iv), lfs_in_head,
+                                                                                         len(rows)))
+    T.mark("iv")
+
+    # clone checkout equals HEAD
+    cwt = os.fsencode(os.path.abspath(a.clone))
+    bad_clone = []
+    for p, (mode, oid) in htree.items():
+        full = os.path.join(cwt, p)
+        try:
+            e = file_entry(full)
+        except FileNotFoundError:
+            e = None
+        if e != (mode, oid):
+            bad_clone.append(p)
+    if bad_clone:
+        errs.append("clone: %d files differ from HEAD, e.g. %r" % (len(bad_clone), sorted(bad_clone)[:3]))
+    status = B.split_z(B.git(a.clone, "status", "--porcelain", "-z", "--untracked-files=all"))
+    if status:
+        errs.append("clone: git status not clean (%d), e.g. %r" % (len(status), status[:3]))
+    T.mark("clone")
+
+    rep = dict(ok=not errs, errors=errs, p=p_ref, head=head, oldTextFiles=len(old_text), pTextFiles=len(p_text),
+               lfsPaths=lfs_in_head, finalMapRows=len(rows), changedPtoHead=len(changed), skipped=skipped,
+               cloneFiles=len(htree), seconds=T.marks)
+    B.write_json(a.report, rep)
+    print("stage 8: %s (%d errors)" % ("ok" if not errs else "FAIL", len(errs)))
+    sys.exit(0 if not errs else 1)
+
+
+if __name__ == "__main__":
+    main()

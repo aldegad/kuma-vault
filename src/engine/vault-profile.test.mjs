@@ -105,7 +105,7 @@ describe("audit F — same sync/lint entry point, only root/profile differ", () 
     expect(typeof vaultSync.changedCount).toBe("number");
     expect(typeof docsSync.changedCount).toBe("number");
 
-    const vaultLint = lintVaultFiles({ vaultDir: vaultRoot });
+    const vaultLint = lintVaultFiles({ vaultDir: vaultRoot, profile: "kuma-vault" });
     const docsLint = lintVaultFiles({ vaultDir: docsRoot, profile: "docs" });
     expect(vaultLint.vaultDir).toBe(vaultRoot);
     expect(docsLint.vaultDir).toBe(docsRoot);
@@ -127,7 +127,7 @@ describe("docs profile contract (differs from the vault slot contract)", () => {
     expect(docs.issues.some((issue) => issue.code === "missing-schema")).toBe(false);
     expect(docs.issues.some((issue) => issue.code === "schema-special-files-missing")).toBe(false);
 
-    const vaultOnSameTree = lintVaultFiles({ vaultDir: docsRoot, mode: "full" });
+    const vaultOnSameTree = lintVaultFiles({ vaultDir: docsRoot, profile: "kuma-vault", mode: "full" });
     expect(vaultOnSameTree.issues.some((issue) => issue.code === "missing-schema")).toBe(true);
   });
 

@@ -1,110 +1,149 @@
 # kuma-vault
 
-A repo-agnostic **knowledge-base compiler** extracted into its own package: frontmatter parsing, index sync, lint (drift gate), search, full-text search (FTS), sidecar extraction, and description enrichment. Host applications consume it as a library and inject their host-specific concerns (dispatch paths, project registry, model profiles).
+**A knowledge base your agents can rely on.** kuma-vault keeps a folder of Markdown notes
+honest the way a compiler keeps code honest: every index, summary and search cache is
+derived from the notes themselves, so they cannot drift apart. It ships as a CLI
+(`kuma-vault`, short alias `vault`), a small library, and three agent skills for Claude Code
+and Codex.
 
-> Status: self-standing engine library + `kuma-vault` CLI (`vault` short alias) + git
-> pre-commit drift-gate installer + interactive setup, packaged as a Claude Code / Codex plugin.
-> Not yet published to a registry.
+What you get:
+
+- **Search that agents can follow** — `search` → `timeline` → `get`, across every vault you
+  register, with a full-text index that handles CJK as well as English.
+- **Folder indexes that maintain themselves** — each folder's `README.md` carries a generated
+  index; `vault sync` regenerates it, `vault lint` and a git pre-commit gate catch drift.
+- **Optional one-line summaries** written by the Claude or Codex CLI (`vault sync --enrich`),
+  only for pages that are new or changed.
+- **Your choice of storage** — one computer, or a server you own (a free Oracle Cloud
+  machine or any Linux box) with a local copy kept in sync in the background.
+
+> Status: not yet published to npm or Homebrew. Install from a checkout (below).
 
 ## Requirements
 
-- **Node >= 22.5** — the FTS index uses `node:sqlite` (`DatabaseSync`, FTS5), which is a zero-native-build built-in on Node 22.5+.
-- Test runner: **vitest**.
-- Optional: `kordoc@^4` for PDF sidecar extraction (PDF engine bundled since kordoc 4.x — no separate `pdfjs-dist`; lazily imported so a vault with no PDFs never pays the load cost). Optional: a `claude` or `codex` CLI on PATH, only when using `--enrich`.
+- **Node 22.5 or newer** (the search index uses the built-in `node:sqlite`).
+- **git 2.38 or newer** and **Git LFS** — large files are stored as LFS pointers.
+- Optional: `kordoc@^4` for PDF text extraction; a `claude` or `codex` CLI on your PATH for
+  `--enrich`; `gh` if you want setup to star the project.
 
-## Install
+## Start here
 
-`kuma-vault` is not published to npm or Homebrew yet, so the command does not exist on a
-fresh machine until you install or link this checkout.
+Read in this order. Each step links to the one page that owns it.
 
-From a local checkout:
+### 1. Install the CLI
 
 ```bash
-cd /path/to/kuma-vault
+git clone https://github.com/aldegad/kuma-vault.git
+cd kuma-vault
 npm install
-npm link
-```
-
-After `npm link`, npm exposes both binary names from `package.json`:
-
-```bash
+npm link            # puts kuma-vault and vault on your PATH
 kuma-vault --help
-vault --help
 ```
 
-Use `kuma-vault` in docs, scripts, and setup instructions. `vault` is kept as a short alias for
-the same CLI.
+Without `npm link`, run `./bin/vault` from the checkout. To use the skills, register the
+`skills/<name>/` folders with your agent runtime, or build a plugin
+([plugin packaging](docs/plugin-packaging.md)).
 
-Without a global link, run the repo-local binary directly:
+### 2. Choose where the vault lives
+
+Pick one guide and follow it; each ends with one `kuma-vault setup --storage …` command:
+
+| Where | Guide | Good for |
+|---|---|---|
+| This computer only | [local.md](skills/kuma-vault-setup/docs/local.md) | trying it out; nothing leaves the machine. Moves to a server later without rewriting history |
+| Your own free Oracle Cloud server | [oracle.md](skills/kuma-vault-setup/docs/oracle.md) | agents on several machines; the vault stays reachable while your laptop sleeps |
+| A Linux server you already have | [other-remote.md](skills/kuma-vault-setup/docs/other-remote.md) | the same, on a VPS or home server, over Tailscale or HTTPS + token |
+
+Then choose which CLI writes page summaries (and, if you like, star the project):
 
 ```bash
-./bin/vault --help
-./bin/vault setup
+kuma-vault setup                 # interactive: enrich provider, optional GitHub star, optional git hook
 ```
 
-## Layout
+Or ask your agent to "set up kuma-vault" — the `kuma-vault-setup` skill asks the same
+questions and runs the same commands. Your vault always appears at `~/.kuma/vault`, whichever
+you choose. What the vault may commit and push to is fixed by the
+[storage policy](skills/kuma-vault/docs/storage-policy.md).
 
-```
-src/
-  index.mjs                     public API barrel
-  engine/                       pure compiler
-    vault-profile.mjs           profile abstraction (graph root)
-    vault-config.mjs            repo self-declaration resolver (vault.config.json → root + contract)
-    vault-ingest.mjs            frontmatter parser + core sync + dispatch-ingest
-    vault-search.mjs            search + get
-    vault-fts.mjs               node:sqlite FTS index
-    vault-lint.mjs              drift lint
-    vault-sync-triggers.mjs     self-heal / boundaries
-    vault-lifecycle-hook.mjs    dispatch-lifecycle lint hook
-    vault-sidecar.mjs           sidecar extraction (PDF via kordoc)
-    vault-enrich.mjs            pure enrich (injected generateDescription)
-    path-resolver.mjs           resolveVaultDir (env-driven)
-    atomic-file-store.mjs       atomic write primitive
-    kuma-paths.mjs              default dispatch/stamp paths (injectable)
-    project-attribution.mjs     pure project-id matcher (injected known ids)
-  enrich-adapters/
-    provider-adapter.mjs        createCliDescriptionGenerator (claude|codex)
-    process-util.mjs            CLI spawn primitive
-  cli/
-    cli.mjs                     node CLI router (vault-<verb>)
-    vault-commands.mjs          sync/lint/search/get/ingest adapters
-    enrich-config.mjs           reads provider from ~/.kuma-vault/config.json
-    setup.mjs                   `kuma-vault setup` (provider pick + GitHub star)
-bin/vault                       human CLI surface, exposed as `kuma-vault` and `vault`
-skills/                         kuma:vault (retrieval) + kuma:vault-setup (first-run)
-.claude-plugin/plugin.json      Claude Code plugin manifest
-.codex-plugin/plugin.json       Codex plugin manifest
-docs/design.md                  extraction design + dependency seams
-docs/setup.md                   interactive-setup research + design + evidence
-```
-
-## Setup
-
-Run setup after the CLI is installed or linked:
+### 3. Use it every day
 
 ```bash
-kuma-vault setup                       # interactive: pick an enrich provider, optionally star
-kuma-vault setup --provider claude --yes   # non-interactive (agent / CI); add --star to consent
+vault search "release checklist"     # L1: which pages match
+vault timeline "release checklist"   # L2: the lines around each match
+vault get domains/ops/release.md     # L3: one page in full
+vault sync                           # regenerate folder indexes, sidecars and the search cache
+vault sync --enrich                  # also write one-line summaries for new or changed pages
+vault lint --mode full --root ~/.kuma/vault
+vault graph --open                   # see how the pages connect
 ```
 
-Setup records the enrich provider (`claude` | `codex`) to `~/.kuma-vault/config.json` and, only on
-explicit consent, stars the project via `gh`. The choice is always the user's. See `docs/setup.md`
-for the doc-first design and cross-runtime (Claude Code / Codex) plugin packaging. `vault setup`
-is kept as a short alias for the same CLI.
+Agents get the same surface through the `kuma-vault` skill. How the compiler works:
+[architecture](docs/architecture.md).
+
+On a server-backed vault the sync daemon commits and pushes for you (`vault sync status`
+shows it), search asks the server, and large files arrive as small pointers until you
+open them with `vault blob get <path>`. Details: [remote mode](docs/remote-mode.md) and
+[sync](docs/sync.md).
+
+### 4. Back it up, and practise restoring
+
+| Store | Backup | Guide |
+|---|---|---|
+| Server-backed | the server's nightly restic job, with an automatic restore drill | [server.md › Backup](docs/server.md#backup) |
+| Local only | client-encrypted restic to S3-compatible storage | skill [kuma-vault-remote-backup](skills/kuma-vault-remote-backup/SKILL.md) |
+
+A backup counts only once you have restored from it.
+
+## The three skills
+
+| Skill | Use it when |
+|---|---|
+| [`kuma-vault`](skills/kuma-vault/SKILL.md) | searching, recalling earlier work, checking facts at their source, filing new knowledge (`ingest`), tidying the vault (`curate`), drawing the graph |
+| [`kuma-vault-setup`](skills/kuma-vault-setup/SKILL.md) | installing, choosing or changing where the vault lives, adding a store, choosing the enrich provider |
+| [`kuma-vault-remote-backup`](skills/kuma-vault-remote-backup/SKILL.md) | backing up a local-only vault offsite with client-side encryption, verifying or restoring that backup |
+
+## Documentation map
+
+| Page | What it owns |
+|---|---|
+| [architecture](docs/architecture.md) | the model: derived views, folder topology, enrich, commit gate, `vault.config.json` |
+| [setup](docs/setup.md) | `kuma-vault setup`: every flag and what each storage step does |
+| [remote mode](docs/remote-mode.md) | store registry, remote search, commit gate, git hooks, `binaries.reject`, migration |
+| [sync](docs/sync.md) | `vault clone`, the sync daemon, conflicts, alarms, large files |
+| [server](docs/server.md) | `vault serve`: install, identity, receive rules, search index, backup |
+| [cross-store pointers](docs/cross-store-pointers.md) | linking one vault to another and how lint checks it |
+| [design](docs/design.md) | the library's public API and what a host application injects |
+| [plugin packaging](docs/plugin-packaging.md) | building a Claude Code / Codex plugin from this checkout |
+| [CHANGELOG](CHANGELOG.md) | what changed, release by release |
+
+## Repository layout
+
+```
+bin/vault          the CLI, exposed as kuma-vault and vault
+src/engine/        the compiler: frontmatter, sync, lint, search, FTS, sidecars, enrich
+src/enrich-adapters/  spawns the claude or codex CLI for --enrich
+src/cli/           command routing, setup, graph
+src/sync/          vault clone and the sync daemon (client half of remote mode)
+src/server/        vault serve and vault server (server half; imports nothing from the engine)
+src/backup/        client-side backup retirement checks
+src/index.mjs      the library's public API
+skills/            the three agent skills
+packaging/         plugin manifest templates (not plugin roots)
+docs/              the pages in the map above
+```
 
 ## Design principles
 
-- **SSoT** — the engine source lives here, once. Consumers import it; they do not vendor a copy.
-- **SoC** — the engine is a pure compiler. Host-specific concerns are **injected**: dispatch paths (`taskDir`/`resultDir`/`stampDir`), the project registry (`knownProjectIds`), and the enrich model policy (which provider/model to spawn). The engine ships no-op/empty defaults so a generic tree works with no dispatch or project concepts.
-- **No Silent Fallback** — a missing enrich provider or PDF dependency throws a clear error; nothing is silently skipped.
-- **Repo self-declaration** — a managed tree declares its own contract in a root-level `vault.config.json` (base contract id + tree-local overrides). `vault sync`/`vault lint` resolve the target root *and* its contract from that declaration in one step: a disagreeing `--profile` flag is a hard error, an undeclared tree without explicit flags is a hard error, and there is no default-vault fallback. This structurally removes the flag-pair accident class (`--profile` without `--root` applying a foreign contract to the wrong tree).
+- **One source of truth.** People and agents edit the notes; indexes, sidecars and search
+  caches are generated from them and never edited by hand.
+- **The engine is a pure compiler.** Host concerns — task-result paths, a project registry,
+  which model writes summaries — are injected by the host, never built in.
+- **No silent fallback.** A missing provider, an undeclared tree or an unreachable server is
+  an error that says what to do, not a quiet guess.
+- **Trees declare themselves.** A vault's root `vault.config.json` names its contract;
+  `sync` and `lint` read it and refuse a tree that has none.
 
-See `docs/design.md` for the full dependency-seam analysis, and `docs/architecture.md` for the
-four-domain topology (kuma-studio = system/host, kuma-vault = ontology engine, knowledge repos =
-sibling content trees, each self-declaring via `vault.config.json`) and the fail-loud resolution
-contract.
-
-## Test
+## Develop
 
 ```bash
 npm install

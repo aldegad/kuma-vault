@@ -10,6 +10,9 @@ import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { readNumber, readOptionalString } from "./cli-options.mjs";
 import { resolveDefaultEnrichGenerator } from "./enrich-config.mjs";
+import { checkCommitPolicy } from "../engine/commit-policy.mjs";
+import { loadVaultDeclaration, resolveTreeContract } from "../engine/vault-config.mjs";
+import { findStoreByRoot, loadStoreRegistry } from "../engine/vault-stores.mjs";
 // Compiler vault engine — this package's own public API.
 import {
   ENRICH_FIELDS_ALL,
@@ -27,12 +30,13 @@ import {
   resolveVaultContract,
   resolveVaultDir,
   runVaultSync,
-  searchVault,
+  searchVaultStores,
+  searchVaultTree,
   vaultSyncExitCode,
 } from "../index.mjs";
 
 // Generic distribution: no host project registry. Dispatch-ingest project attribution
-// (the C4 seam) takes an injected list; a generic tree threads an empty list so no
+// (the project-registry seam) takes an injected list; a generic tree threads an empty list so no
 // slug-prefix inference fires. A consumer with a registry passes its own via the engine API.
 function getKnownProjectIds() {
   return [];
@@ -49,7 +53,7 @@ function printVaultUsage() {
       "  vault-search --query <q> [--mode search|timeline] [--engine auto|fts|scan] [--limit <n>] [--vault-dir <path>] [--format text|json]",
       "  vault-get <id|path> [more ids...] [--vault-dir <path>] [--format text|json]",
       "  vault-ingest [source] [--section <s>] [--page <p>] [--project <slug>] [--bypass] [--dry-run] [--vault-dir <path>]",
-      "  vault-sync [--check] [--enrich] [--enrich-limit <n>] [--root <path>] [--profile <id>] [--json]",
+      "  vault-sync [--check] [--no-fts] [--enrich] [--enrich-limit <n>] [--root <path>] [--profile <id>] [--json]",
       "  vault-lint [--mode fast|full] [--root <path>] [--profile <id>] [--json] [files...]",
       "",
       "Options:",
@@ -223,7 +227,7 @@ export async function commandVaultIngest(options, args = []) {
   const signal = readOptionalString(options, "signal") ?? undefined;
   const stampDir = readOptionalString(options, "stamp-dir") ?? undefined;
   const useGuardedResultIngest = Boolean(signal || stampDir);
-  // C4 seam: the engine takes the resolved known project ids as an injected parameter
+  // Project-registry seam: the engine takes the resolved known project ids as an injected parameter
   // (it no longer reads a projects registry itself). The generic CLI has none.
   const knownProjectIds = getKnownProjectIds();
 
@@ -276,6 +280,12 @@ export async function commandVaultIngest(options, args = []) {
     });
     process.stdout.write(`${JSON.stringify(response, null, 2)}\n`);
     return;
+  }
+
+  // The lint after the write judges the tree under the contract it declares; a tree whose
+  // contract cannot be resolved fails here, before anything is written.
+  if (!dryRun) {
+    resolveTreeContract(resolve(activeVaultDir ?? resolveVaultDir()));
   }
 
   let response;
@@ -472,13 +482,17 @@ export async function commandVaultSearch(options) {
   const mode = readOptionalString(options, "mode") ?? "search";
   const limit = readNumber(options, "limit", 20);
   const engine = readOptionalString(options, "engine") ?? "auto";
-  const result = await searchVault({
-    query,
-    mode,
-    limit,
-    engine,
-    vaultDir: readOptionalString(options, "vault-dir") ?? undefined,
-  });
+  // Cross-store search is the default. `--vault-dir` keeps its existing meaning —
+  // "this tree only" — so an explicit root still narrows, and `--store <id>` narrows
+  // to one registered store.
+  const explicitVaultDir = readOptionalString(options, "vault-dir") ?? undefined;
+  const storeId = readOptionalString(options, "store") ?? undefined;
+  // `--local`: a remote-search store is searched on this clone's copy (no index) instead of its
+  // server. Never automatic — a server failure is an error that names this flag.
+  const local = options.local === true;
+  const result = explicitVaultDir
+    ? await searchVaultTree({ query, mode, limit, engine, vaultDir: explicitVaultDir, local })
+    : await searchVaultStores({ query, mode, limit, engine, storeId, local });
 
   const format = readOptionalString(options, "format") ?? "text";
   if (format === "json") {
@@ -534,7 +548,7 @@ export async function commandVaultSync(options) {
     options,
     // `generateDescription` is an internal injectable seam (E2E driver), never a CLI arg,
     // but programmatic callers pass it, so it is a known key.
-    ["check", "enrich", "enrich-limit", "root", "vault-dir", "wiki-dir", "profile", "json", "generateDescription"],
+    ["check", "no-fts", "enrich", "enrich-limit", "root", "vault-dir", "wiki-dir", "profile", "json", "generateDescription"],
     "vault sync",
   );
 
@@ -551,6 +565,29 @@ export async function commandVaultSync(options) {
     profile: readOptionalString(options, "profile"),
   });
 
+  // Commit policy (check mode = the pre-commit gate): a vault freeze, intermediates in a
+  // `binaries.reject` place, an oversized non-LFS file. Judged on what is staged, before any
+  // derivation runs — a refused commit needs no index work.
+  if (options.check === true) {
+    const declaration = loadVaultDeclaration(vaultDir);
+    const policy = checkCommitPolicy({ vaultDir, declaration });
+    if (policy.violations.length > 0) {
+      for (const violation of policy.violations) process.stderr.write(`vault gate [${violation.rule}] ${violation.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    if (policy.freezeException) process.stderr.write("vault gate: 동결 중 — KUMA_VAULT_FREEZE_ID 예외 커밋\n");
+  }
+
+  // A store registered with remote search keeps its index on the server: the gate does not
+  // build a local `.fts/` for it. Said in the report, never silent.
+  let ftsSkipped = options["no-fts"] === true ? "--no-fts" : null;
+  if (!ftsSkipped) {
+    const registry = loadStoreRegistry();
+    const found = registry.present && !registry.invalid ? findStoreByRoot(registry, vaultDir) : null;
+    if (found?.entry.search === "remote") ftsSkipped = `remote store ${found.id} — the index is on its server`;
+  }
+
   // The composition, the report shape and the exit gate are the engine's (vault-sync-pipeline).
   // This adapter contributes only what is this distribution's own: its provider generator and
   // the field set that generator's response contract supports.
@@ -558,6 +595,7 @@ export async function commandVaultSync(options) {
     vaultDir,
     profile,
     check: options.check === true,
+    fts: ftsSkipped === null,
     enrich: options.enrich === true,
     enrichLimit: readNumber(options, "enrich-limit"),
     // This package's provider adapter returns { description, tags, aliases }, so the CLI opts
@@ -569,9 +607,10 @@ export async function commandVaultSync(options) {
   });
 
   if (options.json === true) {
-    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ ...report, ...(ftsSkipped ? { ftsSkipped } : {}) }, null, 2)}\n`);
   } else {
     process.stdout.write(formatVaultSyncReport(report));
+    if (ftsSkipped) process.stdout.write(`fts: skipped (${ftsSkipped})\n`);
   }
 
   if (vaultSyncExitCode(report) === 1) {

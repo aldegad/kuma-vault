@@ -1,0 +1,8 @@
+# Synthetic itemize records: short protocol format, then GNU format.
+.L...p... alias -> document.txt
+cLc.Tp... alias -> executable.sh
+.L..Tp... alias -> document.txt
+.f...p... document.txt
+<f..t.... document.txt
+.d..t.... ./
+.L...p..... alias -> document.txt

@@ -15,6 +15,7 @@ import {
   discoverVaultDeclaration,
   loadVaultDeclaration,
   resolveDeclaredProfile,
+  resolveTreeContract,
   resolveVaultContract,
 } from "./vault-config.mjs";
 import { DOCS_PROFILE, VAULT_PROFILE } from "./vault-profile.mjs";
@@ -71,6 +72,30 @@ describe("loadVaultDeclaration", () => {
 
     writeDeclaration(root, { profile: "docs", schema: { path: "x.md", extra: true } });
     expect(() => loadVaultDeclaration(root)).toThrow(/"schema" has unknown key\(s\) extra/u);
+  });
+
+  it("accepts binaries.reject (tree-relative globs) and refuses anything else under binaries", () => {
+    writeDeclaration(root, { profile: "kuma-vault", binaries: { reject: ["work/frames/**"] } });
+    expect(loadVaultDeclaration(root).binaries.reject).toEqual(["work/frames/**"]);
+
+    writeDeclaration(root, { profile: "kuma-vault", binaries: { autosave: ["*.png"] } });
+    expect(() => loadVaultDeclaration(root)).toThrow(/"binaries" has unknown key\(s\) autosave/u);
+
+    writeDeclaration(root, { profile: "kuma-vault", binaries: { reject: "work/**" } });
+    expect(() => loadVaultDeclaration(root)).toThrow(/"binaries.reject" must be an array/u);
+  });
+
+  it("accepts personaMemoryPages as top-level domains/<name>.md paths only, and defaults it to none", () => {
+    writeDeclaration(root, { profile: "kuma-vault", personaMemoryPages: ["domains/nova.md"] });
+    expect(resolveDeclaredProfile(loadVaultDeclaration(root)).personaMemoryPages).toEqual(["domains/nova.md"]);
+    expect(VAULT_PROFILE.personaMemoryPages).toEqual([]);
+
+    for (const entry of ["domains/tools/nova.md", "nova.md", "domains/README.md", "domains/nova"]) {
+      writeDeclaration(root, { profile: "kuma-vault", personaMemoryPages: [entry] });
+      expect(() => loadVaultDeclaration(root)).toThrow(/"personaMemoryPages" entries must be top-level domains/u);
+    }
+    writeDeclaration(root, { profile: "kuma-vault", personaMemoryPages: "domains/nova.md" });
+    expect(() => loadVaultDeclaration(root)).toThrow(/array of non-empty strings/u);
   });
 });
 
@@ -190,5 +215,44 @@ describe("resolveVaultContract", () => {
     const result = resolveVaultContract({ cwd: tmpdir(), env: { KUMA_VAULT_DIR: root } });
     expect(result.vaultDir).toBe(root);
     expect(result.profile.id).toBe("kuma-vault");
+  });
+});
+
+// The contract every lint/sync pass runs under for a known root: lint, `runVaultSync` and the
+// CLI ingest resolve through it, so a caller that names no contract still gets the declared one.
+describe("resolveTreeContract", () => {
+  const PERSONA = { profile: "kuma-vault", personaMemoryPages: ["domains/nova.md"] };
+
+  it("a declared tree with no contract given → the declared contract, overrides included", () => {
+    writeDeclaration(root, PERSONA);
+    expect(resolveTreeContract(root).personaMemoryPages).toEqual(["domains/nova.md"]);
+  });
+
+  it("the declared contract passed back (by id or as the resolved object) is accepted", () => {
+    writeDeclaration(root, PERSONA);
+    const declared = resolveDeclaredProfile(loadVaultDeclaration(root));
+    expect(resolveTreeContract(root, "kuma-vault")).toEqual(declared);
+    expect(resolveTreeContract(root, declared)).toEqual(declared);
+    expect(resolveTreeContract(root, JSON.parse(JSON.stringify(declared)))).toEqual(declared);
+  });
+
+  it("a contract other than the declared one throws — a built-in object with the same id included", () => {
+    writeDeclaration(root, PERSONA);
+    expect(() => resolveTreeContract(root, "docs")).toThrow(/conflicts with the vault\.config\.json declaration/u);
+    // VAULT_PROFILE carries the declared id but none of the declared persona pages.
+    expect(() => resolveTreeContract(root, VAULT_PROFILE)).toThrow(/is not the one its vault\.config\.json declares/u);
+  });
+
+  it("an undeclared tree needs a contract: none throws, an id or object is used as given", () => {
+    expect(() => resolveTreeContract(root)).toThrow(/No vault\.config\.json declaration at .* and no contract given/u);
+    expect(() => resolveTreeContract(root, "  ")).toThrow(/no contract given/u);
+    expect(resolveTreeContract(root, "docs")).toBe(DOCS_PROFILE);
+    expect(resolveTreeContract(root, VAULT_PROFILE)).toBe(VAULT_PROFILE);
+  });
+
+  it("an invalid declaration throws instead of falling back", () => {
+    writeFileSync(join(root, VAULT_CONFIG_FILENAME), "{ not json");
+    expect(() => resolveTreeContract(root)).toThrow(/Invalid vault declaration/u);
+    expect(() => resolveTreeContract(root, "kuma-vault")).toThrow(/Invalid vault declaration/u);
   });
 });

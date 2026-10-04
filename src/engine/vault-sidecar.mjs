@@ -79,9 +79,19 @@ export const SIDECAR_EXTRACTORS = new Map([
 
 // --- Hashing + stamp -------------------------------------------------------------------
 
+// In a remote store a large binary is a git-lfs pointer on disk until it is fetched. The
+// pointer's oid IS the sha256 of the content, so the stamp check needs no bytes: a pointer is
+// in sync with a sidecar stamped with its oid. Extraction (a stale or missing sidecar) still
+// needs the real file and fails loud on a pointer.
+const LFS_POINTER = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:([0-9a-f]{64})\nsize (0|[1-9][0-9]*)\n$/u;
+
 async function sha256File(absolutePath) {
   const buffer = await readFile(absolutePath);
-  return createHash("sha256").update(buffer).digest("hex");
+  if (buffer.length <= 1024) {
+    const pointer = LFS_POINTER.exec(buffer.toString("utf8"));
+    if (pointer) return { sha256: pointer[1], lfsPointer: true };
+  }
+  return { sha256: createHash("sha256").update(buffer).digest("hex"), lfsPointer: false };
 }
 
 // Read the idempotency stamp (source hash + extractor) from an existing sidecar without
@@ -254,8 +264,9 @@ export async function syncVaultSidecars({ vaultDir, check = false, profile = VAU
     const sidecarRelativePath = `${source.relativePath}.md`;
 
     let sha256;
+    let lfsPointer;
     try {
-      sha256 = await sha256File(source.absolutePath);
+      ({ sha256, lfsPointer } = await sha256File(source.absolutePath));
     } catch (error) {
       failed.push({ path: source.relativePath, error: `hash failed: ${error.message}` });
       continue;
@@ -270,6 +281,11 @@ export async function syncVaultSidecars({ vaultDir, check = false, profile = VAU
     const reason = stamp ? "hash-changed" : "missing";
     if (check) {
       regenerated.push({ path: sidecarRelativePath, created: !stamp, reason });
+      continue;
+    }
+
+    if (lfsPointer) {
+      failed.push({ path: source.relativePath, error: `LFS pointer (sha256 ${sha256.slice(0, 12)}…) — fetch the file first (vault blob get ${source.relativePath}), then sync` });
       continue;
     }
 

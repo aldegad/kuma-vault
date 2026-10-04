@@ -38,6 +38,11 @@ export const VAULT_PROFILE = Object.freeze({
   // domain taxonomy tree drift). Off for generic docs-as-code trees that don't
   // carry the vault's projects/domains slot semantics.
   canonicalChecks: true,
+  // Top-level `domains/<name>.md` pages that are persona-memory pages (linted with that
+  // contract; every other top-level page is domain-top-level-drift). A tree declares its own in
+  // vault.config.json — no page shape tells a persona page from a misplaced topic page, so the
+  // engine names none.
+  personaMemoryPages: Object.freeze([]),
   // Enforce the vault canonical-page frontmatter/section authoring contract on
   // every content page (title/created/updated, per-page-type schemas; the
   // `domain` field is REJECTED here as deprecated — 2026-07-05). Generic
@@ -92,6 +97,7 @@ export const DOCS_PROFILE = Object.freeze({
   enrich: false,
   fts: false,
   canonicalChecks: false,
+  personaMemoryPages: Object.freeze([]),
   enforcePageFrontmatter: false,
   genericPageSections: Object.freeze(["Summary", "Details", "Related"]),
   navScope: "git-tracked",

@@ -15,10 +15,10 @@
 //
 //   - `generateDescription` / `createGenerateDescription` — which model writes a page's
 //     synopsis. The generic CLI resolves it from ~/.kuma-vault/config.json; kuma-studio
-//     injects its Moonbi team-config generator.
+//     injects a generator built from its team config.
 //   - `enrichFields` — which leaf-frontmatter fields the enrich pass may fill. This is NOT a
 //     free choice: it is the dependent variable of the generator's response contract. A
-//     generator that returns a bare description string (the host's Moonbi prompt) must select
+//     generator that returns a bare description string (the host's prompt) must select
 //     `["description"]` only, because asking for `tags`/`aliases` it never produces writes
 //     empty arrays AND their freshness stamps, permanently suppressing later enrichment. A
 //     generator that returns `{description, tags, aliases}` (this package's provider adapter)
@@ -30,7 +30,7 @@ import { enrichVaultDescriptions } from "./vault-enrich.mjs";
 import { healFtsIndex } from "./vault-fts.mjs";
 import { syncVaultIndex } from "./vault-ingest.mjs";
 import { lintVaultFiles } from "./vault-lint.mjs";
-import { resolveProfile } from "./vault-profile.mjs";
+import { resolveTreeContract } from "./vault-config.mjs";
 import { syncVaultSidecars } from "./vault-sidecar.mjs";
 
 export function formatVaultSyncReport(report) {
@@ -146,8 +146,13 @@ function summarizeVaultSyncLint(lintResult) {
  *
  * @param {object} options
  * @param {string} options.vaultDir Resolved tree root.
- * @param {object|string} options.profile Resolved contract (or a built-in profile id).
+ * @param {object|string} [options.profile] Resolved contract (or a built-in profile id). A
+ *   declared tree's contract is its declaration (`resolveTreeContract`): omit it, or pass the
+ *   declared one; an undeclared tree needs it.
  * @param {boolean} [options.check] Report drift without writing.
+ * @param {boolean} [options.fts] Heal the `.fts/` search cache (default true). `--no-fts` turns
+ *   it off for a tree whose search index lives elsewhere (a remote store indexes on its server;
+ *   the sync daemon's autosave runs `vault sync --no-fts` before it commits).
  * @param {boolean} [options.enrich] Run the opt-in LLM leaf-metadata pass.
  * @param {number} [options.enrichLimit] Cap pages one enrich write run may (re)generate.
  * @param {string[]} [options.enrichFields] Leaf fields the enrich pass may fill; must match
@@ -156,7 +161,7 @@ function summarizeVaultSyncLint(lintResult) {
  * @param {Function} [options.generateDescription] Explicit generator (tests / E2E drivers).
  * @param {Function} [options.createGenerateDescription] Lazy factory for the production
  *   generator. Called ONLY when a write-mode enrich actually needs it, so a consumer whose
- *   generator construction reads config and throws (kuma-studio's Moonbi team-config lookup)
+ *   generator construction reads config and throws (kuma-studio's team-config lookup)
  *   cannot break a plain `vault sync`.
  * @returns {Promise<object>} The sync report, with the full lint result as `lintReport`.
  */
@@ -164,13 +169,14 @@ export async function runVaultSync({
   vaultDir,
   profile,
   check = false,
+  fts: ftsEnabled = true,
   enrich = false,
   enrichLimit,
   enrichFields,
   generateDescription,
   createGenerateDescription,
 } = {}) {
-  const resolvedProfile = resolveProfile(profile);
+  const resolvedProfile = resolveTreeContract(vaultDir, profile);
 
   if (enrich && !resolvedProfile.enrich) {
     // No Silent Fallback: a profile that does not carry the LLM-enrich contract
@@ -216,7 +222,7 @@ export async function runVaultSync({
   // owns this case — the derived cache recovers from the live truth instead of stopping and
   // calling a human. Tracked derivations in the gate below keep the loud refusal.
   let fts = null;
-  if (resolvedProfile.fts) {
+  if (resolvedProfile.fts && ftsEnabled) {
     fts = await healFtsIndex({ vaultDir: sync.vaultDir, profile: resolvedProfile });
   }
 

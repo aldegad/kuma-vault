@@ -16,14 +16,17 @@ import {
   resolveGitTrackedDirs,
   rewriteCrossReferenceBullet,
 } from "./vault-ingest.mjs";
-import { VAULT_PROFILE, resolveProfile } from "./vault-profile.mjs";
+import { resolveTreeContract } from "./vault-config.mjs";
 import { loadStoreRegistry } from "./vault-stores.mjs";
 
 // Nav context: the resolved profile plus the (optional) git-tracked directory set,
 // resolved once per lint run and threaded through every tree walk so lint and the
 // index generator stay in lockstep on scope (원칙 3 Consistency; DEC step 8).
+// The contract comes from the tree's own declaration (`resolveTreeContract`), so every
+// caller — the CLI, ingest, the lifecycle hook, self-heal, a host importing the engine —
+// lints a tree under the contract it declares without having to pass it.
 function buildLintNavContext(vaultDir, profile) {
-  const resolved = resolveProfile(profile);
+  const resolved = resolveTreeContract(vaultDir, profile);
   const trackedDirs = resolved.navScope === "git-tracked" ? resolveGitTrackedDirs(vaultDir) : null;
   return { profile: resolved, trackedDirs };
 }
@@ -87,29 +90,11 @@ const RESULT_SOURCE_PATTERN = /(?:^|\/)results\/[^/]+\.result\.md$|\.result\.md$
 const RESULT_ARCHIVE_FILE_PATTERN = /^results\/.+\.md$/u;
 const FENCED_CODE_PATTERN = /^\s*(?:```|~~~)/u;
 // Archive-tree slots and the full-scan skip set are profile-owned now
-// (VAULT_PROFILE.archiveTreeDirs) so lint honors the same non-nav contract as the
+// (profile.archiveTreeDirs) so lint honors the same non-nav contract as the
 // generator for every tree (DEC step 8).
-const DOMAIN_CATEGORY_INDEX_FILES = new Set([
-  "domains/agent-tooling/README.md",
-  "domains/engineering/README.md",
-  "domains/media/README.md",
-  "domains/personal/README.md",
-  "domains/reference-philosophy/README.md",
-  "domains/research/README.md",
-  "domains/security/README.md",
-  "domains/sns/README.md",
-  "domains/system/README.md",
-  "domains/tools/README.md",
-]);
-const PERSONA_MEMORY_FILES = new Set([
-  "domains/claudecy.md",
-  "domains/codexy.md",
-  "domains/jjooni.md",
-]);
-const TOP_LEVEL_DOMAIN_REFERENCE_FILES = new Set([
-  "domains/cloudflare-workers-ai.md",
-  "domains/magenta-realtime-2.md",
-]);
+// The domain tree's shape holds no vault's names: every top-level `domains/<category>/` directory
+// is a category with a README entry point, and the only top-level `domains/<name>.md` pages are
+// the persona-memory pages the tree declares (profile.personaMemoryPages).
 const DOMAIN_ASSET_DIR_NAMES = new Set([
   "_assets",
   "_attachments",
@@ -290,10 +275,6 @@ function isCalendarPage(fileName) {
   return /^calendar\/.+\.md$/u.test(fileName);
 }
 
-function isDomainCategoryIndexPage(fileName) {
-  return DOMAIN_CATEGORY_INDEX_FILES.has(fileName);
-}
-
 function isProjectDecisionPage(fileName) {
   return /^projects\/[^/]+\.project-decisions\.md$/u.test(fileName);
 }
@@ -302,8 +283,11 @@ function isTopLevelDomainPage(fileName) {
   return /^domains\/[^/]+\.md$/u.test(fileName);
 }
 
-function isPersonaMemoryPage(fileName) {
-  return PERSONA_MEMORY_FILES.has(fileName);
+// Persona-memory pages are the only top-level `domains/<name>.md` pages, and the tree names them
+// itself (`personaMemoryPages` in its vault.config.json declaration, default none): no page shape
+// tells a persona page from a topic page left at the top level.
+function isPersonaMemoryPage(fileName, profile) {
+  return (profile.personaMemoryPages ?? []).includes(fileName);
 }
 
 function isOperationalRulePage(fileName) {
@@ -318,7 +302,7 @@ function isNestedReferenceDocPage(fileName) {
   );
 }
 
-function walkVaultMarkdownFileNames(vaultDir, currentDir = vaultDir, ctx = { profile: VAULT_PROFILE, trackedDirs: null }) {
+function walkVaultMarkdownFileNames(vaultDir, currentDir = vaultDir, ctx) {
   const { profile } = ctx;
   const fileNames = [];
 
@@ -666,7 +650,7 @@ function extractReadmeIntroSummary(body) {
   return "";
 }
 
-function isArchiveRelativePath(relativePath, profile = VAULT_PROFILE) {
+function isArchiveRelativePath(relativePath, profile) {
   // Delegate to the generator's predicate so lint and vault-ingest share one
   // archive-slot contract per profile (SSoT #1; DEC step 8).
   return isArchiveTreeRelativePath(relativePath, profile);
@@ -678,7 +662,7 @@ function isArchiveRelativePath(relativePath, profile = VAULT_PROFILE) {
 // single predicate and cannot drift apart (SSoT #1; 원칙 3 Consistency; DEC vault-compiler
 // step 12/13).
 
-function readVaultIndexChildSync(vaultDir, folderPath, entry, ctx = { profile: VAULT_PROFILE, trackedDirs: null }) {
+function readVaultIndexChildSync(vaultDir, folderPath, entry, ctx) {
   const { profile } = ctx;
   const childPath = join(folderPath, entry.name);
   const relativePath = normalizeRelativePath(relative(vaultDir, childPath));
@@ -742,7 +726,7 @@ function readVaultIndexChildSync(vaultDir, folderPath, entry, ctx = { profile: V
   };
 }
 
-function buildVaultIndexRegionSync(vaultDir, readmePath, ctx = { profile: VAULT_PROFILE, trackedDirs: null }) {
+function buildVaultIndexRegionSync(vaultDir, readmePath, ctx) {
   const folderPath = dirname(readmePath);
   const folderRelativePath = normalizeRelativePath(relative(vaultDir, folderPath));
   if (folderRelativePath && isArchiveRelativePath(folderRelativePath, ctx.profile)) {
@@ -785,7 +769,7 @@ function extractRegionLinkTargets(regionMarkdown) {
     .sort((left, right) => left.localeCompare(right));
 }
 
-function lintReadmePage(fileName, absolutePath, mode, vaultDir, ctx = { profile: VAULT_PROFILE, trackedDirs: null }) {
+function lintReadmePage(fileName, absolutePath, mode, vaultDir, ctx) {
   const issues = [];
   const contents = readFileSync(absolutePath, "utf8");
 
@@ -980,41 +964,35 @@ function hasAssetDirectorySegment(relativePath) {
   ));
 }
 
-function scanDomainTreeDrift(vaultDir) {
+function scanDomainTreeDrift(vaultDir, profile) {
   const issues = [];
   const domainsDir = join(vaultDir, "domains");
   if (!existsSync(domainsDir)) {
     return issues;
   }
 
-  const allowedTopLevelFiles = new Set([
-    "domains/README.md",
-    ...DOMAIN_CATEGORY_INDEX_FILES,
-    ...PERSONA_MEMORY_FILES,
-    "domains/cloudflare-workers-ai.md",
-    "domains/magenta-realtime-2.md",
-  ]);
-
   for (const entry of readdirSync(domainsDir, { withFileTypes: true })) {
     const relativePath = `domains/${entry.name}`;
-    if (entry.isFile() && entry.name.endsWith(".md") && !allowedTopLevelFiles.has(relativePath)) {
+    if (
+      entry.isFile() &&
+      entry.name.endsWith(".md") &&
+      relativePath !== "domains/README.md" &&
+      !isPersonaMemoryPage(relativePath, profile)
+    ) {
       issues.push({
         file: relativePath,
         code: "domain-top-level-drift",
-        message: `${relativePath}: top-level domain pages must be category indexes or registered persona-memory pages`,
+        message: `${relativePath}: top-level domain pages must be persona-memory pages declared in vault.config.json personaMemoryPages; put topics under a category directory`,
       });
       continue;
     }
 
-    if (entry.isDirectory() && !entry.name.startsWith("_")) {
-      const categoryIndex = `domains/${entry.name}/README.md`;
-      if (!DOMAIN_CATEGORY_INDEX_FILES.has(categoryIndex)) {
-        issues.push({
-          file: relativePath,
-          code: "domain-category-dir-drift",
-          message: `${relativePath}: top-level domain directories must have a registered README category index`,
-        });
-      }
+    if (entry.isDirectory() && !entry.name.startsWith("_") && !existsSync(join(domainsDir, entry.name, "README.md"))) {
+      issues.push({
+        file: relativePath,
+        code: "domain-category-dir-drift",
+        message: `${relativePath}: top-level domain directories must have a README category index`,
+      });
     }
   }
 
@@ -1050,7 +1028,7 @@ function isMarkdownFileName(fileName) {
   return fileName.endsWith(".md");
 }
 
-function isExcludedFromReachability(relativePath, profile = VAULT_PROFILE) {
+function isExcludedFromReachability(relativePath, profile) {
   const normalizedPath = normalizeRelativePath(relativePath);
   if (normalizedPath === "index.md") {
     return true;
@@ -1076,7 +1054,7 @@ function isExcludedFromReachability(relativePath, profile = VAULT_PROFILE) {
   return isArchiveRelativePath(normalizedPath, profile);
 }
 
-function walkReachableMarkdownFiles(vaultDir, currentDir = vaultDir, ctx = { profile: VAULT_PROFILE, trackedDirs: null }) {
+function walkReachableMarkdownFiles(vaultDir, currentDir = vaultDir, ctx) {
   const { profile } = ctx;
   const files = [];
   for (const entry of readdirSync(currentDir, { withFileTypes: true })) {
@@ -1169,7 +1147,7 @@ function resolveVaultLinkTarget(vaultRealDir, fromFile, rawTarget) {
   return { error: "broken-link", path: initialPath };
 }
 
-function scanLegacyIndexFiles(vaultDir, ctx = { profile: VAULT_PROFILE, trackedDirs: null }) {
+function scanLegacyIndexFiles(vaultDir, ctx) {
   const { profile } = ctx;
   const issues = [];
   function walk(currentDir) {
@@ -1222,7 +1200,7 @@ function collectNavigationLinkTargets(filePath) {
   return collectMarkdownLinks(region);
 }
 
-function scanReachability(vaultDir, ctx = { profile: VAULT_PROFILE, trackedDirs: null }) {
+function scanReachability(vaultDir, ctx) {
   const { profile } = ctx;
   const issues = [];
   const vaultRealDir = realpathSync(vaultDir);
@@ -1338,7 +1316,7 @@ function lintDeprecatedDomainField(fileName, frontmatter) {
   }];
 }
 
-function lintGenericPage(fileName, absolutePath, mode, profile = VAULT_PROFILE) {
+function lintGenericPage(fileName, absolutePath, mode, profile) {
   const issues = [];
   const contents = readFileSync(absolutePath, "utf8");
   const parsed = parseFrontmatter(contents);
@@ -1881,64 +1859,6 @@ function lintCalendarPage(fileName, absolutePath, mode) {
   };
 }
 
-function lintDomainCategoryIndexPage(fileName, absolutePath, mode) {
-  const issues = [];
-  const contents = readFileSync(absolutePath, "utf8");
-  const parsed = parseFrontmatter(contents);
-  if (!parsed) {
-    return {
-      file: fileName,
-      path: absolutePath,
-      ok: false,
-      issues: [{
-        code: "missing-frontmatter",
-        message: `${fileName}: YAML frontmatter is missing or malformed`,
-      }],
-    };
-  }
-
-  if (!normalize(parsed.frontmatter.title)) {
-    issues.push({
-      code: "missing-frontmatter-title",
-      message: `${fileName}: frontmatter.title is required`,
-    });
-  }
-  if (!isArrayFrontmatterValue(parsed.frontmatter.tags)) {
-    issues.push({
-      code: "frontmatter-tags-format",
-      message: `${fileName}: frontmatter.tags must use inline array syntax`,
-    });
-  }
-  // NB: the deprecated-`domain` block for category READMEs (all `domains/*/README.md`) is applied
-  // in lintReadmePage, not here — the README dispatch intercepts these files before this function.
-
-  const sections = parseSections(parsed.body);
-  if (!hasSection(sections, "Summary")) {
-    issues.push({
-      code: "missing-section",
-      message: `${fileName}: missing required section "## Summary"`,
-    });
-  }
-  const additionalSections = Object.keys(sections).filter((section) => section !== "Summary");
-  if (additionalSections.length === 0) {
-    issues.push({
-      code: "missing-section",
-      message: `${fileName}: category index pages must include at least one section besides Summary`,
-    });
-  }
-
-  if (mode === "full") {
-    issues.push(...lintRelativeLinks(fileName, absolutePath, parsed.body));
-  }
-
-  return {
-    file: fileName,
-    path: absolutePath,
-    ok: issues.length === 0,
-    issues,
-  };
-}
-
 function lintPersonaMemoryPage(fileName, absolutePath, mode) {
   const issues = [];
   const contents = readFileSync(absolutePath, "utf8");
@@ -2100,7 +2020,7 @@ function lintSchemaFile(fileName, absolutePath, mode) {
   };
 }
 
-function lintSingleFile({ vaultDir, fileName, mode, schemaSections, ctx = { profile: VAULT_PROFILE, trackedDirs: null } }) {
+function lintSingleFile({ vaultDir, fileName, mode, schemaSections, ctx }) {
   const { profile } = ctx;
   const normalizedFileName = fileName.replace(/\\/gu, "/");
   const baseFileName = basename(normalizedFileName);
@@ -2215,11 +2135,7 @@ function lintSingleFile({ vaultDir, fileName, mode, schemaSections, ctx = { prof
     return lintResultArchivePage(normalizedFileName, absolutePath);
   }
 
-  if (isDomainCategoryIndexPage(normalizedFileName)) {
-    return lintDomainCategoryIndexPage(normalizedFileName, absolutePath, mode);
-  }
-
-  if (isPersonaMemoryPage(normalizedFileName)) {
+  if (isPersonaMemoryPage(normalizedFileName, profile)) {
     return lintPersonaMemoryPage(normalizedFileName, absolutePath, mode);
   }
 
@@ -2236,9 +2152,6 @@ function lintSingleFile({ vaultDir, fileName, mode, schemaSections, ctx = { prof
   }
 
   if (isTopLevelDomainPage(normalizedFileName)) {
-    if (TOP_LEVEL_DOMAIN_REFERENCE_FILES.has(normalizedFileName)) {
-      return lintReferenceDocPage(normalizedFileName, absolutePath);
-    }
     const parsed = parseFrontmatter(readFileSync(absolutePath, "utf8"));
     if (parsed && normalize(parsed.frontmatter.source).startsWith("skills/")) {
       return lintManagedSkillPage(normalizedFileName, absolutePath);
@@ -2310,7 +2223,7 @@ function lintSingleFile({ vaultDir, fileName, mode, schemaSections, ctx = { prof
 // ending in `.md` (a markdown page) or `/` (a directory). A cross-store pointer
 // names a document in another tree (schema.md convention), so this shape is the
 // convention itself, not a heuristic. It excludes mail headers and URI schemes
-// whose value merely looks path-like — `to:alex@x.app`, `from:host.com`,
+// whose value merely looks path-like — `to:user@x.app`, `from:host.com`,
 // `file:../x`, `data:image/png;base64,…` — as well as URLs (`https://…`), clock
 // and ratio text (`16:9`, `12:30`), and plain `key: value` colons.
 const CROSS_STORE_POINTER_PATTERN = /^([a-z][a-z0-9]*(?:-[a-z0-9]+)*):([^\s`]+)$/u;
@@ -2516,7 +2429,7 @@ export function lintVaultFiles({
       // only apply to a tree that carries those slot semantics.
       if (activeProfile.canonicalChecks) {
         globalIssues.push(...scanCanonicalDrift(resolvedVaultDir));
-        globalIssues.push(...scanDomainTreeDrift(resolvedVaultDir));
+        globalIssues.push(...scanDomainTreeDrift(resolvedVaultDir, activeProfile));
       }
     }
 

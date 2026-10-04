@@ -1,129 +1,105 @@
----
-title: kuma-vault interactive setup — doc-first research + design + evidence
-type: doc/design
-status: current
-verified: 2026-07-04
----
+# `kuma-vault setup`
 
-# Interactive setup (`kuma-vault setup`)
+First-run setup decides **where the vault lives**, records which CLI writes page summaries
+(the **enrich provider**), and — only on an explicit yes — **stars the project on GitHub**.
+`vault setup` is the same command. Every choice is the user's: nothing is picked for them,
+and nothing is starred without consent.
 
-First-run setup (`vault setup` is a short alias) records the user's **enrich provider**
-(`claude` | `codex`) and, on explicit consent, **stars the project on GitHub**. It is exposed two
-ways from one deterministic core:
+Two ways in, one deterministic core:
 
-- **TTY** — a human runs `kuma-vault setup`; `node:readline/promises` prompts present the choices.
-- **Agent runtime** — Claude Code / Codex trigger the bundled `kuma:vault-setup` skill, gather the
-  choices with the runtime's own ask surface, then invoke `kuma-vault setup --provider <id> --yes
-  [--star]` to persist them.
+- **In a terminal**, `kuma-vault setup` asks the provider, star and git-hook questions.
+- **Through an agent**, the [`kuma-vault-setup`](../skills/kuma-vault-setup/SKILL.md) skill
+  asks with the runtime's own question surface, then runs the same command with flags.
 
-Two invariants shape everything below: the provider and the star are **always the user's choice**
-(no forcing), and a missing/unauthenticated `gh` or an unresolvable repo is an **explicit skip**,
-never a silent guess or a thrown setup failure (No Silent Fallback).
+Storage is set by flags only, and runs first. The user-facing walk-throughs are the three
+guides in [`skills/kuma-vault-setup/docs/`](../skills/kuma-vault-setup/docs/); this page is
+the reference behind them.
 
-## 1. Doc-first: how each runtime triggers install-time user choices
+## Storage
 
-Source of truth for the cross-runtime facts is the vendor daily-refresh wiki
-(`skill-hook-authoring`), backed here by each vendor's own docs.
+```
+kuma-vault setup --storage local [--store <id>] [--adopt] [--dry-run]
+kuma-vault setup --storage oracle|remote --server <http(s)://host[:port]> [--token-file <path>] [--store <id>] [--adopt] [--dry-run] [--no-daemon]
+kuma-vault setup --add-store <id> --storage local|oracle|remote [--server <url>] [--token-file <path>]
+```
 
-### Claude Code
-- Package = `.claude-plugin/plugin.json`. Only `name` is required (kebab-case); `version`,
-  `description`, `author` (an **object** with `name`/`email`/`url`), `homepage`, `repository`,
-  `license`, `keywords` are optional.
-- A top-level `skills/` directory is **auto-discovered** (each subfolder with `SKILL.md`), and a
-  top-level `bin/` directory is **auto-added to the Bash tool's PATH** while the plugin is enabled.
-  So the CLI and both skills ship without being listed in the manifest.
-- User-invocable skills surface as `/<plugin>:<skill>` slash commands; description-matching also
-  triggers them. Structural check: `claude plugin validate <path>` (`--strict` fails on unknown
-  fields). Local session install: `claude --plugin-dir <path>`.
-- Sources: <https://code.claude.com/docs/en/plugins-reference>,
-  <https://code.claude.com/docs/en/plugins>.
+The main store is `kuma-main-vault` at `<kuma home>/vaults/<id>/` (kuma home = `KUMA_HOME_DIR`,
+else `~/.kuma`), its tree `vault/`, and `<kuma home>/vault` links to that tree. `oracle` and
+`remote` behave the same and are registered as `mode: "remote"`. `--add-store` creates another
+store and leaves the link and the default store alone.
 
-### Codex
-- Package = `.codex-plugin/plugin.json` at the plugin root. Required: `name` (kebab-case,
-  identifier + namespace), `version`, `description`. `skills` is a **relative path string**
-  (`"./skills/"`) pointing at the dir of skill subfolders — not an array. `author` is an object;
-  an optional `interface` block carries `displayName`/`shortDescription`/`category` (and more).
-- Skills are invoked via the `/skills` selector or `$<skill>` mention (typed `/<skill>` is not a
-  documented Codex form). Plugins install from a marketplace snapshot (`codex plugin add`); the
-  app-server protocol JSON Schema is generated with `codex app-server generate-json-schema --out
-  <dir>` (its `PluginInterface` definition confirms the `interface` field names used here).
-- Source: <https://developers.openai.com/codex/plugins> (build page).
-
-### Portable layer (the rule we follow)
-- The portable trigger across engines is **description-triggered invocation**; the typed token is
-  per-engine sugar. We therefore ship the capability as a **skill + CLI**, and do **not**
-  re-implement a slash surface in any host layer above the engine (a second input path would have
-  to re-derive session context and would flatten the per-engine token differences). The agent asks
-  with its native surface, then forwards the decision to the `kuma-vault setup` CLI verbatim.
-
-## 2. The mechanism shipped
-
-| Piece | Path | Role |
+| Step | local | oracle / remote |
 |---|---|---|
-| Setup CLI | `src/cli/setup.mjs` (`kuma-vault setup`; alias `vault setup`) | Deterministic core: readline prompts, config write, `gh` star, optional hook install. |
-| Setup skill | `skills/kuma-vault-setup/SKILL.md` (`kuma:vault-setup`) | Agent-facing: present the choices with the runtime's native ask, then call the CLI. |
-| Claude manifest | `.claude-plugin/plugin.json` | Packages the two skills + `bin/vault` for Claude Code (auto-discovery). |
-| Codex manifest | `.codex-plugin/plugin.json` | Packages `./skills/` for Codex (skills path string + interface block). |
-| Config SSoT | `~/.kuma-vault/config.json` (env `KUMA_VAULT_CONFIG`) | The single place the provider choice is persisted; `kuma-vault sync --enrich` reads it. |
+| refuse | an existing `~/.kuma/vault` (below), a registered id with another root, a non-empty store directory | the same, and a server whose `/v1/health` does not answer |
+| preflight | git ≥ 2.38, git-lfs, a git commit identity (`git var GIT_COMMITTER_IDENT`) | the same |
+| repository | `git init -b main`, `git lfs install --local` | `vault clone <server>/v1/stores/<id>.git` (token copied to `.git/kuma-vault/token`) |
+| files | generated `.gitattributes` (LFS extensions, `merge=union` ledgers) and `.gitignore` (junk block), `vault/vault.config.json` (`visibility: private`, `remotes.allowed`, `binaries.reject: []`), `vault/README.md` if missing | the same when the server store is empty; a non-empty store is taken as it is (its URL is added to `remotes.allowed` when missing) |
+| hooks | `vault hook install` (pre-commit gate, pre-push allowlist) | the same |
+| commit | `vault sync --no-fts`, then one commit of everything | the same (empty store only) |
+| register | `vault-stores.json`: `mode: local`, default for the main store | `mode: remote`, `search: remote`, `remote.tokenFile` = the clone's copy |
+| link | `~/.kuma/vault` → the tree (main store) | the same |
+| push | — | last: nothing reaches the server unless every step above held |
+| daemon | — | macOS: `vault sync install` (launchd); elsewhere it says to run `vault syncd` under a service manager. A daemon that fails to install is reported (exit 1) and the store stays |
 
-## 3. Setup flow
+Every step that changes something registers its undo; a failure runs them in reverse and prints
+each one. Running setup again for a store that is already registered at the same root with the
+link in place prints "already set up" and exits 0.
 
-1. **Provider pick (required).** `claude` (default model `claude-sonnet-5`) or `codex` (default
-   model `gpt-5.4-mini`). The default model comes from the enrich adapter (single source of truth,
-   `createCliDescriptionGenerator({provider}).model`) — this file never re-lists model ids. The
-   pick is written to the config SSoT, merging with any existing keys.
-2. **Star-ask (optional, explicit opt-in).** Default is **No**. On yes, the tool stars its own
-   canonical repo via `gh` (see §4). It never stars the consumer's cwd repo.
-3. **Git hook (optional).** A repo path installs the pre-commit drift gate by delegating to
-   `bin/vault hook install` (the hook installer is the SSoT — setup never re-implements it).
+**An existing `~/.kuma/vault`** is never taken over silently (exit 3):
 
-Non-interactive (agent / CI) mode: prompts are replaced by flags. `--provider` is **required**
-(no silent default), and the star only happens on an explicit `--star`.
+| What is there | Verdict |
+|---|---|
+| a link to this store's tree | already set up |
+| a folder or link inside a git repository | refused; the message names `vault migrate to-remote` (a history with raw large files needs a rewrite first) |
+| a plain folder (Kuma Studio's first-run seed) | refused with its file count and bytes, unless `--adopt`: one `rename` into the tree (another filesystem is refused, never copied), counts printed before and after. On a later failure the added files are removed, rewritten READMEs and declaration restored, the listing compared with the original, and the folder renamed back. A server store that already holds a vault refuses `--adopt` |
+| a dangling link, a file | refused |
 
-## 4. GitHub star command (doc-first)
+`--dry-run` prints the plan (paths, server, adopt source with its counts) and changes nothing.
 
-`gh` has **no `repo star` subcommand** (verified against gh 2.80.0). The documented path is the
-REST endpoint "Star a repository for the authenticated user":
+## Enrich provider
+
+```
+kuma-vault setup --provider claude|codex [--model <id>] --yes
+```
+
+`claude` spawns the Claude CLI, `codex` the Codex CLI; only these two are supported. Without
+`--model`, the provider's default model comes from the enrich adapter
+(`createCliDescriptionGenerator({ provider }).model`), the single place model ids are kept.
+The choice is merged into `~/.kuma-vault/config.json` (override the path with
+`KUMA_VAULT_CONFIG`) with an atomic write; other keys in the file survive. `vault sync --enrich`
+reads it and fails with a message naming `kuma-vault setup` when it is missing.
+
+## GitHub star (optional)
+
+Default is **No**. On an explicit yes (`--star`, or `y` at the prompt) setup stars its own
+repository through the GitHub REST API — `gh` has no `repo star` subcommand:
 
 ```
 gh api --method PUT /user/starred/{owner}/{repo}
 ```
 
-(built by `buildStarApiArgs`). The star target is a baked-in constant `DEFAULT_STAR_REPO`
-(`aldegad/kuma-vault`) — the tool's own identity — overridable with `--repo <owner/repo>` or config
-`starRepo`. Resolution order: flag > config > constant. If `gh` is absent (`ENOENT`),
-unauthenticated (`gh auth status` non-zero), or the API call fails, setup prints the reason and
-skips; it is a courtesy, so it never throws.
+The target is `aldegad/kuma-vault`, overridable with `--repo <owner/repo>` or the config key
+`starRepo` (flag, then config, then the built-in). A missing or unauthenticated `gh`, or a
+failed call, prints the reason and skips: a courtesy never fails setup. It never stars the
+repository you happen to be in.
 
-## 5. Verification / smoke evidence (2026-07-04)
+## Git hook (optional)
 
-**Unit tests** — `src/cli/setup.test.mjs`, 20 cases: pure helpers (provider normalization,
-consent, star-repo resolution, PUT argv, default-model SSoT), config persistence (merge, default
-model, unsupported-provider throw), `starRepository` (no-repo / gh-missing / gh-unauthed / happy /
-gh-error — all via an injected runner, never spawning real `gh`), the non-interactive orchestrator
-(missing-provider throw, star gated on `--star`), and the **interactive readline path** (a reactive
-fake TTY: bad-provider retry, default-on-Enter, star consent). Full package suite: **178 passed**.
+`--hook-root <repo>` (or a path at the third prompt) installs the pre-commit drift gate by
+calling `kuma-vault hook install --root <repo>`; setup never re-implements the hook.
 
-**Claude engine install smoke** — `claude plugin validate .` and `claude plugin validate . --strict`
-both `Validation passed` (exit 0). This validates `.claude-plugin/plugin.json` and the bundled
-skill frontmatter.
+## Non-interactive runs
 
-**Codex engine schema smoke** — `codex app-server generate-json-schema --out <dir>` generates the
-protocol schema; its `PluginInterface` definition lists `displayName`, `shortDescription`,
-`category` (+ more), confirming the manifest's `interface` field names. The `.codex-plugin/plugin.json`
-matches the official build-page authoring schema (name/version/description + `skills: "./skills/"`).
+With `--yes`, or without a terminal, there are no prompts. One of `--provider` or `--storage`
+is required — there is no silent default — and the star happens only with `--star`. A
+storage-only run ends after the storage step and says to run the provider step next.
 
-**CLI end-to-end** (through `bin/vault`, exposed as `kuma-vault setup` and `vault setup`):
-- provider write -> `{ "provider": "claude", "model": "claude-sonnet-5" }`, star skipped, exit 0.
-- missing provider (non-interactive) -> `--provider ... is required`, exit 1 (fail-loud).
-- `--provider codex --yes --star` -> real `gh` call; the repo is not yet published, so `gh: Not
-  Found (HTTP 404)` -> `Could not star aldegad/kuma-vault ... Skipping`, exit 0 (graceful).
-- re-run merges: a pre-existing unrelated key (`starRepo`) survives a provider re-write.
+## Where the code lives
 
-**Packaging** — `npm pack --dry-run` ships `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`,
-`skills/kuma-vault-setup/SKILL.md`, and `src/cli/setup.mjs`.
-
-## Open item
-
-`DEFAULT_STAR_REPO` (`aldegad/kuma-vault`) is the intended slug; confirm/adjust it when the repo is
-published (the star 404s until then, by design). npm-registry publish is out of scope for this step.
+| Piece | Path |
+|---|---|
+| Setup command, prompts, config write, star | `src/cli/setup.mjs` |
+| Storage step (`--storage`, `--add-store`) | `src/cli/setup-storage.mjs` |
+| Enrich config reader | `src/cli/enrich-config.mjs` |
+| Agent-facing skill and storage guides | `skills/kuma-vault-setup/` |
+| Plugin manifests | `packaging/` — see [plugin packaging](plugin-packaging.md) |

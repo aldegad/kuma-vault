@@ -31,6 +31,7 @@ async function makeVault(prefix) {
   const tempRoot = await mkdtemp(join(tmpdir(), prefix));
   const vaultDir = join(tempRoot, "vault");
   await mkdir(join(vaultDir, "domains"), { recursive: true });
+  await writeFile(join(vaultDir, "vault.config.json"), JSON.stringify({ profile: "kuma-vault" }), "utf8");
   return vaultDir;
 }
 
@@ -131,9 +132,6 @@ describe("vault-sync-triggers", () => {
     it("commandVaultSync (the cron safety-net payload) heals a stale index via syncVaultIndex", async () => {
       const { commandVaultSync } = await import("../cli/vault-commands.mjs");
       const vaultDir = await makeVault("kuma-cron-boundary-");
-      // The CLI resolves the tree's contract from its own root declaration (repo
-      // self-declaration; an undeclared explicit root would fail loud).
-      await writeFile(join(vaultDir, "vault.config.json"), JSON.stringify({ profile: "kuma-vault" }), "utf8");
       await writeFile(join(vaultDir, "domains", "alpha.md"), leafPage("Alpha", "alpha"), "utf8");
       await syncVaultIndex({ vaultDir });
       await writeFile(join(vaultDir, "domains", "beta.md"), leafPage("Beta", "beta"), "utf8");

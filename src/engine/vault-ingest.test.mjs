@@ -16,6 +16,7 @@ import {
   ingestInbox,
   ingestResultFile,
   ingestResultFileWithGuards,
+  inspectExistingPageBodyShape,
   parseFrontmatterDocument,
   resolveResultPathForTaskId,
   rewriteIndex,
@@ -33,7 +34,7 @@ async function createResultFile(dir, name, content) {
 
 describe("inline-array frontmatter codec (formatFrontmatterValue <-> parseFrontmatterDocument)", () => {
   it("round-trips array items carrying internal double-quotes or backslashes (writer JSON-encodes, reader JSON-decodes)", () => {
-    const aliases = ['C++ "smart" pointers', "foo\\bar", "C:\\Users\\alex", "plain phrase", "RAII", "한글 별칭"];
+    const aliases = ['C++ "smart" pointers', "foo\\bar", "C:\\Users\\user", "plain phrase", "RAII", "한글 별칭"];
     const doc = `---\ntitle: T\naliases: ${formatFrontmatterValue(aliases)}\n---\n\nbody\n`;
     const { frontmatter } = parseFrontmatterDocument(doc);
     expect(frontmatter.aliases).toEqual(aliases);
@@ -335,7 +336,7 @@ result: ${resultPath}
 Acme App 프로젝트 배포 이슈와 아키텍처 마이그레이션 TODO를 정리했다.
 `,
       vaultDir,
-      // C4 seam: the engine no longer reads a host project registry; known project
+      // Project-registry seam: the engine no longer reads a host project registry; known project
       // ids are injected by the consumer. The host passes its resolved list.
       knownProjectIds: ["acme-app"],
     });
@@ -439,7 +440,7 @@ domain: tooling
         project: null,
       },
       sourceType: "text",
-      // C4 seam: known project ids are injected by the consumer (see above).
+      // Project-registry seam: known project ids are injected by the consumer (see above).
       knownProjectIds: ["acme-app"],
     });
 
@@ -485,6 +486,8 @@ domain: tooling
     const tempRoot = await mkdtemp(join(tmpdir(), "kuma-vault-cli-ingest-"));
     const vaultDir = join(tempRoot, "vault");
     const sourcePath = join(tempRoot, "playwright-timeout.md");
+    await mkdir(vaultDir, { recursive: true });
+    await writeFile(join(vaultDir, "vault.config.json"), JSON.stringify({ profile: "kuma-vault" }), "utf8");
 
     await writeFile(
       sourcePath,
@@ -515,6 +518,78 @@ domain: tooling
       "README.md",
       "log.md",
     ]);
+  });
+
+  // The lint after a CLI ingest passes no contract: it reads the tree's own declaration, so a
+  // persona page the tree declares is judged by the persona contract there too.
+  describe("CLI ingest into a declared persona page", () => {
+    async function createPersonaTree(declaration, novaPage) {
+      const tempRoot = await mkdtemp(join(tmpdir(), "kuma-vault-cli-persona-"));
+      const vaultDir = join(tempRoot, "vault");
+      await mkdir(join(vaultDir, "domains"), { recursive: true });
+      await writeFile(join(vaultDir, "README.md"), "---\ntitle: Vault\n---\n\n## Summary\nx\n", "utf8");
+      await writeFile(join(vaultDir, "domains", "README.md"), "---\ntitle: Domains\n---\n\n## Summary\nx\n", "utf8");
+      if (declaration) {
+        await writeFile(join(vaultDir, "vault.config.json"), JSON.stringify(declaration), "utf8");
+      }
+      if (novaPage) {
+        await writeFile(join(vaultDir, "domains", "nova.md"), novaPage, "utf8");
+      }
+      return vaultDir;
+    }
+
+    async function ingestNova(vaultDir) {
+      try {
+        const { stdout } = await execFile("node", [
+          CLI_PATH, "vault-ingest", "persona note: a timeline entry",
+          "--page", "domains/nova.md", "--vault-dir", vaultDir, "--bypass",
+        ]);
+        return { code: 0, stdout, stderr: "" };
+      } catch (error) {
+        return { code: error.code, stdout: error.stdout, stderr: error.stderr };
+      }
+    }
+
+    const novaIssues = (stdout) => JSON.parse(stdout).lint.issues
+      .filter((issue) => issue.file === "domains/nova.md")
+      .map((issue) => issue.message)
+      .sort();
+    const DECLARED = { profile: "kuma-vault", personaMemoryPages: ["domains/nova.md"] };
+    const PERSONA_HEAD = "---\ntitle: Nova — own memory\ntype: domain\nslug: nova\nupdated: 2026-05-25\n---\n\n";
+
+    it("fails when ingest creates the page without the persona shape", async () => {
+      const vaultDir = await createPersonaTree(DECLARED);
+      const { code, stdout } = await ingestNova(vaultDir);
+      expect(code).toBe(1);
+      expect(JSON.parse(stdout).lint.ok).toBe(false);
+      expect(novaIssues(stdout)).toEqual([
+        "domains/nova.md: frontmatter.slug is required",
+        "domains/nova.md: missing persona timeline section",
+        'domains/nova.md: missing required section "## About"',
+      ]);
+    });
+
+    it("fails when the existing persona page has no Timeline", async () => {
+      const vaultDir = await createPersonaTree(DECLARED, `${PERSONA_HEAD}## About\nn\n`);
+      const { code, stdout } = await ingestNova(vaultDir);
+      expect(code).toBe(1);
+      expect(novaIssues(stdout)).toEqual(["domains/nova.md: missing persona timeline section"]);
+    });
+
+    it("passes when the existing persona page has the persona shape", async () => {
+      const vaultDir = await createPersonaTree(DECLARED, `${PERSONA_HEAD}## About\nn\n\n## Timeline\n- 2026-05-25 — n\n`);
+      const { code, stdout } = await ingestNova(vaultDir);
+      expect(code).toBe(0);
+      expect(JSON.parse(stdout).lint.ok).toBe(true);
+    });
+
+    it("refuses a tree with no declaration before writing anything", async () => {
+      const vaultDir = await createPersonaTree(null);
+      const { code, stderr } = await ingestNova(vaultDir);
+      expect(code).not.toBe(0);
+      expect(stderr).toMatch(/No vault\.config\.json declaration at .* and no contract given/u);
+      expect(existsSync(join(vaultDir, "domains", "nova.md"))).toBe(false);
+    });
   });
 
   it("resolves a result file path from task id metadata", async () => {
@@ -989,6 +1064,7 @@ Curated intro prose.
     const tempRoot = await mkdtemp(join(tmpdir(), "kuma-vault-atomic-"));
     const vaultDir = join(tempRoot, "vault");
     await mkdir(join(vaultDir, "domains", "security"), { recursive: true });
+    await writeFile(join(vaultDir, "vault.config.json"), JSON.stringify({ profile: "kuma-vault" }), "utf8");
     const page = (title) => `---
 title: ${title}
 tags: []
@@ -1364,5 +1440,363 @@ Extractor body.
     const check = await syncVaultIndex({ vaultDir, check: true });
     expect(check.changedCount).toBe(0);
     expect(check.converged).toBe(true);
+  });
+});
+
+// Existing-page ingest is a data-loss boundary (T3, 2026-09-12): a `--page` re-ingest of a
+// nonstandard page (frontmatter + H1 + table + `## 출처`, no Summary/Details/Related) exited 0,
+// passed fast-lint, and had silently rebuilt the body from the three managed sections alone.
+// Everything the page owner wrote must survive verbatim, or the write must be refused before
+// any mutation. All fixtures below are synthetic and live under a temp root.
+describe("existing-page ingest preserves the legacy body", () => {
+  const LEGACY_LEDGER = `---
+title: Synthetic publish ledger
+tags: [synthetic]
+created: 2026-09-01
+updated: 2026-09-01
+sources: ["https://example.invalid/ledger"]
+---
+
+# Synthetic publish ledger
+
+| Date | Post | Status |
+|---|---|---|
+| 2026-09-01 | alpha | published |
+| 2026-09-02 | beta | published |
+
+## 출처
+
+- https://example.invalid/alpha
+- https://example.invalid/beta
+`;
+
+  async function createSyntheticRoot(pageRelativePath, pageContent) {
+    const tempRoot = await mkdtemp(join(tmpdir(), "kuma-vault-preserve-"));
+    const vaultDir = join(tempRoot, "vault");
+    const sourceDir = join(tempRoot, "src");
+    await mkdir(join(vaultDir, pageRelativePath.split("/")[0]), { recursive: true });
+    await writeFile(join(vaultDir, "vault.config.json"), JSON.stringify({ profile: "kuma-vault" }), "utf8");
+    await mkdir(sourceDir, { recursive: true });
+    await writeFile(join(vaultDir, pageRelativePath), pageContent, "utf8");
+    const sourcePath = join(sourceDir, "new-note.md");
+    await writeFile(sourcePath, "# New note\n\nThird post went out.\n", "utf8");
+    return { tempRoot, vaultDir, sourcePath, pagePath: join(vaultDir, pageRelativePath) };
+  }
+
+  it("inspectExistingPageBodyShape is read-only and reports preamble, preserved headings and unsupported shapes", () => {
+    const { body } = parseFrontmatterDocument(LEGACY_LEDGER);
+    const shape = inspectExistingPageBodyShape(body);
+    expect(shape.preamble).toContain("# Synthetic publish ledger");
+    expect(shape.preamble).toContain("| 2026-09-02 | beta | published |");
+    expect(shape.segments.map((segment) => segment.heading)).toEqual(["출처"]);
+    expect(shape.preservedHeadings).toEqual(["출처"]);
+    expect(shape.managedHeadings).toEqual([]);
+    expect(shape.unsupported).toEqual([]);
+
+    const standard = inspectExistingPageBodyShape("## Summary\ns\n\n## Details\nd\n\n## Related\nr\n");
+    expect(standard.preamble).toBe("");
+    expect(standard.managedHeadings).toEqual(["Summary", "Details", "Related"]);
+    expect(standard.unsupported).toEqual([]);
+
+    const duplicated = inspectExistingPageBodyShape("## Notes\na\n\n## Notes\nb\n");
+    expect(duplicated.unsupported).toHaveLength(1);
+    expect(duplicated.unsupported[0]).toContain('duplicate H2 heading "## Notes" (2x)');
+
+    expect(inspectExistingPageBodyShape("")).toEqual({
+      preamble: "",
+      segments: [],
+      managedHeadings: [],
+      preservedHeadings: [],
+      unsupported: [],
+    });
+  });
+
+  it("CLI --page re-ingest of a nonstandard project ledger keeps H1, table rows and the 출처 section, and is idempotent", async () => {
+    const { vaultDir, sourcePath, pagePath } = await createSyntheticRoot("projects/synthetic-ledger.md", LEGACY_LEDGER);
+
+    const { stdout } = await execFile("node", [
+      CLI_PATH,
+      "vault-ingest",
+      "--vault-dir",
+      vaultDir,
+      "--page",
+      "projects/synthetic-ledger.md",
+      "--bypass",
+      sourcePath,
+    ]);
+    const payload = JSON.parse(stdout);
+    expect(payload.relativePagePath).toBe("projects/synthetic-ledger.md");
+    expect(payload.lint.ok).toBe(true);
+
+    const after = await readFile(pagePath, "utf8");
+    const { frontmatter, body } = parseFrontmatterDocument(after);
+    // Every legacy line survives verbatim, in its original order, ahead of the managed sections.
+    for (const line of [
+      "# Synthetic publish ledger",
+      "| Date | Post | Status |",
+      "| 2026-09-01 | alpha | published |",
+      "| 2026-09-02 | beta | published |",
+      "## 출처",
+      "- https://example.invalid/alpha",
+      "- https://example.invalid/beta",
+    ]) {
+      expect(body).toContain(line);
+    }
+    expect(body.indexOf("# Synthetic publish ledger")).toBeLessThan(body.indexOf("## 출처"));
+    expect(body.indexOf("## 출처")).toBeLessThan(body.indexOf("## Summary"));
+    expect(body.indexOf("## Summary")).toBeLessThan(body.indexOf("## Details"));
+    expect(body.indexOf("## Details")).toBeLessThan(body.indexOf("## Related"));
+    expect(body).toContain("Third post went out.");
+    expect(body).toContain("<!-- project-state:start -->");
+    // Legacy frontmatter is carried forward: original source URL stays, title/created untouched.
+    expect(frontmatter.title).toBe("Synthetic publish ledger");
+    expect(frontmatter.created).toBe("2026-09-01");
+    expect(frontmatter.sources).toEqual(["https://example.invalid/ledger"]);
+
+    // Second run over the same source: byte-identical page (원칙 5 idempotency).
+    await execFile("node", [
+      CLI_PATH,
+      "vault-ingest",
+      "--vault-dir",
+      vaultDir,
+      "--page",
+      "projects/synthetic-ledger.md",
+      "--bypass",
+      sourcePath,
+    ]);
+    expect(await readFile(pagePath, "utf8")).toBe(after);
+  });
+
+  it("keeps extra H2 sections on a learnings page around the managed Details block", async () => {
+    const { vaultDir, sourcePath, pagePath } = await createSyntheticRoot(
+      "learnings/legacy-rules.md",
+      `---
+title: Legacy rules
+tags: [rules]
+created: 2026-08-01
+updated: 2026-08-01
+---
+
+Intro paragraph kept above everything.
+
+## Summary
+Old summary stays.
+
+## Checklist
+- [ ] step one
+- [x] step two
+
+## Details
+Manual details.
+
+## Appendix
+Trailing appendix prose.
+`,
+    );
+
+    const result = await ingestGenericSource({
+      source: sourcePath,
+      sourceType: "file",
+      vaultDir,
+      qaStatus: "passed",
+      page: "learnings/legacy-rules.md",
+    });
+    expect(result.action).toBe("INGEST");
+
+    const { body } = parseFrontmatterDocument(await readFile(pagePath, "utf8"));
+    const order = ["Intro paragraph kept above everything.", "## Summary", "Old summary stays.", "## Checklist", "- [x] step two", "## Details", "Manual details.", "<!-- ingest:new-note.md:start -->", "## Appendix", "Trailing appendix prose.", "## Related"];
+    const positions = order.map((needle) => body.indexOf(needle));
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions);
+    expect(body.match(/^## /gmu)).toHaveLength(5);
+  });
+
+  it("refuses before any write when the existing body has duplicate H2 headings", async () => {
+    const original = `---
+title: Dup
+created: 2026-09-01
+updated: 2026-09-01
+---
+
+## Notes
+a
+
+## Notes
+b
+`;
+    const { vaultDir, sourcePath, pagePath } = await createSyntheticRoot("learnings/dup.md", original);
+
+    await expect(ingestGenericSource({
+      source: sourcePath,
+      sourceType: "file",
+      vaultDir,
+      qaStatus: "passed",
+      page: "learnings/dup.md",
+    })).rejects.toThrow(/refused to rewrite learnings\/dup\.md.*duplicate H2 heading "## Notes" \(2x\)/u);
+
+    // Failed write leaves the tree untouched: page bytes identical, no `_sources/` snapshot,
+    // no log.md, no README topology, no scaffold.
+    expect(await readFile(pagePath, "utf8")).toBe(original);
+    expect(existsSync(join(vaultDir, "learnings", "_sources"))).toBe(false);
+    expect(existsSync(join(vaultDir, "log.md"))).toBe(false);
+    expect(existsSync(join(vaultDir, "README.md"))).toBe(false);
+    expect(existsSync(join(vaultDir, "schema.md"))).toBe(false);
+
+    // The CLI surfaces the same refusal as a non-zero exit.
+    const failure = await execFile("node", [
+      CLI_PATH,
+      "vault-ingest",
+      "--vault-dir",
+      vaultDir,
+      "--page",
+      "learnings/dup.md",
+      "--bypass",
+      sourcePath,
+    ]).catch((error) => error);
+    expect(failure.code).toBe(1);
+    expect(String(failure.stderr)).toContain("Nothing was written");
+    expect(await readFile(pagePath, "utf8")).toBe(original);
+  });
+
+  const FENCED_MANAGED_HEADING = `---
+title: Fenced template
+created: 2026-09-01
+updated: 2026-09-01
+---
+
+# Fenced template
+
+Body prose.
+
+## Runbook
+
+Paste this template into a new page:
+
+\`\`\`md
+## Related
+- LEGACY-LINK-ONE
+- LEGACY-LINK-TWO
+\`\`\`
+
+Closing prose after fence.
+`;
+
+  it("inspectExistingPageBodyShape flags `##` lines inside code fences and unclosed fences as unsupported", () => {
+    const { body } = parseFrontmatterDocument(FENCED_MANAGED_HEADING);
+    const managed = inspectExistingPageBodyShape(body);
+    expect(managed.unsupported).toHaveLength(1);
+    expect(managed.unsupported[0]).toMatch(/"## Related" at body line 10 sits inside the code fence opened at body line 9/u);
+
+    const tildeNonManaged = inspectExistingPageBodyShape("Intro\n\n~~~\n## Notes\nnot a heading\n~~~\n\n## Real\nx\n");
+    expect(tildeNonManaged.unsupported).toHaveLength(1);
+    expect(tildeNonManaged.unsupported[0]).toMatch(/"## Notes" at body line 4 sits inside the code fence opened at body line 3/u);
+
+    const unclosed = inspectExistingPageBodyShape("Intro\n\n```sh\necho still open\n");
+    expect(unclosed.unsupported).toHaveLength(1);
+    expect(unclosed.unsupported[0]).toMatch(/code fence opened at body line 3 is never closed/u);
+
+    // A longer closing fence closes a shorter opener; a shorter one does not (CommonMark).
+    expect(inspectExistingPageBodyShape("```\n## X\n````\n").unsupported).toHaveLength(1);
+    expect(inspectExistingPageBodyShape("````\n```\n## X\n````\n").unsupported).toHaveLength(1);
+    // Mixed fence characters do not close each other.
+    expect(inspectExistingPageBodyShape("```\n~~~\n## X\n```\n").unsupported).toHaveLength(1);
+
+    // Fences without any `##` line inside stay supported, and the fence text is preserved.
+    const plain = inspectExistingPageBodyShape("## Snippet\n\n```js\nconst x = 1;\n```\n\nafter\n");
+    expect(plain.unsupported).toEqual([]);
+    expect(plain.segments[0].content).toBe("```js\nconst x = 1;\n```\n\nafter");
+  });
+
+  it("inspectExistingPageBodyShape keeps the indentation of a segment's first and last line", () => {
+    const shape = inspectExistingPageBodyShape("    LEAD-INDENT\n\n## Snippet\n\n    INDENTED-CODE-LINE-1\n    INDENTED-CODE-LINE-2\n\n");
+    expect(shape.preamble).toBe("    LEAD-INDENT");
+    expect(shape.segments[0].content).toBe("    INDENTED-CODE-LINE-1\n    INDENTED-CODE-LINE-2");
+  });
+
+  it("CLI --page refuses before any write when a managed heading sits inside a code fence", async () => {
+    const { vaultDir, sourcePath, pagePath } = await createSyntheticRoot("projects/fenced.md", FENCED_MANAGED_HEADING);
+
+    const failure = await execFile("node", [
+      CLI_PATH,
+      "vault-ingest",
+      "--vault-dir",
+      vaultDir,
+      "--page",
+      "projects/fenced.md",
+      "--bypass",
+      sourcePath,
+    ]).catch((error) => error);
+    expect(failure.code).toBe(1);
+    expect(String(failure.stderr)).toMatch(/refused to rewrite projects\/fenced\.md.*"## Related" at body line 10 sits inside the code fence opened at body line 9/u);
+    expect(String(failure.stderr)).toContain("Nothing was written");
+
+    // Same rejection tree as the duplicate-heading refusal: page bytes identical, no snapshot,
+    // no log, no README topology, no scaffold.
+    expect(await readFile(pagePath, "utf8")).toBe(FENCED_MANAGED_HEADING);
+    expect(existsSync(join(vaultDir, "projects", "_sources"))).toBe(false);
+    expect(existsSync(join(vaultDir, "log.md"))).toBe(false);
+    expect(existsSync(join(vaultDir, "README.md"))).toBe(false);
+    expect(existsSync(join(vaultDir, "schema.md"))).toBe(false);
+  });
+
+  it("refuses a nonmanaged heading inside a tilde fence and an unclosed fence the same way", async () => {
+    for (const [name, body, reason] of [
+      ["tilde", "~~~\n## Notes\n~~~\n", /"## Notes" at body line 2 sits inside the code fence opened at body line 1/u],
+      ["unclosed", "Intro\n\n```sh\necho still open\n", /code fence opened at body line 3 is never closed/u],
+    ]) {
+      const original = `---\ntitle: ${name}\ncreated: 2026-09-01\nupdated: 2026-09-01\n---\n\n${body}`;
+      const { vaultDir, sourcePath, pagePath } = await createSyntheticRoot(`learnings/${name}.md`, original);
+      await expect(ingestGenericSource({
+        source: sourcePath,
+        sourceType: "file",
+        vaultDir,
+        qaStatus: "passed",
+        page: `learnings/${name}.md`,
+      })).rejects.toThrow(reason);
+      expect(await readFile(pagePath, "utf8")).toBe(original);
+      expect(existsSync(join(vaultDir, "learnings", "_sources"))).toBe(false);
+      expect(existsSync(join(vaultDir, "log.md"))).toBe(false);
+    }
+  });
+
+  it("CLI --page keeps an indented code block on a preserved section's first line, and is idempotent", async () => {
+    const original = `---
+title: Indented
+created: 2026-09-01
+updated: 2026-09-01
+---
+
+# Indented
+
+## Snippet
+
+    INDENTED-CODE-LINE-1
+    INDENTED-CODE-LINE-2
+
+after
+`;
+    const { vaultDir, sourcePath, pagePath } = await createSyntheticRoot("projects/indented.md", original);
+    const args = ["vault-ingest", "--vault-dir", vaultDir, "--page", "projects/indented.md", "--bypass", sourcePath];
+    await execFile("node", [CLI_PATH, ...args]);
+    const after = await readFile(pagePath, "utf8");
+    const { body } = parseFrontmatterDocument(after);
+    expect(body).toContain("## Snippet\n    INDENTED-CODE-LINE-1\n    INDENTED-CODE-LINE-2\n\nafter\n\n## Summary");
+
+    await execFile("node", [CLI_PATH, ...args]);
+    expect(await readFile(pagePath, "utf8")).toBe(after);
+  });
+
+  it("still renders the canonical three sections for a brand-new page", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "kuma-vault-preserve-"));
+    const vaultDir = join(tempRoot, "vault");
+    const sourcePath = join(tempRoot, "fresh.md");
+    await mkdir(vaultDir, { recursive: true });
+    await writeFile(sourcePath, "# Fresh\n\nBrand new content.\n", "utf8");
+    const result = await ingestGenericSource({ source: sourcePath, sourceType: "file", vaultDir, qaStatus: "passed", page: "learnings/fresh.md" });
+    expect(result.action).toBe("CREATE");
+    const { body } = parseFrontmatterDocument(await readFile(result.pagePath, "utf8"));
+    expect(body.match(/^## /gmu)).toEqual(["## ", "## ", "## "]);
+    expect(body.indexOf("## Summary")).toBeLessThan(body.indexOf("## Details"));
+    expect(body.indexOf("## Details")).toBeLessThan(body.indexOf("## Related"));
   });
 });

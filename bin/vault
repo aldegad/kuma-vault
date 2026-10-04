@@ -8,10 +8,20 @@ set -euo pipefail
 
 # Resolve the real location of this script (following symlinks) so the package root and its
 # own bin path are stable regardless of how `vault` was invoked (PATH, symlink, npm bin).
-SCRIPT_PATH="$(node -e 'const fs = require("node:fs"); process.stdout.write(fs.realpathSync(process.argv[1]));' "$0")"
+# `vault server install` runs before Node exists on a fresh server, so fall back to readlink -f.
+if command -v node >/dev/null 2>&1; then
+  SCRIPT_PATH="$(node -e 'const fs = require("node:fs"); process.stdout.write(fs.realpathSync(process.argv[1]));' "$0")"
+else
+  SCRIPT_PATH="$(readlink -f "$0")"
+fi
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 PKG_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLI_MJS="$PKG_ROOT/src/cli/cli.mjs"
+SERVER_MJS="$PKG_ROOT/src/server/server-cli.mjs"
+SYNC_MJS="$PKG_ROOT/src/sync/sync-cli.mjs"
+# Node line the server installs under /opt/node (docs/server.md). Override with
+# KUMA_VAULT_NODE_VERSION.
+KUMA_VAULT_NODE_VERSION_DEFAULT="v22.23.3"
 
 die() {
   printf '%s\n' "$*" >&2
@@ -22,25 +32,79 @@ require_file() {
   [ -f "$1" ] || die "not found: $1"
 }
 
+# Put the official Node tarball (sha256-checked against SHASUMS256.txt) at /opt/node/<version>
+# and point /opt/node/current at it. Server install only (root, Linux).
+bootstrap_server_node() {
+  local version="${KUMA_VAULT_NODE_VERSION:-$KUMA_VAULT_NODE_VERSION_DEFAULT}"
+  local arch
+  case "$(uname -m)" in
+    aarch64|arm64) arch="arm64" ;;
+    x86_64|amd64) arch="x64" ;;
+    *) die "vault server install: unsupported architecture $(uname -m)" ;;
+  esac
+  local dir="/opt/node/$version"
+  if [ ! -x "$dir/bin/node" ]; then
+    local file="node-$version-linux-$arch.tar.xz"
+    local tmp
+    tmp="$(mktemp -d)"
+    printf 'installing Node %s (%s)\n' "$version" "$arch"
+    curl -fsSL -o "$tmp/$file" "https://nodejs.org/dist/$version/$file" || die "download failed: $file"
+    curl -fsSL "https://nodejs.org/dist/$version/SHASUMS256.txt" | grep " $file\$" > "$tmp/SHASUMS256.txt" || die "no checksum for $file"
+    (cd "$tmp" && sha256sum -c SHASUMS256.txt >/dev/null) || die "checksum mismatch for $file"
+    mkdir -p /opt/node
+    tar --no-same-owner -xJf "$tmp/$file" -C "$tmp"
+    rm -rf "$dir"
+    mv "$tmp/node-$version-linux-$arch" "$dir"
+    rm -rf "$tmp"
+  fi
+  # root-owned, so no local user can swap the runtime the service and its hooks execute
+  chown -R 0:0 "$dir"
+  chmod -R go-w "$dir"
+  ln -sfn "$dir" /opt/node/current.tmp
+  mv -T /opt/node/current.tmp /opt/node/current
+  export PATH="/opt/node/current/bin:$PATH"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
-  kuma-vault search <query>        (or: vault search <query>)
-  kuma-vault timeline <query>
+  kuma-vault search <query> [--store <id>] [--local]   (or: vault search <query>)
+                                   Searches every registered store by default. A store
+                                   registered with search "remote" is searched on its
+                                   server; --local searches this clone's copy instead.
+  kuma-vault timeline <query> [--store <id>]
   kuma-vault get <id|path> [more ids...]
   kuma-vault ingest [source] [--section <s>] [--page <p>] [--project <slug>] [--bypass] [--dry-run] [--vault-dir <path>]
-  kuma-vault sync [--check] [--enrich] [--enrich-limit <n>] [--root <path>] [--profile <id>]
+  kuma-vault sync [--check] [--no-fts] [--enrich] [--enrich-limit <n>] [--root <path>] [--profile <id>]
+  kuma-vault sync status|now|pause|resume|conflicts|resolve|install|uninstall [--repo <dir>]
+                                   Sync daemon of a remote store clone (see: vault sync --help-daemon)
+  kuma-vault clone <url> [<dir>] [--store <id>] [--token-file <path>]   Partial clone of a remote store
+  kuma-vault syncd [<store>] [--repo <dir>]    Run the write-behind sync daemon (launchd runs this)
+  kuma-vault blob get|evict|status <path...> [--repo <dir>]   Large files of a remote store clone
   kuma-vault lint [--mode fast|full] [--root <path>] [--profile <id>] [--json] [files...]
   kuma-vault hook install|uninstall|status --root <repo>
+  kuma-vault setup --storage local|oracle|remote [--server <url>] [--token-file <path>] [--adopt] [--dry-run]
+                                   Where the vault lives (main store kuma-main-vault, ~/.kuma/vault)
+  kuma-vault setup --add-store <id> --storage local|oracle|remote [--server <url>] [--token-file <path>]
   kuma-vault setup [--provider claude|codex] [--model <id>] [--star] [--repo <owner/repo>] [--yes]
   kuma-vault graph [--out <path>] [--open]   Render the vault topology as an interactive HTML graph
   kuma-vault index
+  kuma-vault store list|show|add|set|rename|rm ...   Store registry (~/.kuma/vault-stores.json)
+  kuma-vault commit-map <sha-prefix> [--map <tsv>] [--root <tree>]
+  kuma-vault migrate to-remote|refmap|rollback-export ...   (see: vault migrate --help)
+  kuma-vault binaries apply --from <reject.json> [--gitignore-decisions <csv>] --root <tree>
+  kuma-vault serve [--config <server.json>]      Serve stores over git smart HTTP + LFS (server)
+  kuma-vault server install|init-store|token|set-reject|backup ...   Server setup (see: vault server --help)
+  kuma-vault backup sample|retire-check --store <id> ...        Mac backup routine retirement (design 3.4)
   kuma-vault <path>          Print a vault page (a file, <path>.md, or <dir>/README.md)
 
 Options:
-  --vault-dir <path>   Override the vault root (default for search/get/index: ~/.kuma/vault
+  --vault-dir <path>   Override the vault root (default for get/index: ~/.kuma/vault
                        or KUMA_VAULT_DIR. sync/lint have NO default — they resolve the
-                       tree's root vault.config.json declaration, walking up from the cwd)
+                       tree's root vault.config.json declaration, walking up from the cwd.
+                       For search/timeline, passing it NARROWS to that one tree —
+                       omit it to span every store in vault-stores.json)
+  --store <id>         search/timeline: search only this registered store
   --root <path>        Repo-agnostic alias for --vault-dir (the tree to sync/lint)
   --profile <id>       Contract override for an UNDECLARED tree only (kuma-vault | docs).
                        A tree with a vault.config.json owns its contract; a disagreeing
@@ -49,6 +113,7 @@ Options:
   --engine <e>         search/timeline engine: auto (default) | fts | scan
   --format <f>         search/timeline output: text (default) | json
   --mode <m>           vault lint: fast | full (default: full)
+  --no-fts             vault sync: skip the .fts/ search cache (remote stores index on the server)
   --check              vault sync: gate the tracked tree — report index/sidecar drift and
                        would-enrich targets without writing tracked files. The out-of-tree
                        `.fts/` search cache is NOT gated: a stale cache self-heals (rebuild)
@@ -100,7 +165,17 @@ run_search_command() {
       --vault-dir|--root)
         [ $# -ge 2 ] || die "vault $mode: $1 requires a value"
         VAULT_DIR="$2"
+        VAULT_DIR_EXPLICIT="1"
         shift 2
+        ;;
+      --store)
+        [ $# -ge 2 ] || die "vault $mode: --store requires a value"
+        SEARCH_STORE="$2"
+        shift 2
+        ;;
+      --local)
+        SEARCH_LOCAL="1"
+        shift
         ;;
       -h|--help)
         usage
@@ -124,8 +199,18 @@ run_search_command() {
   [ ${#query_parts[@]} -gt 0 ] || die "$mode query required"
   local -a engine_args=()
   [ -n "$search_engine" ] && engine_args=(--engine "$search_engine")
-  node "$CLI_MJS" vault-search --vault-dir "$VAULT_DIR" --format "$SEARCH_FORMAT" --mode "$mode" \
-    --limit "$SEARCH_LIMIT" ${engine_args[@]+"${engine_args[@]}"} "--query=${query_parts[*]}"
+  # Forward --vault-dir ONLY when the caller gave one (same idiom as sync/lint below).
+  # Passing it unconditionally pins the search to a single tree, which would make the
+  # cross-store default unreachable from the CLI — the JS layer reads "no --vault-dir"
+  # as "span every registered store".
+  local -a root_args=()
+  [ -n "$VAULT_DIR_EXPLICIT" ] && root_args=(--vault-dir "$VAULT_DIR")
+  local -a store_args=()
+  [ -n "$SEARCH_STORE" ] && store_args=(--store "$SEARCH_STORE")
+  [ -n "$SEARCH_LOCAL" ] && store_args+=(--local)
+  node "$CLI_MJS" vault-search ${root_args[@]+"${root_args[@]}"} --format "$SEARCH_FORMAT" --mode "$mode" \
+    --limit "$SEARCH_LIMIT" ${engine_args[@]+"${engine_args[@]}"} ${store_args[@]+"${store_args[@]}"} \
+    "--query=${query_parts[*]}"
 }
 
 VAULT_DIR="${KUMA_VAULT_DIR:-$HOME/.kuma/vault}"
@@ -133,6 +218,8 @@ VAULT_DIR_EXPLICIT=""
 PROFILE=""
 SEARCH_FORMAT="text"
 SEARCH_LIMIT="20"
+SEARCH_STORE=""
+SEARCH_LOCAL=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -189,7 +276,14 @@ case "$COMMAND" in
     node "$CLI_MJS" vault-ingest --vault-dir "$VAULT_DIR" "$@"
     ;;
   sync)
+    # Daemon verbs (remote store clones) live in src/sync; everything else is the compiler sync.
+    case "${1:-}" in
+      status|now|pause|resume|conflicts|resolve|install|uninstall|--help-daemon)
+        exec node "$SYNC_MJS" sync "$@"
+        ;;
+    esac
     SYNC_CHECK=""
+    SYNC_NO_FTS=""
     SYNC_JSON=""
     SYNC_ENRICH=""
     SYNC_ENRICH_LIMIT=""
@@ -200,6 +294,10 @@ case "$COMMAND" in
       case "$1" in
         --check)
           SYNC_CHECK="--check"
+          shift
+          ;;
+        --no-fts)
+          SYNC_NO_FTS="--no-fts"
           shift
           ;;
         --json)
@@ -241,7 +339,7 @@ case "$COMMAND" in
     # the cwd) and fails loud when there is none (No Silent Fallback).
     SYNC_ROOT=()
     [ -n "$VAULT_DIR_EXPLICIT" ] && SYNC_ROOT=(--vault-dir "$VAULT_DIR")
-    node "$CLI_MJS" vault-sync ${SYNC_ROOT[@]+"${SYNC_ROOT[@]}"} $SYNC_CHECK $SYNC_JSON $SYNC_ENRICH $SYNC_ENRICH_LIMIT $SYNC_PROFILE
+    node "$CLI_MJS" vault-sync ${SYNC_ROOT[@]+"${SYNC_ROOT[@]}"} $SYNC_CHECK $SYNC_NO_FTS $SYNC_JSON $SYNC_ENRICH $SYNC_ENRICH_LIMIT $SYNC_PROFILE
     ;;
   lint)
     LINT_JSON=""
@@ -291,6 +389,7 @@ case "$COMMAND" in
   hook)
     HOOK_ACTION="${1:-status}"
     [ $# -ge 1 ] && shift || true
+    HOOK_BIN=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --vault-dir|--root)
@@ -300,6 +399,10 @@ case "$COMMAND" in
           ;;
         --profile)
           PROFILE="${2:?profile id required}"
+          shift 2
+          ;;
+        --bin)
+          HOOK_BIN="${2:?vault executable path required}"
           shift 2
           ;;
         *)
@@ -314,13 +417,37 @@ case "$COMMAND" in
     git -C "$VAULT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$VAULT_DIR is not a git repository"
     HOOK_PATH="$(git -C "$VAULT_DIR" rev-parse --git-path hooks/pre-commit)"
     case "$HOOK_PATH" in /*) : ;; *) HOOK_PATH="$VAULT_DIR/$HOOK_PATH" ;; esac
+    PUSH_HOOK_PATH="$(git -C "$VAULT_DIR" rev-parse --git-path hooks/pre-push)"
+    case "$PUSH_HOOK_PATH" in /*) : ;; *) PUSH_HOOK_PATH="$VAULT_DIR/$PUSH_HOOK_PATH" ;; esac
     HOOK_MARKER="# kuma-vault-sync-hook"
-    VAULT_BIN_ABS="$SCRIPT_DIR/vault"
+    PUSH_HOOK_MARKER="# kuma-vault-push-hook"
+    # Which `vault` the hooks run is resolved when they run, not baked into the hook file: the
+    # repo's `git config kuma-vault.bin` (set by --bin; a daemon whose PATH lacks `vault` needs
+    # it), else `vault` on PATH. A missing executable refuses the commit/push, loud.
+    HOOK_RESOLVE_BIN='VAULT_BIN="$(git config --get kuma-vault.bin 2>/dev/null || true)"
+[ -n "$VAULT_BIN" ] || VAULT_BIN=vault
+command -v "$VAULT_BIN" >/dev/null 2>&1 || { echo "kuma-vault: $VAULT_BIN not found — put vault on PATH or run: git config kuma-vault.bin <path to vault>" >&2; exit 1; }'
+    # The pre-push allowlist gate is installed for trees that declare a storage policy
+    # (`visibility` or `remotes`); a tree without one keeps a plain pre-commit gate.
+    wants_push_hook() {
+      node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.exit(c.visibility!==undefined||c.remotes!==undefined?0:1)' "$VAULT_DIR/vault.config.json"
+    }
     case "$HOOK_ACTION" in
       install)
         [ -f "$VAULT_DIR/vault.config.json" ] || die "no vault.config.json declaration at $VAULT_DIR — declare the tree's contract before installing the drift gate"
         if [ -e "$HOOK_PATH" ] && ! grep -q "$HOOK_MARKER" "$HOOK_PATH" 2>/dev/null; then
           die "pre-commit hook already exists at $HOOK_PATH and was not installed by vault hook. Move it aside or merge manually."
+        fi
+        INSTALL_PUSH=""
+        if wants_push_hook; then
+          INSTALL_PUSH="1"
+          # The stock git-lfs pre-push hook is replaced: ours runs `git lfs pre-push` after the
+          # allowlist check. Anything else is someone's hook — refuse rather than overwrite.
+          if [ -e "$PUSH_HOOK_PATH" ] && ! grep -q "$PUSH_HOOK_MARKER" "$PUSH_HOOK_PATH" 2>/dev/null; then
+            if ! grep -q 'git lfs pre-push' "$PUSH_HOOK_PATH" 2>/dev/null || [ "$(wc -l < "$PUSH_HOOK_PATH")" -gt 4 ]; then
+              die "pre-push hook already exists at $PUSH_HOOK_PATH and is neither ours nor the stock git-lfs hook. Move it aside or merge manually."
+            fi
+          fi
         fi
         # The declared tree may be a subdirectory of the git repo (e.g. kuma-brain/vault).
         # Bake only the tree's structural path *relative to the git toplevel* so the hook
@@ -332,20 +459,45 @@ case "$COMMAND" in
           "$GIT_TOP"/*) TREE_REL="${VAULT_DIR_PHYS#"$GIT_TOP"}" ;;
           *) die "declared tree $VAULT_DIR_PHYS is not inside its git toplevel $GIT_TOP" ;;
         esac
+        if [ -n "$HOOK_BIN" ]; then
+          [ -x "$HOOK_BIN" ] || die "--bin $HOOK_BIN is not an executable"
+          git -C "$VAULT_DIR" config kuma-vault.bin "$HOOK_BIN"
+        fi
         mkdir -p "$(dirname "$HOOK_PATH")"
         cat > "$HOOK_PATH" <<HOOK
 #!/bin/sh
 $HOOK_MARKER — regenerate via: vault hook install --root <tree>
-# Idempotent knowledge-base drift gate: blocks a commit when a TRACKED derivation would change
-# — a folder README vault-index region or a binary sidecar (\`vault sync --check\`). Run
-# \`vault sync --root <tree>\` to regenerate them, then re-commit. The out-of-tree \`.fts/\`
-# search cache is not gated: it self-heals in place, so another session's edit never blocks
-# this commit. The tree's contract comes from its root vault.config.json declaration.
+# Knowledge-base gate: refuses a commit while the vault is frozen (vault-freeze.json), when it
+# stages an intermediate binary in a binaries.reject place or a non-LFS file over 32MiB, or when
+# a TRACKED derivation would change — a folder README vault-index region or a binary sidecar
+# (\`vault sync --check\`). Run \`vault sync --root <tree>\` to regenerate them, then re-commit.
+# The out-of-tree \`.fts/\` search cache is not gated (a remote-search store has none).
 ROOT="\$(git rev-parse --show-toplevel)$TREE_REL"
-exec "$VAULT_BIN_ABS" sync --check --root "\$ROOT"
+$HOOK_RESOLVE_BIN
+exec "\$VAULT_BIN" sync --check --root "\$ROOT"
 HOOK
         chmod +x "$HOOK_PATH"
         printf 'Installed pre-commit drift gate: %s (contract: vault.config.json declaration)\n' "$HOOK_PATH"
+        if [ -n "$INSTALL_PUSH" ]; then
+          cat > "$PUSH_HOOK_PATH" <<HOOK
+#!/bin/sh
+$PUSH_HOOK_MARKER — regenerate via: vault hook install --root <tree>
+# Remote allowlist: a private vault (vault.config.json visibility/remotes) pushes only to the
+# URLs in remotes.allowed. Then git-lfs uploads the large-file objects, as its own hook did.
+ROOT="\$(git rev-parse --show-toplevel)$TREE_REL"
+$HOOK_RESOLVE_BIN
+"\$VAULT_BIN" gate pre-push --root "\$ROOT" "\$1" "\$2" </dev/null || exit 1
+if command -v git-lfs >/dev/null 2>&1; then
+  exec git lfs pre-push "\$@"
+fi
+if git check-attr -a -- .gitattributes >/dev/null 2>&1 && grep -qs 'filter=lfs' "\$(git rev-parse --show-toplevel)/.gitattributes"; then
+  echo "kuma-vault pre-push: this repository uses Git LFS but git-lfs is not installed" >&2
+  exit 2
+fi
+HOOK
+          chmod +x "$PUSH_HOOK_PATH"
+          printf 'Installed pre-push remote allowlist: %s\n' "$PUSH_HOOK_PATH"
+        fi
         # The gate heals the `.fts/` search cache in place, so it writes there on every commit
         # attempt. A tree that does not ignore that path would see the cache turn up as untracked
         # repo noise — say so at install time rather than let it be discovered mid-commit.
@@ -361,11 +513,18 @@ HOOK
         else
           printf 'No vault-sync pre-commit hook to remove at %s\n' "$HOOK_PATH"
         fi
+        if [ -e "$PUSH_HOOK_PATH" ] && grep -q "$PUSH_HOOK_MARKER" "$PUSH_HOOK_PATH" 2>/dev/null; then
+          rm -f "$PUSH_HOOK_PATH"
+          printf 'Removed vault pre-push hook: %s\n' "$PUSH_HOOK_PATH"
+        fi
         ;;
       status)
         if [ -e "$HOOK_PATH" ] && grep -q "$HOOK_MARKER" "$HOOK_PATH" 2>/dev/null; then
           printf 'installed: %s\n' "$HOOK_PATH"
           grep "$HOOK_MARKER" "$HOOK_PATH"
+          if [ -e "$PUSH_HOOK_PATH" ] && grep -q "$PUSH_HOOK_MARKER" "$PUSH_HOOK_PATH" 2>/dev/null; then
+            printf 'installed: %s\n' "$PUSH_HOOK_PATH"
+          fi
         else
           printf 'not installed: %s\n' "$HOOK_PATH"
           exit 1
@@ -387,6 +546,39 @@ HOOK
     # Render the vault topology as an interactive node-link graph (self-contained HTML).
     # Forwards --out/--open verbatim; defaults to <vault>/.graph/topology.html.
     node "$CLI_MJS" vault-graph --vault-dir "$VAULT_DIR" "$@"
+    ;;
+  serve)
+    exec node "$SERVER_MJS" serve "$@"
+    ;;
+  store)
+    exec node "$CLI_MJS" vault-store "$@"
+    ;;
+  commit-map)
+    exec node "$CLI_MJS" vault-commit-map "$@"
+    ;;
+  migrate)
+    exec node "$CLI_MJS" vault-migrate "$@"
+    ;;
+  binaries)
+    exec node "$CLI_MJS" vault-binaries "$@"
+    ;;
+  gate)
+    # Hook entry points (installed by `vault hook install`): pre-push remote allowlist.
+    exec node "$CLI_MJS" vault-gate "$@"
+    ;;
+  clone|syncd|blob)
+    exec node "$SYNC_MJS" "$COMMAND" "$@"
+    ;;
+  server)
+    if [ "${1:-}" = "install" ]; then
+      [ "$(id -u)" = "0" ] || die "vault server install must run as root (sudo)"
+      bootstrap_server_node
+    fi
+    exec node "$SERVER_MJS" server "$@"
+    ;;
+  backup)
+    # Mac side of the server backup: sync-status samples and the backup routine retirement judge.
+    exec node "$PKG_ROOT/src/backup/backup-cli.mjs" "$@"
     ;;
   index)
     require_file "$VAULT_DIR/README.md"

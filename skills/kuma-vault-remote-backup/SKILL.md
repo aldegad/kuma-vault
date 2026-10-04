@@ -4,25 +4,55 @@ description: 'Set up and operate client-encrypted offsite backup for a kuma-vaul
 user-invocable: true
 ---
 
-# kuma-vault-remote-backup — 암호화 원격 백업 가이드
+# kuma-vault-remote-backup — client-encrypted offsite backup
 
-원격(github 등)을 두지 않기로 한 지식 레포의 내구성을 담당하는 표준 패턴:
-**로컬 git (히스토리) + restic 클라이언트 암호화 → S3 호환 스토리지 (암호문만)**.
-비밀·개인정보 원문을 정제 없이 통째로 보존하면서 디스크 사망에 대비한다.
+Backs up a vault that lives **only on this computer** (`local` storage mode) without giving it
+a git remote: local git keeps the history, restic encrypts on this machine, and S3-compatible
+storage receives ciphertext only. Secrets stay in the vault untouched, and a dead disk costs
+nothing but the restore time.
 
-실제 지식 레포들에 적용하며 측정된 절차다.
+**Which backup applies.** A server-backed vault (`oracle` or `remote` mode) is backed up by the
+server's own nightly job, with an automatic restore drill — use
+[server.md › Backup](../../docs/server.md#backup) instead. This skill is for a `local` store,
+or for any other local-only git repository that holds secrets. After moving a local vault to a
+server, the client routine below can be retired once the server's backups have proven
+themselves ([server.md › Retiring a client-side backup routine](../../docs/server.md#retiring-a-client-side-backup-routine)).
 
-## 왜 이 조합인가
+## Why this combination
 
-- **원격 git 은 평문 노출** — private repo 도 실수 공개·토큰 유출 한 방의 블라스트 반경이 "뇌 전체"다. 비밀값을 빼고 커밋하는 정책은 원문을 오염시켜 SSoT 를 해친다.
-- **restic**: 콘텐츠 단위 청킹 + 중복제거 + 클라이언트 암호화. 스냅샷마다 완전 복원점인데 저장은 변경 청크만 (수 GiB 레포도 2회차 스냅샷은 수 초). `.git` 을 포함한 폴더 전체를 그냥 파일로 백업하므로 git 히스토리가 통째로 보존된다 — restic 은 git 을 모르고, 알 필요도 없다.
-- **Cloudflare R2**: 이그레스 무료(복원 0원), 무료 구간 10 GB-월. 다른 S3 호환도 가능 — restic 쪽은 endpoint 만 다르다.
+- **No git remote.** Even a private hosted repository puts the whole vault, secrets included,
+  one leaked token or wrong visibility switch away from exposure. Stripping secrets before
+  each commit would corrupt the single source of truth instead. The
+  [storage policy](../kuma-vault/docs/storage-policy.md) therefore allows no public remote.
+- **restic** chunks by content, deduplicates and encrypts on the client. Every snapshot is a
+  full restore point, yet each run stores only the changed chunks (seconds for a second
+  snapshot of a multi-GiB repo). It backs up the folder as files, `.git` included, so the git
+  history comes back whole — restic does not need to know about git.
+- **Cloudflare R2** charges nothing for egress, so a restore is free, and its free tier covers
+  10 GB-month of Standard storage ([R2 pricing](https://developers.cloudflare.com/r2/pricing/),
+  verified 2026-10-04). Any S3-compatible service works; only the endpoint changes.
 
-## 셋업 절차
+## Set up
 
-1. **버킷 + S3 토큰**: 스토리지 콘솔에서 레포당 버킷 1개, Object Read&Write 를 그 버킷 한정으로 발급.2. **자격증명은 OS 키체인으로만**: `security add-generic-password -s <repo>-restic-r2 -a access-key-id|secret-access-key|endpoint`. 시크릿이 1회 노출되는 발급 화면은 셸 변수로 받아 키체인 직행 — **대화 로그·파일에 값을 찍지 않는다** (마스킹 출력만).
-3. **restic 패스워드**: 생성 → 키체인 `-s <repo>-restic -a password` + 볼트 문서(재해 절차 포함) 저장.
-4. **init + 첫 백업**:
+The commands use the macOS keychain (`security`). On Linux, use your secret store of choice
+(`secret-tool`, `pass`) and keep the same rule: values go from the store into environment
+variables, never into files, chat or logs.
+
+1. **Bucket and token.** Create one bucket per repository and an S3 API token with Object
+   Read & Write on **that bucket only**.
+2. **Store the token in the keychain.** With `-w` as the last option, `security` prompts for
+   the value, so it never appears on a command line, in shell history or in a log:
+
+   ```bash
+   security add-generic-password -s <repo>-restic-r2 -a access-key-id -w
+   security add-generic-password -s <repo>-restic-r2 -a secret-access-key -w
+   security add-generic-password -s <repo>-restic-r2 -a endpoint -w
+   ```
+
+3. **Create the restic password** and store it in the keychain
+   (`-s <repo>-restic -a password`) and in the vault's `_credentials`, together with the
+   recovery steps below.
+4. **Initialise and take the first snapshot:**
 
    ```bash
    export AWS_ACCESS_KEY_ID=$(security find-generic-password -s <repo>-restic-r2 -a access-key-id -w)
@@ -35,32 +65,42 @@ user-invocable: true
      --exclude "/.fts" --exclude "**/*.log" --exclude ".DS_Store" --exclude "tmp/"
    ```
 
-   파생물(FTS 인덱스·빌드물·캐시)은 백업하지 않는다 — `vault sync` 등이 재생성한다 (SSoT 원칙).
-5. **정기 실행**: 러너 스크립트(키체인에서 읽기 + backup + `forget --keep-daily 14 --keep-weekly 8 --keep-monthly 12 --prune` + `snapshots --latest 1` 출력) 를 야간 cron 에 건다. 실패는 조용히 넘기지 말고 관측 가능하게 보고.
+   Derived files (the `.fts/` search index, build output, caches) are left out: `vault sync`
+   regenerates them.
+5. **Run it nightly.** A small runner script reads the keychain, runs `backup`, then
+   `forget --keep-daily 14 --keep-weekly 8 --keep-monthly 12 --prune`, and prints
+   `snapshots --latest 1`. Schedule it with cron or launchd and make a failure visible — a
+   backup job that fails quietly is no backup.
 
-## 열쇠 배치 — 순환 참조를 반드시 끊는다
+## Where the keys live — break the circle
 
-**백업 대상 머신 위의 패스워드 사본(키체인·볼트 문서)은 그 머신과 함께 죽는다.**
-볼트 문서의 사본은 암호화된 백업 *안에* 들어가므로 재해 시엔 열 수 없는 금고 속 열쇠다.
+**A password stored only on the machine being backed up dies with that machine.** The copy
+in the vault's `_credentials` is inside the encrypted backup: on the day of the disaster it
+is a key locked in the safe it opens.
 
-- restic 패스워드: **오프머신 사본 1부가 필수** (폰 비밀번호 관리자, `adb push` 한 파일, 종이 — 형태 무관). 이거 없으면 백업은 "있는데 못 여는" 상태로 재해 당일 발견된다. 메신저 전송은 평문이 서버에 남으므로 비추.
-- S3 토큰: **재발급이 싸다** — 키체인만으로 충분, 오프머신 불필요 (재해 시 콘솔에서 새로 발급).
-- 성립 조건 = **삼각형**: R2 의 암호문 + 오프머신 패스워드 + 재발급 가능한 토큰.
+- **restic password:** keep **one copy off this machine** — a phone password manager, a file
+  on another device, or paper. Without it the backup exists but cannot be opened. Avoid
+  messengers: the message stays on their servers in plain text.
+- **S3 token:** cheap to replace. The keychain alone is enough; after a disaster, issue a new
+  token in the console.
+- A restore needs all three: the ciphertext in the bucket, the off-machine password, and a
+  token you can issue again.
 
-## 검증 — 스냅샷 id 는 성공의 증거가 아니다
+## Verify — a snapshot id is not proof
 
-성공 판정은 **다른 디렉토리로 실제 복원해서 그 복원본의 `git log` 가 도는 것**으로 한다:
+A backup has worked only when a restore into **another directory** gives a working `git log`:
 
 ```bash
 restic -r "s3:$EP/<bucket>" restore latest --target /tmp/verify --include "<repo-path>/.git"
-git --git-dir=/tmp/verify/<repo-path>/.git log --oneline -3   # 최신 커밋까지 보여야 통과
+git --git-dir=/tmp/verify/<repo-path>/.git log --oneline -3   # must show the latest commit
 ```
 
-복원 검증은 키체인에서 읽은 패스워드로 수행한다 (사본이 실제로 여는 열쇠인지까지 검증).
-파일 하나를 원본과 `cmp` 로 바이트 대조하면 더 강하다. 검증 후 scratch 는 삭제.
+Restore with the password read from the keychain, so you also prove that copy opens the
+repository. Comparing one file byte for byte with `cmp` makes the check stronger. Delete the
+scratch directory afterwards.
 
-## 복원 (재해 시, 다른 머신에서)
+## Restore after a disaster (on another machine)
 
-1. 스토리지 콘솔 로그인 → 새 S3 토큰 발급 (Object Read, 해당 버킷)
-2. `RESTIC_PASSWORD=<오프머신 사본> restic -r "s3:<endpoint>/<bucket>" restore latest --target ~/restore`
-3. 복원된 폴더의 `.git` 이 그대로 살아 있다 — clone 이 아니라 원본 복귀다.
+1. Sign in to the storage console and issue a new token (Object Read, that bucket).
+2. `RESTIC_PASSWORD=<off-machine copy> restic -r "s3:<endpoint>/<bucket>" restore latest --target ~/restore`
+3. The restored folder's `.git` is intact: this is the original repository back, not a clone.

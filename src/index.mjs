@@ -24,6 +24,7 @@ export {
   ingestResultFileWithGuards,
   ingestGenericSource,
   ingestInbox,
+  inspectExistingPageBodyShape,
   isSidecarPath,
   isArchiveTreeRelativePath,
   isPlansSlotPath,
@@ -39,6 +40,11 @@ export { lintVaultFiles, formatVaultLintReport } from "./engine/vault-lint.mjs";
 // Search + get.
 export {
   searchVault,
+  searchVaultStores,
+  searchVaultTree,
+  searchOneStore,
+  isSearchCorpusPath,
+  crossesSecretDir,
   getVaultDocuments,
   formatVaultSearchText,
   formatVaultGetText,
@@ -99,6 +105,22 @@ export {
 
 // Vault directory resolver.
 export { resolveVaultDir } from "./engine/path-resolver.mjs";
+
+// Storage policy a host applies before it writes a file into a vault tree: the same verdict the
+// pre-commit gate gives a staged file (intermediate places, the non-LFS size ceiling).
+export { judgeBinaryWrite, MAX_NON_LFS_BYTES } from "./engine/commit-policy.mjs";
+
+// The machine's store registry (`~/.kuma/vault-stores.json`, v1 and v2), read side.
+export { loadStoreRegistry, resolveStoreRegistryPath } from "./engine/vault-stores.mjs";
+
+// A tree's sync conflict records (`_sync-conflicts/conflicts.jsonl`), read by path.
+export { readTreeSyncConflicts } from "./sync/conflicts.mjs";
+
+// Reading a partial clone (docs/sync.md "From a host"): the canonical LFS pointer form, where the
+// sync daemon keeps its state files, and `vault blob get` as a call.
+export { parseLfsPointer, LFS_POINTER_MAX_BYTES } from "./server/lfs-paths.mjs";
+export { syncStateDir } from "./sync/context.mjs";
+export { blobGet } from "./sync/blob.mjs";
 
 // Project attribution (pure — consumer injects its known project ids).
 export {

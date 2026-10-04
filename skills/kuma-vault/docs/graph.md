@@ -25,7 +25,7 @@ vault graph [--all-stores] [--open] [--out <path>] [--vault-dir <path>]
 
 ## What the graph shows
 
-- **Root** — the vault itself (kuma-brain), pinned at center. The topology's starting point.
+- **Root** — the vault itself, pinned at center. The topology's starting point.
 - **Nodes** — every `.md` document, every folder, plus hub nodes for tags / domains / schema
   types / projects.
 - **Edges** — one classified, independently toggleable **layer per connection methodology**.
@@ -40,15 +40,15 @@ illustrative from a large vault; yours will differ.
 
 | Layer | Frontmatter / source | Why it exists | Role |
 |---|---|---|---|
-| **hier** (계층) | folder README topology | the vault's canonical ownership structure is the folder tree (`architecture.md` = Kuma Topology Vault); every doc is owned by exactly one folder | the SSoT of *where a doc lives*; the backbone reaching every doc from the root |
-| **ref** (참조) | `related:`, `## Related`, relative `.md` links, `[[wikilinks]]` | hand-authored, explicit cross-reference between pages | "see this, then see that" — deliberate related-knowledge navigation |
-| **xstore** (외부 저장소) | inline-code cross-store pointer `` `<store-id>:<path>` `` (parser shared with `vault lint`; store roots from the machine registry `vault-stores.json`) | a fact lives in exactly one store, so a page in this tree points at the owning document in another tree (`docs/cross-store-pointers.md`) | shows where two knowledge stores connect: referencing doc → external doc → external store hub. A pointer whose registered root is *this* tree resolves to the internal node instead (one document, one node). No registry on the machine → the layer is empty and the skip is printed at generation time, never silent |
-| **alias** (별칭) | reference resolved via a page `aliases` value | per `schema.md`, `aliases` are **search handles** (synonyms / abbreviations / cross-language), not page-to-page links — they connect a *query* to a page | find-by-fuzzy-memory. Structurally near-empty as a doc→doc layer: almost no references resolve through an alias, and that emptiness is the honest truth, not a bug |
-| **tag** (태그) | shared `tags:` → tag hubs | bounded-vocab topic tags (one of the three enrich fields) shared across docs | cross-groups docs by topic even across folders; a `#hub` reveals a topic cluster |
-| **domain** (도메인, 폐기된 필드) | `domain:` → drift hubs | the `domain:` field is **deprecated** (2026-07-05 결정 — membership is declared by the path/topology, cross-cutting classification by `tags`) | surfaces any *leftover* `domain:` values as drift; after the vault-wide migration this layer must be empty (hub/edge count 0 = clean) |
-| **schema** (스키마) | `type:` / `kind:` → type hubs | schema classification fields (`special/decisions`, `special/dispatch-log`, `sidecar`, `tech`, …) | groups by document *kind/role*, surfacing the special-file contracts |
-| **project** (프로젝트) | `project:` → project hubs | the project a work artifact belongs to | bundles per-project output; the primary way the `plans/` subtree interconnects |
-| **planline** (플랜 계보) | `parent_plan:` chain | a plan points at its parent plan (plan id `<project>/<stem>`) | plan parent-child lineage / orchestration flow, master plan → derived plans |
+| **hier** (hierarchy) | folder README topology | the vault's canonical ownership structure is the folder tree; every doc is owned by exactly one folder | the SSoT of *where a doc lives*; the backbone reaching every doc from the root |
+| **ref** (reference) | `related:`, `## Related`, relative `.md` links, `[[wikilinks]]` | hand-authored, explicit cross-reference between pages | "see this, then see that" — deliberate related-knowledge navigation |
+| **xstore** (cross-store) | inline-code cross-store pointer `` `<store-id>:<path>` `` (parser shared with `vault lint`; store roots from the machine registry `vault-stores.json`) | a fact lives in exactly one store, so a page in this tree points at the owning document in another tree (the engine's `docs/cross-store-pointers.md`) | shows where two knowledge stores connect: referencing doc → external doc → external store hub. A pointer whose registered root is *this* tree resolves to the internal node instead (one document, one node). No registry on the machine → the layer is empty and the skip is printed at generation time, never silent |
+| **alias** | reference resolved via a page `aliases` value | per `schema.md`, `aliases` are **search handles** (synonyms / abbreviations / cross-language), not page-to-page links — they connect a *query* to a page | find-by-fuzzy-memory. Structurally near-empty as a doc→doc layer: almost no references resolve through an alias, and that emptiness is the honest truth, not a bug |
+| **tag** | shared `tags:` → tag hubs | bounded-vocab topic tags (one of the three enrich fields) shared across docs | cross-groups docs by topic even across folders; a `#hub` reveals a topic cluster |
+| **domain** (deprecated field) | `domain:` → drift hubs | the `domain:` field is **deprecated**: membership is declared by the path, cross-cutting classification by `tags` | surfaces any *leftover* `domain:` values as drift; a clean vault shows 0 hubs and 0 edges here |
+| **schema** | `type:` / `kind:` → type hubs | schema classification fields (`special/decisions`, `special/dispatch-log`, `sidecar`, `tech`, …) | groups by document *kind/role*, surfacing the special-file contracts |
+| **project** | `project:` → project hubs | the project a work artifact belongs to | bundles per-project output; the primary way the `plans/` subtree interconnects |
+| **planline** (plan lineage) | `parent_plan:` chain | a plan points at its parent plan (plan id `<project>/<stem>`) | plan parent-child lineage / orchestration flow, master plan → derived plans |
 
 ## Notes
 
@@ -64,7 +64,7 @@ illustrative from a large vault; yours will differ.
   thick lines, and sections separate into same-colored continents. No shared center exists to
   glue unrelated components together. Precise relations still live in the click-detail panel;
   the layout is the tendency, the panel is the truth.
-- **Local graph (N홉 포커스).** Selecting a node offers 1/2/3-hop buttons that hide everything
+- **Local graph (N-hop focus).** Selecting a node offers 1/2/3-hop buttons that hide everything
   outside that radius over the ACTIVE layers — the Obsidian-style answer to "how is THIS node
   connected". Esc restores the full view.
 - Unresolved references (external URLs, owner-local asset paths, ambiguous stems) are counted
@@ -72,7 +72,7 @@ illustrative from a large vault; yours will differ.
   counts are printed with the render (`unresolved: ref=… plan=… xstore-unknown-store=…
   xstore-self=…`) so what is absent from the picture is still visible.
 - **Operational-artifact sections start hidden.** `plans/`, `results/`, and `_archive/` are
-  the bulk of a working vault's documents (≈94% on the reference tree) and drown the knowledge
+  most of a working vault's documents and drown the knowledge
   topology, so the default view excludes them. They stay listed (dimmed, with counts) in the
-  Sections legend — one click, or the 전체 action, brings them back.
+  Sections legend — one click, or the show-all action, brings them back.
 - The render is a snapshot. Re-run `vault graph` after the vault changes to refresh it.

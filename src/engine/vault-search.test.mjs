@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -6,7 +6,13 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { formatVaultGetText, formatVaultSearchText, getVaultDocuments, searchVault } from "./vault-search.mjs";
+import {
+  formatVaultGetText,
+  formatVaultSearchText,
+  getVaultDocuments,
+  searchVault,
+  searchVaultStores,
+} from "./vault-search.mjs";
 import { buildFtsIndex } from "./vault-fts.mjs";
 
 const execFile = promisify(execFileCallback);
@@ -40,7 +46,7 @@ alpha-suite와 acme-app를 자주 같이 본다.
     `---
 title: Entity Catalog
 project: studio-alpha
-owner: tookdaki
+owner: nova
 ---
 
 Plain background notes only.
@@ -271,13 +277,18 @@ describe("vault search", () => {
       query: "내 노바링 아이디 알려줘",
     });
 
-    expect(result.hits).toEqual([
+    // The alias document must LEAD. It is no longer the only hit: a multi-word query now
+    // also searches its individual words, so a weaker document mentioning one of them
+    // ("아이디") surfaces below. That is the intended trade — ranking is by match count,
+    // so the alias hit still wins, and the recall is what makes a two-word lookup work
+    // at all (see extractSearchTerms).
+    expect(result.hits[0]).toEqual(
       expect.objectContaining({
         id: "domains/persona-accounts.md",
         title: "노바 SNS/플랫폼 계정 레지스트리",
-        entityMatchCount: 1,
       }),
-    ]);
+    );
+    expect(result.hits[0].entityMatchCount).toBeGreaterThan(0);
   });
 
   it("loads full document contents only through vault get", async () => {
@@ -476,5 +487,178 @@ describe("vault search", () => {
     const parsed = JSON.parse(stdout);
     expect(parsed.engine).toBe("fts");
     expect(parsed.hits.map((hit) => hit.path)).toContain("domains/lotus-playbook.md");
+  });
+});
+
+// Cross-store search. The incident this guards (2026-09-15): a rule living in a second
+// registered store was unreachable from `vault search`, which only ever returned the
+// pointer page sitting in the primary vault.
+describe("searchVaultStores", () => {
+  const storeDirs = [];
+
+  afterEach(async () => {
+    await Promise.all(storeDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  async function createStore(id, files) {
+    const root = await mkdtemp(join(tmpdir(), `vault-store-${id}-`));
+    storeDirs.push(root);
+    await writeFile(join(root, "vault.config.json"), JSON.stringify({ id, profile: "kuma-vault" }));
+    for (const [relativePath, body] of Object.entries(files)) {
+      await mkdir(resolve(root, relativePath, ".."), { recursive: true });
+      await writeFile(join(root, relativePath), body);
+    }
+    return root;
+  }
+
+  async function createRegistry(stores) {
+    const dir = await mkdtemp(join(tmpdir(), "vault-registry-"));
+    storeDirs.push(dir);
+    const path = join(dir, "vault-stores.json");
+    await writeFile(path, JSON.stringify({ stores }));
+    return path;
+  }
+
+  it("spans every registered store and labels each hit with its store", async () => {
+    const primary = await createStore("primary-store", {
+      "projects/pointer.md": "---\ntitle: Pointer\n---\n\n정본은 회사 저장소에 있다. 트리거단어.\n",
+    });
+    const secondary = await createStore("second-store", {
+      "rules/recipient.md": "---\ntitle: Recipient Rule\n---\n\n실제 규칙 본문이다. 트리거단어.\n",
+    });
+    const registry = await createRegistry({ "primary-store": primary, "second-store": secondary });
+
+    const result = await searchVaultStores({
+      query: "트리거단어",
+      vaultDir: primary,
+      env: { KUMA_VAULT_STORES: registry },
+    });
+
+    expect(result.union).toBe(true);
+    expect(result.storesSkipReason).toBeNull();
+    expect(result.stores.map((store) => store.storeId).sort()).toEqual(["primary-store", "second-store"]);
+
+    const byStore = Object.fromEntries(result.hits.map((hit) => [hit.storeId, hit]));
+    expect(byStore["second-store"].path).toBe("rules/recipient.md");
+    expect(byStore["second-store"].id).toBe("second-store:rules/recipient.md");
+    expect(byStore["primary-store"].id).toBe("primary-store:projects/pointer.md");
+  });
+
+  it("round-trips a union hit id through getVaultDocuments", async () => {
+    const primary = await createStore("rt-primary", {
+      "notes/a.md": "---\ntitle: A\n---\n\n왕복단어.\n",
+    });
+    const secondary = await createStore("rt-second", {
+      "rules/b.md": "---\ntitle: B\n---\n\n왕복단어 본문.\n",
+    });
+    const registry = await createRegistry({ "rt-primary": primary, "rt-second": secondary });
+    const env = { KUMA_VAULT_STORES: registry };
+
+    const search = await searchVaultStores({ query: "왕복단어", vaultDir: primary, env });
+    const crossHit = search.hits.find((hit) => hit.storeId === "rt-second");
+    expect(crossHit).toBeDefined();
+
+    const got = await getVaultDocuments({ ids: [crossHit.id], vaultDir: primary, env });
+    expect(got.hits[0].storeId).toBe("rt-second");
+    expect(got.hits[0].content).toContain("왕복단어 본문");
+  });
+
+  it("degrades to the primary store when no registry exists, and says so", async () => {
+    const primary = await createStore("lonely-store", {
+      "notes/a.md": "---\ntitle: A\n---\n\n고립단어.\n",
+    });
+    const result = await searchVaultStores({
+      query: "고립단어",
+      vaultDir: primary,
+      env: { KUMA_VAULT_STORES: join(primary, "absent-registry.json") },
+    });
+
+    expect(result.union).toBe(false);
+    expect(result.storesSkipReason).toMatch(/no store registry/u);
+    expect(result.hits).toHaveLength(1);
+  });
+
+  it("keeps searching when one registered store is unusable", async () => {
+    const primary = await createStore("ok-store", {
+      "notes/a.md": "---\ntitle: A\n---\n\n격리단어.\n",
+    });
+    const empty = await createStore("empty-store", {});
+    const registry = await createRegistry({ "ok-store": primary, "empty-store": empty });
+
+    const result = await searchVaultStores({
+      query: "격리단어",
+      vaultDir: primary,
+      env: { KUMA_VAULT_STORES: registry },
+    });
+
+    expect(result.hits).toHaveLength(1);
+    expect(result.hits[0].storeId).toBe("ok-store");
+    const failed = result.stores.find((store) => store.storeId === "empty-store");
+    expect(failed.error).toBeTruthy();
+  });
+
+  it("narrows to one store with storeId", async () => {
+    const primary = await createStore("narrow-primary", {
+      "notes/a.md": "---\ntitle: A\n---\n\n좁힘단어.\n",
+    });
+    const secondary = await createStore("narrow-second", {
+      "rules/b.md": "---\ntitle: B\n---\n\n좁힘단어.\n",
+    });
+    const registry = await createRegistry({ "narrow-primary": primary, "narrow-second": secondary });
+
+    const result = await searchVaultStores({
+      query: "좁힘단어",
+      vaultDir: primary,
+      storeId: "narrow-second",
+      env: { KUMA_VAULT_STORES: registry },
+    });
+
+    expect(result.hits).toHaveLength(1);
+    expect(result.hits[0].path).toBe("rules/b.md");
+  });
+
+  it("finds a document holding both words apart, not just an adjacent phrase", async () => {
+    // The 2026-09-15 lookup failure in miniature: the rule document used the two words
+    // paragraphs apart, while a pointer page happened to carry them adjacent in an alias
+    // list. Phrase-only matching returned the pointer and scored the rule zero.
+    const primary = await createStore("recall-primary", {
+      "notes/pointer.md": "---\ntitle: Pointer\n---\n\naliases 목록: 케이스마텍 숨은참조\n",
+    });
+    const secondary = await createStore("recall-second", {
+      "rules/real.md":
+        "---\ntitle: Real Rule\n---\n\n케이스마텍 발신 메일 기본값이다.\n\n다른 문단이다.\n\n숨은참조 세 명을 매번 넣는다.\n",
+    });
+    const registry = await createRegistry({ "recall-primary": primary, "recall-second": secondary });
+
+    const result = await searchVaultStores({
+      query: "케이스마텍 숨은참조",
+      vaultDir: primary,
+      env: { KUMA_VAULT_STORES: registry },
+    });
+
+    expect(result.hits.map((hit) => hit.id)).toContain("recall-second:rules/real.md");
+  });
+
+  it("falls back to scan when the index cannot represent every term, and says which", async () => {
+    // Trigram FTS drops sub-3-character terms, which is most short Korean words. Reporting
+    // "no matches" from a query we never fully asked is a false negative, not an answer.
+    const root = await createStore("short-term-store", {
+      "notes/deal.md": "---\ntitle: Deal\n---\n\n인수 관련 메모이고 제안 내용을 담았다.\n",
+    });
+    await buildFtsIndex({ vaultDir: root });
+
+    const result = await searchVault({ query: "인수 제안", vaultDir: root });
+
+    expect(result.droppedTerms).toEqual(expect.arrayContaining(["인수", "제안"]));
+    expect(result.hits.map((hit) => hit.path)).toContain("notes/deal.md");
+    expect(formatVaultSearchText(result)).toContain("terms_too_short_for_index:");
+  });
+
+  it("bin/vault forwards --vault-dir only when the caller gave one", async () => {
+    // Guards the trap that made the default unreachable: an unconditional --vault-dir
+    // pins search to one tree no matter what the JS layer defaults to.
+    const script = await readFile(VAULT_BIN_PATH, "utf8");
+    expect(script).not.toMatch(/vault-search --vault-dir "\$VAULT_DIR"/u);
+    expect(script).toMatch(/root_args=\(--vault-dir "\$VAULT_DIR"\)/u);
   });
 });

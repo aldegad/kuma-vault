@@ -27,13 +27,16 @@
 //
 // Backend: Node's built-in `node:sqlite` (DatabaseSync + FTS5) — zero native dependency, no build
 // step, matching the repo's repo-agnostic tooling goal. It is an experimental API (Node ≥ 22.5),
-// so importing this module emits one `ExperimentalWarning` on stderr; that is deliberate and
-// stdout stays clean for `--json` consumers.
+// so the first index open emits one `ExperimentalWarning` on stderr; that is deliberate and
+// stdout stays clean for `--json` consumers. It loads on first USE, not on import: a static
+// import loaded it while every importer's module graph linked, so any host CLI that merely
+// reached `kuma-vault` for frontmatter or path helpers printed the warning ahead of its own
+// operator message (kuma-studio, 2026-09-23 — kuma cron, kuma dispatch, kuma katok).
 
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { DatabaseSync } from "node:sqlite";
 import { basename, dirname, join, resolve } from "node:path";
 
 import { resolveVaultDir } from "./path-resolver.mjs";
@@ -46,6 +49,13 @@ import {
   resolveSearchScope,
   walkVaultMarkdownFiles,
 } from "./vault-search.mjs";
+
+// node:sqlite on first use (see the Backend note above).
+let sqlite = null;
+function openDatabase(path, options) {
+  sqlite ??= createRequire(import.meta.url)("node:sqlite");
+  return options === undefined ? new sqlite.DatabaseSync(path) : new sqlite.DatabaseSync(path, options);
+}
 
 // Bumped whenever the on-disk FTS schema (columns / tokenizer) changes so a stale-schema DB is
 // treated as drift and rebuilt rather than queried with the wrong shape.
@@ -135,6 +145,16 @@ export function ftsQueryServiceable(searchTerms) {
   return buildFtsMatchExpression(searchTerms) !== "";
 }
 
+// Terms the trigram index physically cannot match. Two-code-point Korean words
+// (인수 · 약속 · 카톡 …) fall here constantly, and dropping them silently makes FTS
+// answer a narrower question than the one asked while reporting "no matches" as if
+// the corpus held nothing. Callers surface this and fall back to scan.
+export function unserviceableFtsTerms(searchTerms) {
+  return (Array.isArray(searchTerms) ? searchTerms : []).filter(
+    (term) => codePointLength(term) < TRIGRAM_MIN_LENGTH,
+  );
+}
+
 export function ftsIndexAvailable(vaultDir = resolveVaultDir(), dbPath) {
   return existsSync(dbPath ?? resolveFtsDbPath(vaultDir));
 }
@@ -179,7 +199,7 @@ function readStoredMeta(dbPath) {
   }
   let db;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
+    db = openDatabase(dbPath, { readOnly: true });
     const rows = db.prepare("SELECT key, value FROM fts_meta").all();
     const meta = {};
     for (const row of rows) {
@@ -227,7 +247,7 @@ export async function buildFtsIndex({ vaultDir = resolveVaultDir(), dbPath, forc
   const tmpPath = `${resolvedDbPath}.${process.pid}.${nextBuildSequence()}.tmp`;
 
   try {
-    const db = new DatabaseSync(tmpPath);
+    const db = openDatabase(tmpPath);
     try {
       db.exec(
         "CREATE VIRTUAL TABLE vault_fts USING fts5(" +
@@ -372,7 +392,7 @@ export async function searchFtsIndex({
     limit,
   };
 
-  const db = new DatabaseSync(resolvedDbPath, { readOnly: true });
+  const db = openDatabase(resolvedDbPath, { readOnly: true });
   let corpusFiles;
   let candidatePaths = [];
   try {

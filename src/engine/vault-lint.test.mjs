@@ -12,8 +12,14 @@ import { rewriteIndex } from "./vault-ingest.mjs";
 const execFile = promisify(execFileCallback);
 const CLI_PATH = resolve(process.cwd(), "src/cli/cli.mjs");
 
+// The tree declares its contract, as every linted tree does (lint resolves it from the root).
+async function writeVaultDeclaration(vaultDir, declaration = { profile: "kuma-vault" }) {
+  await writeFile(join(vaultDir, "vault.config.json"), JSON.stringify(declaration), "utf8");
+}
+
 async function writeVaultLintFixture(vaultDir) {
   await mkdir(vaultDir, { recursive: true });
+  await writeVaultDeclaration(vaultDir);
 
   await writeFile(
     join(vaultDir, "schema.md"),
@@ -497,20 +503,21 @@ updated: 2026-04-25
     expect(result.issueCount).toBe(0);
   });
 
-  it("accepts persona memory pages with the persona-memory contract", async () => {
+  it("accepts persona memory pages the tree declares, with the persona-memory contract", async () => {
     const root = await mkdtemp(join(tmpdir(), "kuma-vault-lint-"));
     tempRoots.push(root);
 
     const vaultDir = join(root, "vault");
     await mkdir(join(vaultDir, "domains"), { recursive: true });
     await writeVaultLintFixture(vaultDir);
+    await writeVaultDeclaration(vaultDir, { profile: "kuma-vault", personaMemoryPages: ["domains/nova.md"] });
 
     await writeFile(
-      join(vaultDir, "domains", "codexy.md"),
+      join(vaultDir, "domains", "nova.md"),
       `---
-title: 코덱시 (Codexy) — 본인 기억
+title: 노바 (Nova) — 본인 기억
 type: domain
-slug: codexy
+slug: nova
 updated: 2026-05-25T02:15:00.000+09:00
 boot_priority: 3
 ---
@@ -527,11 +534,88 @@ persona memory
     const result = lintVaultFiles({
       vaultDir,
       mode: "full",
-      files: ["domains/codexy.md"],
+      files: ["domains/nova.md"],
     });
 
     expect(result.ok).toBe(true);
     expect(result.issueCount).toBe(0);
+  });
+
+  // A top-level domains/<name>.md is a persona-memory page only when the tree declares it
+  // (vault.config.json personaMemoryPages). No page shape tells the two apart: the misplaced
+  // topic page and the persona page below have the same shape, and a slug equal to the file
+  // name is how this kind of tree writes every page that carries a slug.
+  it("judges top-level domain pages by the tree's persona declaration, the same as the fixed list did", async () => {
+    const root = await mkdtemp(join(tmpdir(), "kuma-vault-lint-"));
+    tempRoots.push(root);
+
+    const vaultDir = join(root, "vault");
+    await mkdir(join(vaultDir, "domains", "gardening"), { recursive: true });
+    await writeVaultLintFixture(vaultDir);
+    await mkdir(join(vaultDir, "domains", "cooking")); // after the fixture, which gives every folder a README
+    await writeFile(
+      join(vaultDir, "domains", "gardening", "README.md"),
+      "---\ntitle: Gardening\ntags: [g]\n---\n\n## Summary\ng\n",
+      "utf8",
+    );
+
+    const page = (title, slugLine, body) => `---\ntitle: ${title}\ntype: domain\n${slugLine}updated: 2026-05-25\n---\n\n${body}\n`;
+    // Misplaced topic page in the persona shape, slug = file name.
+    await writeFile(join(vaultDir, "domains", "topic-y.md"), page("Topic Y", "slug: topic-y\n", "## About\ny\n\n## Timeline\n- 2026-05-25 — y"), "utf8");
+    // Misplaced reference page, slug = file name.
+    await writeFile(join(vaultDir, "domains", "widget-x.md"), page("Widget X", "slug: widget-x\n", "## Summary\nx\n\n## Details\nx\n\n## Sources\nx"), "utf8");
+    // Misplaced page without a slug.
+    await writeFile(join(vaultDir, "domains", "topic-z.md"), page("Topic Z", "", "## Summary\nz\n\n## Details\nz"), "utf8");
+    // The persona page.
+    await writeFile(join(vaultDir, "domains", "nova.md"), page("Nova", "slug: nova\n", "## About\nn\n\n## Timeline\n- 2026-05-25 — n"), "utf8");
+
+    const INDEX_CODES = new Set(["unreachable-vault-page", "vault-index-region-stale", "missing-vault-index-region"]);
+    const verdicts = async (declaration) => {
+      await writeVaultDeclaration(vaultDir, declaration);
+      const result = lintVaultFiles({ vaultDir, mode: "full" });
+      const byFile = {};
+      for (const issue of result.issues) {
+        // The fixture leaves the vault-index regions unwritten; index and reachability are judged elsewhere.
+        if (!issue.file?.startsWith("domains/") || INDEX_CODES.has(issue.code)) continue;
+        (byFile[issue.file] ??= []).push(issue.code);
+      }
+      return Object.fromEntries(Object.entries(byFile).map(([file, codes]) => [file, codes.sort()]));
+    };
+
+    // Each misplaced page as the built-in name list judged it: drift plus the generic page contract.
+    const drift = (...missingSections) => [
+      "domain-top-level-drift",
+      "frontmatter-created-format",
+      "frontmatter-tags-format",
+      ...missingSections,
+    ];
+    const misplaced = {
+      "domains/topic-y.md": drift("missing-section", "missing-section", "missing-section"),
+      "domains/widget-x.md": drift("missing-section"),
+      "domains/topic-z.md": drift("missing-section"),
+    };
+    const categoryDrift = {
+      "domains/cooking": ["domain-category-dir-drift", "domain-folder-index-missing"],
+    };
+
+    // No persona page declared (the default): every top-level page is drift, the persona-shaped ones too.
+    expect(await verdicts({ profile: "kuma-vault" })).toEqual({
+      ...categoryDrift,
+      ...misplaced,
+      "domains/nova.md": drift("missing-section", "missing-section", "missing-section"),
+    });
+    // The declared page takes the persona contract and passes; the others stay drift.
+    expect(await verdicts({ profile: "kuma-vault", personaMemoryPages: ["domains/nova.md"] })).toEqual({
+      ...categoryDrift,
+      ...misplaced,
+    });
+    // A declared page is linted with the persona contract, whatever it holds.
+    expect(await verdicts({ profile: "kuma-vault", personaMemoryPages: ["domains/nova.md", "domains/widget-x.md"] })).toEqual({
+      ...categoryDrift,
+      "domains/topic-y.md": misplaced["domains/topic-y.md"],
+      "domains/topic-z.md": misplaced["domains/topic-z.md"],
+      "domains/widget-x.md": ["missing-section", "missing-section"],
+    });
   });
 
   it("accepts learning pages with the learning-specific contract", async () => {
@@ -1305,7 +1389,7 @@ boot_priority: 3
 ## About
 
 - inline image: ![chart](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==)
-- contact: [mail](mailto:alex@example.com), [call](tel:+821012345678)
+- contact: [mail](mailto:user@example.com), [call](tel:+821012345678)
 - external: [site](https://example.com), [note](obsidian://open?vault=x)
 
 ## Decisions
