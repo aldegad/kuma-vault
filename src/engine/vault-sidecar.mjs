@@ -20,9 +20,9 @@
 //     sidecar written), and the caller surfaces it as a failing gate.
 
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { readdir, readFile, writeFile } from "node:fs/promises";
-import { basename, extname, join, relative } from "node:path";
+import { basename, dirname, extname, join, relative } from "node:path";
 
 import { resolveVaultDir } from "./path-resolver.mjs";
 import {
@@ -223,13 +223,32 @@ async function collectOrphanSidecars(vaultDir, ctx, currentDir = vaultDir, out =
   return out;
 }
 
+// A sidecar edit/deletion checks its source too; deleted sources can leave orphans.
+function selectedSidecars(vaultDir, paths, ctx) {
+  const candidates = new Set(paths.map((path) => isSidecarPath(path, ctx.profile) ? path.slice(0, -3) : path));
+  const sources = [];
+  const orphans = [];
+  for (const path of candidates) {
+    const ext = extname(path).toLowerCase();
+    if (!ctx.sourceExtensions.has(ext)) continue;
+    const dirs = dirname(path).split("/").filter((p) => p !== ".");
+    if (dirs.some((p) => p.startsWith(".") || SIDECAR_WALK_SKIP_DIRS.has(p))) continue;
+    if (!isDirInTrackedScope(dirname(path), ctx.trackedDirs)) continue;
+    const absolutePath = join(vaultDir, path);
+    if (existsSync(absolutePath)) {
+      if (lstatSync(absolutePath).isFile()) sources.push({ absolutePath, relativePath: path, ext });
+    } else if (existsSync(`${absolutePath}.md`)) orphans.push(`${path}.md`);
+  }
+  return { sources, orphans };
+}
+
 // --- Sync -------------------------------------------------------------------------------
 
 // Idempotent sidecar derivation. In write mode, (re)generates a sidecar for every binary
 // whose stamped hash is missing or stale, and skips the rest; a second invocation over an
 // unchanged tree regenerates nothing (no-op). `check: true` never writes — it reports which
 // sidecars would be (re)generated (the drift gate for git hooks / CI).
-export async function syncVaultSidecars({ vaultDir, check = false, profile = VAULT_PROFILE } = {}) {
+export async function syncVaultSidecars({ vaultDir, check = false, profile = VAULT_PROFILE, paths = null } = {}) {
   const activeVaultDir = vaultDir ?? resolveVaultDir();
   const resolvedProfile = resolveProfile(profile);
 
@@ -252,7 +271,8 @@ export async function syncVaultSidecars({ vaultDir, check = false, profile = VAU
     sourceExtensions,
   };
 
-  const sources = await collectSidecarSources(activeVaultDir, ctx);
+  const selected = paths === null ? null : selectedSidecars(activeVaultDir, paths, ctx);
+  const sources = selected ? selected.sources : await collectSidecarSources(activeVaultDir, ctx);
   sources.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 
   const regenerated = [];
@@ -311,7 +331,7 @@ export async function syncVaultSidecars({ vaultDir, check = false, profile = VAU
     }
   }
 
-  const orphans = await collectOrphanSidecars(activeVaultDir, ctx);
+  const orphans = selected ? selected.orphans : await collectOrphanSidecars(activeVaultDir, ctx);
   orphans.sort((left, right) => left.localeCompare(right));
 
   return {

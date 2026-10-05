@@ -1095,10 +1095,6 @@ class Driver:
             if not ok:
                 self.log("smoke %s FAILED %s" % (name, detail))
 
-        def remote_main():
-            _, out = self.git(nc, "ls-remote", "origin", "refs/heads/main", quiet=True)
-            return out.split()[0] if out.split() else None
-
         def commit_line(rel, line, msg):
             p = os.path.join(nc, rel)
             os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -1130,29 +1126,19 @@ class Driver:
             except (OSError, StepFailed, KeyError) as e:
                 record("plan", False, error=str(e))
         # commit -> server accepts, 10 times
-        lat = []
+        lat, confirmations = [], []
         try:
             for i in range(sm.get("commits", 10)):
                 commit_line(sm["logFile"], "c8 smoke commit %d %s" % (i + 1, now_iso()), "c8 smoke: commit %d" % (i + 1))
                 _, h = self.git(nc, "rev-parse", "HEAD", quiet=True)
-                t0 = time.time()
-                # nudge the daemon, do not wait for its tick: latency = commit until the server has it
-                nudge = subprocess.Popen([expand(x) for x in self.mac["vault"]] + ["sync", "now", "--repo", nc],
-                                         env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL)
-                try:
-                    while remote_main() != h.strip():
-                        if time.time() - t0 > sm.get("syncTimeout", 120):
-                            raise StepFailed("server did not take commit %d" % (i + 1))
-                        time.sleep(0.5)
-                finally:
-                    if nudge.poll() is None:
-                        nudge.terminate()
-                    nudge.wait()
-                lat.append(round(time.time() - t0, 2))
-            record("commits", True, latencies=lat, indexLockRetries=locked[0])
+                detail = {"commit": h.strip(), "remote": "origin", "attempts": [], "retries": 0}
+                confirmations.append(detail)
+                self.confirm_smoke_commit(nc, h.strip(), sm.get("syncTimeout", 120), detail)
+                lat.append(detail["elapsedSeconds"])
+            record("commits", True, latencies=lat, indexLockRetries=locked[0], confirmations=confirmations)
         except (StepFailed, KeyError) as e:
-            record("commits", False, latencies=lat, indexLockRetries=locked[0], error=str(e))
+            record("commits", False, latencies=lat, indexLockRetries=locked[0],
+                   confirmations=confirmations, error=str(e))
         # read the smoke log back through the engine reader (no search index: agents find a page
         # with a scoped rg over the tree and read it with vault get)
         tree_dir = os.path.join(nc, self.tree) if self.tree else nc
@@ -1205,6 +1191,101 @@ class Driver:
             self.save()
         if blocking:
             raise StepFailed("smoke failed: %s" % ", ".join(blocking))
+
+    def confirm_smoke_commit(self, repo, commit, budget, detail):
+        """One origin/commit, one monotonic budget including query and nudge cleanup.
+        Only explicit transport failures are retried; all observations stay in the receipt.
+        Each child owns a process group so a timed-out Git transport cannot retain its pipes.
+        """
+        started = time.monotonic()
+        deadline = started + budget
+        transient = re.compile(r"(?:Recv failure: Connection reset by peer|Connection reset by peer|"
+                               r"Send failure: Broken pipe|Empty reply from server|"
+                               r"Connection timed out|Failed to connect to [^\n]+: Connection timed out)", re.I)
+        permanent = re.compile(r"authentication failed|permission denied|access denied|forbidden|"
+                               r"repository not found|does not appear to be a git repository|"
+                               r"requested URL returned error: (?:401|403|404)|URL rejected", re.I)
+
+        def remaining():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise StepFailed("remote confirmation deadline exceeded for " + commit)
+            return left
+
+        def kill_group(process):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            # Never add an unbounded wait after the deadline. Popen's reaper retains an
+            # unreaped child if it has not exited yet; closing our pipe ends cannot block.
+            process.poll()
+
+        nudge = None
+        try:
+            remaining()
+            with open(self.step_log, "a", encoding="utf-8") as log:
+                nudge = subprocess.Popen([expand(x) for x in self.mac["vault"]] +
+                                         ["sync", "now", "--repo", repo], env=self.env,
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=log, start_new_session=True)
+                while True:
+                    left = remaining()
+                    if detail["attempts"] and detail["attempts"][-1]["rc"] == 128:
+                        detail["retries"] += 1
+                    query_started = time.monotonic()
+                    args = [self.mac.get("git", "git"), "-C", repo,
+                            "ls-remote", "origin", "refs/heads/main"]
+                    query = subprocess.Popen(args, env=self.env, stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             start_new_session=True)
+                    timed_out = False
+                    try:
+                        out, err = query.communicate(timeout=min(left, remaining()))
+                    except subprocess.TimeoutExpired as exc:
+                        timed_out = True
+                        out, err = exc.output or b"", exc.stderr or b""
+                        kill_group(query)
+                    except BaseException:
+                        kill_group(query)
+                        raise
+                    finally:
+                        query.stdout.close()
+                        query.stderr.close()
+                    stderr = err.decode("utf-8", "replace")
+                    rc = 124 if timed_out else query.returncode
+                    attempt = {"number": len(detail["attempts"]) + 1, "rc": rc,
+                               "seconds": round(time.monotonic() - query_started, 3), "stderr": stderr}
+                    detail["attempts"].append(attempt)
+                    if stderr:
+                        log.write(stderr + ("" if stderr.endswith("\n") else "\n"))
+                        log.flush()
+                    remaining()  # A matching response arriving after the deadline is not success.
+                    if timed_out:
+                        raise StepFailed("remote confirmation deadline exceeded for " + commit)
+                    if rc:
+                        if rc != 128 or permanent.search(stderr) or not transient.search(stderr):
+                            raise StepFailed("ls-remote origin failed (exit %s): %s" % (rc, stderr.strip()))
+                        self.log("smoke remote transient error " + json.dumps(attempt, ensure_ascii=False))
+                    else:
+                        fields = out.decode("utf-8", "replace").split()
+                        if fields == [commit, "refs/heads/main"]:
+                            break
+                    time.sleep(min(0.5, remaining()))
+        finally:
+            cleanup_timeout = False
+            if nudge is not None:
+                if nudge.poll() is None:
+                    nudge.terminate()
+                try:
+                    nudge.wait(timeout=max(0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    kill_group(nudge)
+                    cleanup_timeout = True
+                detail["nudgeExit"] = nudge.poll()
+            detail["elapsedSeconds"] = round(time.monotonic() - started, 3)
+            detail["cleanupTimedOut"] = cleanup_timeout
+        remaining()
 
     def git_index(self, repo, *args, env=None, tries=40, pause=0.5):
         """A git command that writes the index, next to a daemon that writes it too (its autosave

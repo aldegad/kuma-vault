@@ -142,6 +142,30 @@ before each autosave commit.)
 
 ## The commit gate
 
+Installed pre-commit hooks run `vault sync --check --incremental`. The scope is the
+union of staged, unstaged and untracked paths, including both sides of renames. The
+engine checks each affected folder README and its ancestor chain: an index reads
+immediate pages and child README summaries, so changes can propagate upward. The
+same generator and exclusion rules serve both full and incremental runs. On additions,
+deletions and renames the engine also discovers reverse dependencies in descriptions:
+a link in another folder's index changes when its target starts or stops existing.
+That discovery reads navigation metadata across the tree; ordinary modifications
+avoid it. Sidecar
+checks read only changed sources (or the source of a changed sidecar); stale-region
+lint reads the selected existing READMEs. An empty scope does no derivation work.
+
+This is a working-tree drift check, as before; it does not validate an isolated staged
+snapshot. A pre-existing drift outside the affected closure is intentionally not
+reported by the incremental gate. `vault sync --check` without `--incremental`,
+`vault sync`, `vault lint`, server/nightly calls and explicit `--full` retain full
+coverage. A missing Git baseline, unavailable/invalid path list, non-file change,
+changed declaration, attributes, ignore rules or declared schema/rules page promotes
+to a full pass. Enrich runs always use full scope (`scope.reason: enrich-pass`),
+even with a restricted leaf-metadata path list. Reports include `scope.mode` and
+`scope.reason` (also printed in text).
+Profiles and index rules are engine code or the declaration; upgrading them requires
+a full sync. There is no persistent scope cache or extra declaration key.
+
 `vault sync --check` is a gate on **the tree being committed**. Every derived file (the folder
 README `vault-index` regions, binary sidecars) is inside the commit. If one disagrees with its
 generator, the snapshot being committed contradicts itself, and regenerating during the commit

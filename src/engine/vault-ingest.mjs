@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { existsSync, lstatSync } from "node:fs";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { DEFAULT_DISPATCH_RESULT_DIR, DEFAULT_DISPATCH_TASK_DIR, DEFAULT_VAULT_INGEST_STAMP_DIR } from "./kuma-paths.mjs";
 import { resolveVaultDir } from "./path-resolver.mjs";
@@ -1757,12 +1757,68 @@ ${VAULT_INDEX_END_MARKER}
 `;
 }
 
-async function buildVaultReadmeIndexUpdates(vaultDir, ctx = buildNavContext(vaultDir)) {
+// The generator reads immediate children; a regenerated child README can change
+// its parent's summary, so include the ancestor closure. Scope uses the same
+// exclusions as collectReadmePaths, including archive roots and tracked dirs.
+export async function affectedVaultReadmes(vaultDir, paths, { profile, trackedDirs, topologyPaths = [] } = {}) {
+  vaultDir = resolve(vaultDir);
+  const ctx = buildNavContext(vaultDir, { profile, trackedDirs });
+  const selected = new Set();
+  const affected = new Set(paths);
+  if (topologyPaths.length) {
+    // Link rendering tests target existence. Add/delete/rename therefore needs
+    // reverse dependencies, even when the referring page was never edited.
+    // Discover only for topology changes; ordinary edits do not scan other folders.
+    const targets = new Set();
+    for (const path of topologyPaths) {
+      let target = resolve(vaultDir, path);
+      while (target !== vaultDir) {
+        const fromRoot = relative(vaultDir, target);
+        if (isAbsolute(fromRoot) || fromRoot === ".." || fromRoot.startsWith(`..${sep}`)) break;
+        targets.add(target);
+        target = dirname(target);
+        targets.add(join(target, "README.md"));
+      }
+    }
+    const indexes = [join(vaultDir, "README.md"), ...await collectReadmePaths(vaultDir, vaultDir, ctx)];
+    for (const index of indexes) {
+      for (const child of await collectReadmeIndexChildren(vaultDir, index, ctx)) {
+        for (const match of child.summary.matchAll(new RegExp(MARKDOWN_LINK_PATTERN.source, "gu"))) {
+          const target = parseMarkdownLinkTarget(match[2]).targetPath.trim();
+          if (target && !isExternalLinkTarget(target) && !target.startsWith("#") && targets.has(resolve(dirname(child.filePath), target))) {
+            affected.add(normalizeVaultRelativePath(relative(vaultDir, index)));
+          }
+        }
+      }
+    }
+  }
+  for (const path of affected) {
+    const parts = dirname(path).split("/").filter((p) => p !== ".");
+    let dir = "";
+    selected.add("README.md");
+    for (const part of parts) {
+      dir = dir ? `${dir}/${part}` : part;
+      if (part.startsWith(".") || part === "node_modules" ||
+          isPlansSlotPath(dir, ctx.profile) || isOwnerLocalBucketPath(dir, ctx.profile) ||
+          !isDirInNavScope(dir, ctx)) break;
+      try { if (!lstatSync(join(vaultDir, dir)).isDirectory()) break; }
+      catch (error) { if (error.code === "ENOENT" || error.code === "ENOTDIR") break; throw error; }
+      if (isArchiveTreeRelativePath(dir, ctx.profile)) {
+        if (!dir.includes("/")) selected.add(`${dir}/README.md`);
+        break;
+      }
+      selected.add(`${dir}/README.md`);
+    }
+  }
+  return [...selected].sort();
+}
+
+async function buildVaultReadmeIndexUpdates(vaultDir, ctx = buildNavContext(vaultDir), readmes = null) {
   const rootReadmePath = join(vaultDir, "README.md");
-  const readmePaths = [
+  const readmePaths = readmes === null ? [
     rootReadmePath,
     ...await collectReadmePaths(vaultDir, vaultDir, ctx),
-  ].filter((readmePath, index, all) => all.indexOf(readmePath) === index);
+  ].filter((readmePath, index, all) => all.indexOf(readmePath) === index) : readmes.map((path) => join(vaultDir, path));
 
   const updates = [];
 
@@ -1843,8 +1899,8 @@ export async function rewriteIndex(vaultDir, { profile, trackedDirs } = {}) {
 // One derivation pass: regenerate every folder's generated vault-index region
 // and (unless `check`) write back only the READMEs whose content actually
 // changed (content equality, 8원칙 #5).
-async function runVaultIndexPass(activeVaultDir, check, ctx) {
-  const updates = await buildVaultReadmeIndexUpdates(activeVaultDir, ctx);
+async function runVaultIndexPass(activeVaultDir, check, ctx, readmes) {
+  const updates = await buildVaultReadmeIndexUpdates(activeVaultDir, ctx, readmes);
   const changed = [];
   let unchangedCount = 0;
   for (const update of updates) {
@@ -1874,12 +1930,12 @@ async function runVaultIndexPass(activeVaultDir, check, ctx) {
 //
 // `check: true` never writes; it reports single-pass drift — the drift gate for
 // git hooks / CI ("would a sync change anything?").
-export async function syncVaultIndex({ vaultDir, check = false, maxPasses = 10, profile, trackedDirs } = {}) {
+export async function syncVaultIndex({ vaultDir, check = false, maxPasses = 10, profile, trackedDirs, readmes = null } = {}) {
   const activeVaultDir = vaultDir ?? resolveVaultDir();
   const ctx = buildNavContext(activeVaultDir, { profile, trackedDirs });
 
   if (check) {
-    const pass = await runVaultIndexPass(activeVaultDir, true, ctx);
+    const pass = await runVaultIndexPass(activeVaultDir, true, ctx, readmes);
     return {
       vaultDir: activeVaultDir,
       check: true,
@@ -1897,7 +1953,7 @@ export async function syncVaultIndex({ vaultDir, check = false, maxPasses = 10, 
   let passes = 0;
   let lastChangedCount = 0;
   while (passes < maxPasses) {
-    const pass = await runVaultIndexPass(activeVaultDir, false, ctx);
+    const pass = await runVaultIndexPass(activeVaultDir, false, ctx, readmes);
     passes += 1;
     total = pass.total;
     lastChangedCount = pass.changed.length;

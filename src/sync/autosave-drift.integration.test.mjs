@@ -29,6 +29,7 @@ import { VAULT_BIN, createWorld, fixtureAttributes, fixtureGitignore, removeWorl
 import { loadContext } from "./context.mjs";
 import { createMemory, runTick } from "./daemon.mjs";
 import { gitBin } from "./git.mjs";
+import { gateRefusal } from "./autosave.mjs";
 
 const MIN = 60_000;
 const RACER = "vault/domains/notes/racer.md";
@@ -333,4 +334,23 @@ describe.sequential("autosave and the index.lock a killed git left", { timeout: 
   it("a page not yet added: the add's wait removes the lock once it is old enough, and the tick does not fail", async () => {
     expectSaved(await tickUnderDeadLock("q9", { staged: false }));
   });
+});
+
+it("reports a full first autosave and a scoped subsequent autosave through the real binary", async () => {
+  const d = await daemon(VAULT_BIN);
+  const now = Date.now();
+  quietPage("scope-first", now);
+  await d.tick({ now, force: true });
+  expect(d.events("autosave-sync-scope")[0]).toMatchObject({ mode: "full", reason: "first-autosave" });
+  const second = quietPage("scope-second", now);
+  const result = await d.tick({ now, force: true });
+  expect(result.status.autosaveBlocked).toBeNull();
+  expect(tracked(second)).toBe(true);
+  expect(d.events("autosave-sync-scope").at(-1)).toMatchObject({ mode: "incremental", reason: "changed-paths" });
+}, 60_000);
+
+it("does not mistake the scope report for a foreign hook's refusal", () => {
+  const report = "vault sync — check (no writes)\nvault-dir: /fixture\nscope: incremental (changed-paths)\nindex: 0 drifted / 0 README(s) (0 in sync)\n";
+  expect(gateRefusal(`${report}custom hook said no\n`, 1)).toBe("custom hook said no");
+  expect(gateRefusal(report, 1)).toBe("git commit exited 1");
 });

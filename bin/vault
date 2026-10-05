@@ -71,7 +71,7 @@ Usage:
   kuma-vault get <id|path|store:path> [more ids...]
                                    Read pages (finding them is a scoped rg over the tree)
   kuma-vault ingest [source] [--section <s>] [--page <p>] [--project <slug>] [--bypass] [--dry-run] [--vault-dir <path>]
-  kuma-vault sync [--check] [--enrich] [--enrich-limit <n>] [--enrich-paths-from <file|->] [--root <path>] [--profile <id>]
+  kuma-vault sync [--check] [--incremental|--full] [--changed-paths-from <file|->] [--enrich] [--enrich-limit <n>] [--enrich-paths-from <file|->] [--root <path>] [--profile <id>]
   kuma-vault sync status|now|pause|resume|conflicts|resolve|install|uninstall [--repo <dir>]
                                    Sync daemon of a remote store clone (see: vault sync --help-daemon)
   kuma-vault clone <url> [<dir>] [--store <id>] [--token-file <path>]   Partial clone of a remote store
@@ -183,6 +183,7 @@ case "$COMMAND" in
         exec node "$SYNC_MJS" sync "$@"
         ;;
     esac
+    SYNC_SCOPE=()
     SYNC_CHECK=""
     # retired with the FTS index; passed on so the node side says it has no effect
     SYNC_NO_FTS=""
@@ -195,6 +196,14 @@ case "$COMMAND" in
     # rather than silently dropped (No Silent Fallback).
     while [ $# -gt 0 ]; do
       case "$1" in
+        --incremental|--full)
+          SYNC_SCOPE+=("$1")
+          shift
+          ;;
+        --changed-paths-from|--full-reason)
+          SYNC_SCOPE+=("$1" "${2:?scope argument required}")
+          shift 2
+          ;;
         --check)
           SYNC_CHECK="--check"
           shift
@@ -246,7 +255,7 @@ case "$COMMAND" in
     # the cwd) and fails loud when there is none (No Silent Fallback).
     SYNC_ROOT=()
     [ -n "$VAULT_DIR_EXPLICIT" ] && SYNC_ROOT=(--vault-dir "$VAULT_DIR")
-    node "$CLI_MJS" vault-sync ${SYNC_ROOT[@]+"${SYNC_ROOT[@]}"} $SYNC_CHECK $SYNC_NO_FTS $SYNC_JSON $SYNC_ENRICH $SYNC_ENRICH_LIMIT ${SYNC_ENRICH_PATHS[@]+"${SYNC_ENRICH_PATHS[@]}"} $SYNC_PROFILE
+    node "$CLI_MJS" vault-sync ${SYNC_ROOT[@]+"${SYNC_ROOT[@]}"} ${SYNC_SCOPE[@]+"${SYNC_SCOPE[@]}"} $SYNC_CHECK $SYNC_NO_FTS $SYNC_JSON $SYNC_ENRICH $SYNC_ENRICH_LIMIT ${SYNC_ENRICH_PATHS[@]+"${SYNC_ENRICH_PATHS[@]}"} $SYNC_PROFILE
     ;;
   lint)
     LINT_JSON=""
@@ -380,7 +389,7 @@ $HOOK_MARKER — regenerate via: vault hook install --root <tree>
 # (\`vault sync --check\`). Run \`vault sync --root <tree>\` to regenerate them, then re-commit.
 ROOT="\$(git rev-parse --show-toplevel)$TREE_REL"
 $HOOK_RESOLVE_BIN
-exec "\$VAULT_BIN" sync --check --root "\$ROOT"
+exec "\$VAULT_BIN" sync --check --incremental --root "\$ROOT"
 HOOK
         chmod +x "$HOOK_PATH"
         printf 'Installed pre-commit drift gate: %s (contract: vault.config.json declaration)\n' "$HOOK_PATH"

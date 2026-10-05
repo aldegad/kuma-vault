@@ -49,7 +49,7 @@ function printVaultUsage() {
       "Usage:",
       "  vault-get <id|path> [more ids...] [--vault-dir <path>] [--format text|json]",
       "  vault-ingest [source] [--section <s>] [--page <p>] [--project <slug>] [--bypass] [--dry-run] [--vault-dir <path>]",
-      "  vault-sync [--check] [--enrich] [--enrich-limit <n>] [--enrich-paths-from <file|->] [--root <path>] [--profile <id>] [--json]",
+      "  vault-sync [--check] [--incremental|--full] [--changed-paths-from <file|->] [--enrich] [--enrich-limit <n>] [--enrich-paths-from <file|->] [--root <path>] [--profile <id>] [--json]",
       "  vault-lint [--mode fast|full] [--root <path>] [--profile <id>] [--json] [files...]",
       "",
       "Options:",
@@ -517,6 +517,14 @@ export function readEnrichPaths(options) {
   return paths;
 }
 
+function readChangedPaths(options) {
+  if (options["changed-paths-from"] === undefined) return undefined;
+  const source = readOptionalString(options, "changed-paths-from");
+  if (!source) throw new Error("--changed-paths-from needs a file, or - for stdin.");
+  try { return readFileSync(source === "-" ? 0 : source, "utf8").split("\0").filter(Boolean); }
+  catch { return null; } // The engine reports invalid-changed-paths and runs full.
+}
+
 export async function commandVaultSync(options) {
   if (options.help === true) {
     printVaultUsage();
@@ -527,7 +535,7 @@ export async function commandVaultSync(options) {
     options,
     // `generateDescription` is an internal injectable seam (E2E driver), never a CLI arg,
     // but programmatic callers pass it, so it is a known key.
-    ["check", "no-fts", "enrich", "enrich-limit", "enrich-paths-from", "root", "vault-dir", "wiki-dir", "profile", "json", "generateDescription"],
+    ["check", "incremental", "full", "changed-paths-from", "full-reason", "no-fts", "enrich", "enrich-limit", "enrich-paths-from", "root", "vault-dir", "wiki-dir", "profile", "json", "generateDescription"],
     "vault sync",
   );
 
@@ -572,6 +580,10 @@ export async function commandVaultSync(options) {
     vaultDir,
     profile,
     check: options.check === true,
+    incremental: options.incremental === true,
+    full: options.full === true,
+    scopeReason: readOptionalString(options, "full-reason"),
+    changedPaths: readChangedPaths(options),
     enrich: options.enrich === true,
     enrichLimit: readNumber(options, "enrich-limit"),
     enrichPaths: readEnrichPaths(options),

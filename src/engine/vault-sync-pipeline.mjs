@@ -26,8 +26,11 @@
 //
 // Everything else — order, gate, report — is not a consumer's to vary.
 
+import { existsSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { resolveSyncScope } from "./vault-sync-scope.mjs";
 import { enrichVaultDescriptions } from "./vault-enrich.mjs";
-import { syncVaultIndex } from "./vault-ingest.mjs";
+import { affectedVaultReadmes, syncVaultIndex } from "./vault-ingest.mjs";
 import { lintVaultFiles } from "./vault-lint.mjs";
 import { resolveTreeContract } from "./vault-config.mjs";
 import { syncVaultSidecars } from "./vault-sidecar.mjs";
@@ -37,6 +40,7 @@ export function formatVaultSyncReport(report) {
   const mode = report.check ? "check (no writes)" : "write";
   lines.push(`vault sync — ${mode}`);
   lines.push(`vault-dir: ${report.vaultDir}`);
+  if (report.scope) lines.push(`scope: ${report.scope.mode} (${report.scope.reason})`);
   lines.push(
     report.check
       ? `index: ${report.changedCount} drifted / ${report.total} README(s) (${report.unchangedCount} in sync)`
@@ -183,6 +187,10 @@ export async function runVaultSync({
   vaultDir,
   profile,
   check = false,
+  incremental = false,
+  changedPaths,
+  full = false,
+  scopeReason,
   enrich = false,
   enrichLimit,
   enrichFields,
@@ -190,6 +198,7 @@ export async function runVaultSync({
   generateDescription,
   createGenerateDescription,
 } = {}) {
+  vaultDir = resolve(vaultDir);
   const resolvedProfile = resolveTreeContract(vaultDir, profile);
 
   if (enrich && !resolvedProfile.enrich) {
@@ -198,12 +207,15 @@ export async function runVaultSync({
     throw new Error(`vault sync --enrich is not supported by the ${resolvedProfile.id} profile.`);
   }
 
+  const scope = resolveSyncScope({ vaultDir, profile: resolvedProfile, incremental, changedPaths, full, scopeReason: scopeReason ?? (enrich ? "enrich-pass" : undefined) });
+  const readmes = scope.paths === null ? null : await affectedVaultReadmes(vaultDir, scope.paths, { profile: resolvedProfile, topologyPaths: scope.topologyPaths });
+
   // Binary sidecars are a profile feature. Sidecars first when enabled: extracting binaries
   // mints/refreshes `<name>.<ext>.md` derivatives, and a newly-created sidecar must exist
   // before the index pass so it gets listed in its folder's vault-index. Both passes are
   // hash/content-gated derivations, so the composed sync stays idempotent.
   const sidecars = resolvedProfile.sidecar
-    ? await syncVaultSidecars({ vaultDir, check, profile: resolvedProfile })
+    ? await syncVaultSidecars({ vaultDir, check, profile: resolvedProfile, paths: scope.paths })
     : null;
   const activeVaultDir = sidecars?.vaultDir ?? vaultDir;
 
@@ -225,15 +237,19 @@ export async function runVaultSync({
     });
   }
 
-  const sync = await syncVaultIndex({ vaultDir: activeVaultDir, check, profile: resolvedProfile });
+  const sync = await syncVaultIndex({ vaultDir: activeVaultDir, check, profile: resolvedProfile, readmes });
 
   // Lint runs against the resolved vault after the (conditional) index write so
   // the stale-region count reflects post-sync state. No writes in check mode.
-  const lintReport = lintVaultFiles({ vaultDir: sync.vaultDir, mode: "full", profile: resolvedProfile });
+  const lintFiles = readmes?.filter((path) => existsSync(join(sync.vaultDir, path)));
+  const lintReport = lintFiles?.length === 0
+    ? { ok: true, fileCount: 0, issueCount: 0, issues: [] }
+    : lintVaultFiles({ vaultDir: sync.vaultDir, mode: "full", profile: resolvedProfile, files: lintFiles ?? undefined });
   const lint = summarizeVaultSyncLint(lintReport);
 
   return {
     command: "vault-sync",
+    scope,
     profile: resolvedProfile.id,
     ...sync,
     sidecars,

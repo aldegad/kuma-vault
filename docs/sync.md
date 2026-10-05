@@ -57,6 +57,16 @@ What stays loose (a path the walk cannot read or chmod) is the `credentialModes`
 `.git/vault-syncd.lock`. Each tick:
 
 1. **Autosave** what is not committed: `git status --porcelain=v2 -z --untracked-files=all`.
+   Before committing, derivation uses this pass's changed paths via the NUL-separated
+   `--changed-paths-from` input. Only affected sidecars and the folder README ancestor
+   closure are regenerated and checked. The first autosave, post-integration pass,
+   unknown scope and contract changes run full, with a reason in the sync report.
+   Enrich runs also always use full scope (`scope.reason: enrich-pass`), even when
+   their leaf-metadata input is restricted to selected paths.
+   Drift retries add the gate's reported paths and a fresh worktree scan to their scope.
+   Installed hooks use `--check --incremental`; direct `vault sync --check` stays full.
+   Existing drift outside the affected closure is left to full/periodic checks.
+
    Everything not ignored is collected, text or binary. There is no allow list. Held back:
    - a path changed in the last 120 s. Text still changing after 10 min is saved as it stands.
      A binary (an LFS extension) is never forced; a recording appended to for an hour waits until it stops.
@@ -115,7 +125,9 @@ What stays loose (a path the walk cannot read or chmod) is the `credentialModes`
    by the server's receive rules blocks with the server's reason until someone fixes it.
 5. **Status**: `~/.kuma-vault/sync/<id>.json`, written atomically.
 
-Hourly it also rescans ignored files and trims the LFS cache.
+Hourly it also rescans ignored files and trims the LFS cache. Forced ticks reuse the
+ignored-file scan until its configured interval expires; force still retries blocked
+autosaves and bypasses network backoff.
 
 Woken by a commit (fs watch on `refs/heads` and `logs/HEAD`, 2 s debounce), the server's
 events long-poll, a 60 s timer, and `vault sync now`. Every step is recomputed from git, so a

@@ -145,6 +145,7 @@ export async function runTick(ctx, mem, { now = Date.now(), force = false, api =
   // names the files a pass left out because their writer deleted them after the scan. A pass that
   // only waits out a block logs nothing.
   const noteBlocked = (pass, name) => {
+    if (pass.syncScope) log({ event: "autosave-sync-scope", pass: name, mode: pass.syncScope.mode, reason: pass.syncScope.reason });
     const files = (paths) => ({ driftedCount: paths?.length ?? 0, drifted: (paths ?? []).slice(0, 20) });
     for (const retry of pass.driftRetries ?? []) log({ event: "autosave-drift-retry", pass: name, attempt: retry.attempt, ...files(retry.drifted) });
     if (pass.vanished?.length) log({ event: "autosave-vanished", pass: name, count: pass.vanished.length, paths: pass.vanished.slice(0, 20) });
@@ -245,7 +246,7 @@ export async function runTick(ctx, mem, { now = Date.now(), force = false, api =
   const judgedAt = judgeNow(); // after the scan: no mtime in `entries` is ahead of it by a tick's length
   const prevAlerts = mem.previous?.alerts ?? {};
   const uncollected = computeUncollected(ctx, entries, { now: judgedAt, previous: prevAlerts.uncollected, memory: mem.autosave, reject });
-  if (!mem.ignored || judgedAt - mem.ignoredAt >= ctx.settings.ignoredScanMs || force) {
+  if (!mem.ignored || judgedAt - mem.ignoredAt >= ctx.settings.ignoredScanMs) {
     mem.ignored = await scanIgnored(ctx, { reject });
     mem.ignoredAt = judgeNow();
   }

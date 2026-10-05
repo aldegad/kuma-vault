@@ -15,6 +15,8 @@ const BOOLEAN_FLAGS = new Set([
   "dry-run",
   "enrich",
   "full-auto",
+  "full",
+  "incremental",
   "help",
   "json",
   "keep-data",

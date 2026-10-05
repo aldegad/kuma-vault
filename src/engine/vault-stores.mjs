@@ -28,7 +28,7 @@ import { loadVaultDeclaration } from "./vault-config.mjs";
 export const VAULT_STORES_FILENAME = "vault-stores.json";
 
 // Store-id grammar: lowercase kebab, matching the `id` both real trees declare
-// (`kuma-brain`, `acme-ops`). Kept in sync with the pointer parser boundary.
+// (`acme-vault`, `acme-ops`). Kept in sync with the pointer parser boundary.
 export const STORE_ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
 
 export function resolveHomeRelative(rawPath) {
@@ -174,7 +174,7 @@ export function parseStoreRegistry(parsed) {
   if (unknownTop.length > 0) throw new Error(`unknown top-level key(s) ${unknownTop.join(", ")} (allowed: version, default, stores).`);
   const entries = new Map();
   for (const [storeId, raw] of Object.entries(rawStores)) {
-    if (!STORE_ID_PATTERN.test(storeId)) throw new Error(`store-id "${storeId}" is not a valid id (lowercase kebab, e.g. "kuma-brain").`);
+    if (!STORE_ID_PATTERN.test(storeId)) throw new Error(`store-id "${storeId}" is not a valid id (lowercase kebab, e.g. "acme-vault").`);
     if (version === 1 && typeof raw !== "string") throw new Error(`store "${storeId}" must map to a non-empty path string.`);
     entries.set(storeId, normalizeStoreEntry(storeId, raw));
   }

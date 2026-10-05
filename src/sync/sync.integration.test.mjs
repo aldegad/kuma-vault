@@ -297,6 +297,7 @@ describe.sequential("autosave collects what nobody committed", { timeout: 240_00
 
 describe.sequential("alarms", { timeout: 600_000 }, () => {
   it("a png in a binaries.reject place is not committed or pushed and shows as rejectResidue", async () => {
+    a.mem.ignored = null; // begin the fixture with its scheduled scan due
     a.write("vault/work/frames/f001.png", randomBytes(10 * 1024));
     const r1 = await a.tick({ advance: QUIET, force: true });
     expect(a.tracked("vault/work/frames/f001.png")).toBe(false);
@@ -324,6 +325,7 @@ describe.sequential("alarms", { timeout: 600_000 }, () => {
   });
 
   it("a png ignored by a nested .gitignore raises ignoredOutside (yellow) with the rule", async () => {
+    a.mem.ignored = null; // a scheduled scan is due for this fixture
     a.write("vault/projects/demo/.gitignore", "out/\n");
     a.write("vault/projects/demo/out/render.png", randomBytes(4096));
     const r = await a.tick({ advance: QUIET, force: true });
@@ -336,7 +338,15 @@ describe.sequential("alarms", { timeout: 600_000 }, () => {
     rmSync(join(a.dir, "vault/projects/demo/out"), { recursive: true });
     a.git(["rm", "--quiet", "vault/projects/demo/.gitignore"]);
     a.commit([], "drop nested ignore");
-    expect((await a.tick({ force: true })).status.alerts.ignoredOutside.count).toBe(0);
+    const cached = a.mem.ignored;
+    const scannedAt = a.mem.ignoredAt;
+    await a.tick({ force: true });
+    await a.tick({ force: true });
+    expect(a.mem.ignored).toBe(cached);
+    expect(a.mem.ignoredAt).toBe(scannedAt);
+    const ctx = await a.ctx();
+    expect((await a.tick({ now: scannedAt + ctx.settings.ignoredScanMs + 1, force: true })).status.alerts.ignoredOutside.count).toBe(0);
+    expect(a.mem.ignored).not.toBe(cached);
   });
 
   it("a 33 MiB .bin is not committed and becomes uncollected red after 30 min + 1 h", async () => {

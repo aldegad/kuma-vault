@@ -150,7 +150,7 @@ export function firstMeaningfulLine(text) {
 // The lines of the gate's own report (formatVaultSyncReport): what the check counted, never why a
 // refusal that is not drift was made. "index: 0 drifted", or a vault-dir path holding the word
 // "drift", must not stand for a freeze or a failed sidecar.
-const GATE_REPORT_LINE = /^(vault sync — |vault-dir: |index: |sidecars: |enrich: |fts: |lint: |stale vault-index regions: |- \[)/u;
+const GATE_REPORT_LINE = /^(vault sync — |vault-dir: |scope: |index: |sidecars: |enrich: |fts: |lint: |stale vault-index regions: |- \[)/u;
 
 /**
  * A refused commit in one line: a refusal that is not drift says its own reason first (`vault gate
@@ -177,9 +177,11 @@ export function gateRefusal(output, code, refusal = parseVaultSyncCheckDrift(out
  * undeclared tree. A run that leaves no report writes nothing we collect; its first error line
  * is kept, and the gate refuses the commit if the tree is left drifted.
  */
-export async function regenerateDerived(ctx) {
+export async function regenerateDerived(ctx, paths = null, reason = "unknown-change-scope") {
   if (!existsSync(join(ctx.treeAbs, "vault.config.json"))) return null;
-  return readSyncRun(ctx, await runVaultSyncJson(ctx));
+  const treePaths = paths?.map((path) => ctx.treePath(path)).filter((path) => path !== null);
+  const extra = treePaths === undefined ? ["--full", "--full-reason", reason] : ["--changed-paths-from", "-"];
+  return readSyncRun(ctx, await runVaultSyncJson(ctx, extra, treePaths === undefined ? null : nulList(treePaths)));
 }
 
 /**
@@ -263,9 +265,11 @@ export async function autosave(ctx, memory, { clock = Date.now, force = false, r
   // do). The rest is judged again: the run took time, and whatever was written during it is not
   // quiet now.
   let ready = sorted.ready;
-  const derived = given ?? (await regenerateDerived(ctx));
+  const derived = given ?? (await regenerateDerived(ctx, regenerate || !memory.syncInitialized ? null : entries.map((e) => e.path), regenerate ? "post-integration" : "first-autosave"));
   if (derived) {
     report.preSync = derived.preSync;
+    report.syncScope = derived.report?.scope;
+    if (derived.preSync.code === 0) memory.syncInitialized = true;
     const owned = new Set(derived.written);
     const after = await scanWorktree(ctx.repo);
     const later = clock();
@@ -314,7 +318,7 @@ export async function autosave(ctx, memory, { clock = Date.now, force = false, r
     const nothing = /nothing to commit|no changes added to commit|nothing added to commit/i.test(output);
     const refusal = parseVaultSyncCheckDrift(output);
     const drifted = refusal.drifted.map((p) => (ctx.treeRel ? `${ctx.treeRel}/${p}` : p));
-    const again = !nothing && refusal.driftOnly && regenerations < ctx.settings.gateDriftRetries ? await regenerateDerived(ctx) : null;
+    const again = !nothing && refusal.driftOnly && regenerations < ctx.settings.gateDriftRetries ? await regenerateDerived(ctx, [...paths, ...drifted, ...(await scanWorktree(ctx.repo)).map((e) => e.path)]) : null;
     if (again) {
       regenerations += 1;
       report.driftRetries.push({ attempt: regenerations, drifted });
