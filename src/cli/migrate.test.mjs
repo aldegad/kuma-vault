@@ -13,9 +13,18 @@
 // trip holds when O's work tree equals N's main with pointers resolved, except the paths the
 // export skips by design (.gitattributes, the tree's vault.config.json) and the shas refmap
 // rewrites.
+//
+// The history built here is the same on every run: binary content comes from a fixed stream
+// (`fixtureBytes`) and every commit has a fixed date, so every sha is the same. refmap leaves an
+// all-digit token for review whatever the map says, so a sha prefix that a refmap run here has
+// to read as a commit reference — one these tests write into a note, or one the forward run wrote
+// and the reverse run reads back — must hold a hex letter: `short` refuses one that does not.
+// The answer then is another SEED, never a looser rule. Only the commits refmap itself makes are
+// dated by the clock (its git calls drop GIT_* from the environment): the tip's sha differs per
+// run, and its reference is cut as long as it takes to hold a letter.
 
 import { spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
@@ -64,6 +73,20 @@ function commitAll(dir, message, date) {
 }
 
 const sha256 = (b) => createHash("sha256").update(b).digest("hex");
+
+const SEED = "kv-migrate-1";
+/** `n` fixed bytes for `label`: incompressible like a real binary, the same on every run. */
+function fixtureBytes(label, n) {
+  const blocks = [];
+  for (let i = 0; i * 32 < n; i += 1) blocks.push(createHash("sha256").update(`${SEED}:${label}:${i}`).digest());
+  return Buffer.concat(blocks).subarray(0, n);
+}
+/** The first `length` characters of a fixture sha, where refmap must read them as a commit reference. */
+function short(sha, length) {
+  const prefix = sha.slice(0, length);
+  if (/^[0-9]+$/.test(prefix)) throw new Error(`fixture: ${prefix} (of ${sha}) is all digits — refmap reviews such a token, it does not replace it. Change SEED.`);
+  return prefix;
+}
 const casPath = (oid) => join(CAS, oid.slice(0, 2), oid.slice(2, 4), oid);
 function toCas(bytes) {
   const oid = sha256(bytes);
@@ -170,10 +193,10 @@ beforeAll(() => {
   write(O, "vault/vault.config.json", JSON.stringify({ id: "brain", profile: "docs" }));
   write(O, "vault/a.md", "# A\n\nfirst\n");
   write(O, "vault/notes/old.md", "old note\n");
-  write(O, "vault/img/x.png", randomBytes(3000));
+  write(O, "vault/img/x.png", fixtureBytes("x.png c1", 3000));
   // two files already LFS in the old layout (sub-.gitattributes + pointer + object)
   write(O, "vault/talks/_media/.gitattributes", "*.mp4 filter=lfs diff=lfs merge=lfs -text\n");
-  const mp4 = randomBytes(5000);
+  const mp4 = fixtureBytes("v.mp4 c1", 5000);
   const mp4Oid = sha256(mp4);
   write(O, "vault/talks/_media/v.mp4", renderLfsPointer(mp4Oid, mp4.length));
   mkdirSync(join(O, ".git/lfs/objects", mp4Oid.slice(0, 2), mp4Oid.slice(2, 4)), { recursive: true });
@@ -183,14 +206,14 @@ beforeAll(() => {
   oldShas.c1 = git(O, ["rev-parse", "HEAD"]).text;
   write(O, "vault/a.md", "# A\n\nsecond\n");
   oldShas.c2 = commitAll(O, "c2 edit a", "1696000100 +0900");
-  write(O, "vault/img/x.png", randomBytes(3000));
+  write(O, "vault/img/x.png", fixtureBytes("x.png c3", 3000));
   oldShas.c3 = commitAll(O, "c3 new x.png", "1696000200 +0900");
   // references written before the cutover
-  write(O, "vault/notes/ref.md", `# refs\n\nsee ${oldShas.c2.slice(0, 7)} and ${oldShas.c3.slice(0, 9)}.\nfull ${oldShas.c1}\ndate 20261003, not a sha deadbeefcafe\n`);
+  write(O, "vault/notes/ref.md", `# refs\n\nsee ${short(oldShas.c2, 7)} and ${short(oldShas.c3, 9)}.\nfull ${oldShas.c1}\ndate 20261003, not a sha deadbeefcafe\n`);
   // freeze: text committed (HEAD_final), binaries left in the work tree
-  write(O, "vault/img/x.png", randomBytes(3100)); // modified tracked binary
-  write(O, "vault/img/new.png", randomBytes(1200)); // untracked binary, touched later
-  write(O, "vault/img/keep.png", randomBytes(900)); // untracked binary, never touched
+  write(O, "vault/img/x.png", fixtureBytes("x.png freeze", 3100)); // modified tracked binary
+  write(O, "vault/img/new.png", fixtureBytes("new.png freeze", 1200)); // untracked binary, touched later
+  write(O, "vault/img/keep.png", fixtureBytes("keep.png freeze", 900)); // untracked binary, never touched
   git(O, ["add", "--", "vault/notes/ref.md", "vault/a.md"]);
   git(O, ["commit", "--quiet", "-m", "vault-migrate: freeze snapshot (text only)"], { env: { GIT_AUTHOR_DATE: "1696000300 +0900", GIT_COMMITTER_DATE: "1696000300 +0900" } });
   headFinal = git(O, ["rev-parse", "HEAD"]).text;
@@ -236,10 +259,10 @@ describe("vault migrate refmap", { timeout: 60_000 }, () => {
     const report = JSON.parse(out.stdout.toString("utf8"));
     expect(report).toMatchObject({ direction: "forward", replaced: 3, replacedUnique: 3, written: false, commit: null });
     const applied = readFileSync(join(root, "applied.tsv"), "utf8");
-    expect(applied).toContain(`${oldShas.c2.slice(0, 7)}\t${newShas.c2.slice(0, 7)}`);
-    expect(applied).toContain(`${oldShas.c3.slice(0, 9)}\t${newShas.c3.slice(0, 9)}`);
+    expect(applied).toContain(`${short(oldShas.c2, 7)}\t${short(newShas.c2, 7)}`);
+    expect(applied).toContain(`${short(oldShas.c3, 9)}\t${newShas.c3.slice(0, 9)}`);
     expect(applied).toContain(`${oldShas.c1}\t${newShas.c1}`);
-    expect(readFileSync(join(N, "vault/notes/ref.md"), "utf8")).toContain(oldShas.c2.slice(0, 7));
+    expect(readFileSync(join(N, "vault/notes/ref.md"), "utf8")).toContain(short(oldShas.c2, 7));
   });
 
   it("other repositories and all-digit tokens go to review; detached HEAD refuses --commit", () => {
@@ -255,7 +278,7 @@ describe("vault migrate refmap", { timeout: 60_000 }, () => {
     write(work, "vault/notes/digits.md", `probe ${digits.slice(0, 7)}\n`);
     git(work, ["add", "vault/notes/digits.md"]);
     const prefixes = join(root, "prefixes.txt");
-    writeFileSync(prefixes, `# from the mac\n${oldShas.c3.slice(0, 9)}\tkuma-studio\n`);
+    writeFileSync(prefixes, `# from the mac\n${short(oldShas.c3, 9)}\tkuma-studio\n`);
     const others = join(root, "others.txt");
     writeFileSync(others, `${join(O, ".git")}\n`);
     let out = vault(["migrate", "refmap", "--repo", work, "--map", mapFile, "--from-git-dir", join(O, ".git"), "--other-repo-prefixes", prefixes, "--review-out", join(root, "r2.tsv")]);
@@ -263,7 +286,7 @@ describe("vault migrate refmap", { timeout: 60_000 }, () => {
     let report = JSON.parse(out.stdout.toString("utf8"));
     expect(report.reviewByReason).toMatchObject({ "all-digits": 1, "other-repo": 1 });
     expect(report.replaced).toBe(2);
-    expect(readFileSync(join(root, "r2.tsv"), "utf8")).toContain(`${oldShas.c3.slice(0, 9)}\tother-repo:prefixes:`);
+    expect(readFileSync(join(root, "r2.tsv"), "utf8")).toContain(`${short(oldShas.c3, 9)}\tother-repo:prefixes:`);
     out = vault(["migrate", "refmap", "--repo", work, "--map", mapFile, "--from-git-dir", join(O, ".git"), "--other-repos", others]);
     report = JSON.parse(out.stdout.toString("utf8"));
     expect(report.replaced).toBe(0);
@@ -285,7 +308,7 @@ describe("vault migrate refmap", { timeout: 60_000 }, () => {
     expect(git(N, ["log", "-1", "--format=%s", tip]).text).toBe("vault-migrate: 커밋 sha 참조 갱신 (3건, 지도 projects/x/commit-map.tsv)");
     expect(git(N, ["show", "--name-only", "--format=", tip]).text).toBe("vault/notes/ref.md");
     const text = readFileSync(join(N, "vault/notes/ref.md"), "utf8");
-    expect(text).toContain(newShas.c2.slice(0, 7));
+    expect(text).toContain(short(newShas.c2, 7));
     expect(text).toContain(newShas.c1);
     expect(text).toContain("20261003");
     // the source repository was only read
@@ -296,25 +319,27 @@ describe("vault migrate refmap", { timeout: 60_000 }, () => {
 
 describe("vault migrate rollback-export", { timeout: 120_000 }, () => {
   let main;
+  let tipRef;
 
   it("post-cutover history: text, binaries, a merge, empty file, symlink, LFS mp4, layout files", () => {
     write(N, "vault/a.md", "# A\n\nafter cutover\n");
-    write(N, "vault/notes/post.md", `after: ${newShas.c3.slice(0, 8)} and ${tip.slice(0, 10)}, pasted old ${oldShas.c1}\n`);
+    tipRef = tip.slice(0, Math.max(10, tip.search(/[a-f]/) + 1));
+    write(N, "vault/notes/post.md", `after: ${short(newShas.c3, 8)} and ${tipRef}, pasted old ${oldShas.c1}\n`);
     commitAll(N, "d1 notes", "1696100000 +0900");
     const d1 = git(N, ["rev-parse", "HEAD"]).text;
     git(N, ["checkout", "--quiet", "-b", "side"]);
     write(N, "vault/b.md", "# B from the side\n");
     commitAll(N, "e1 side", "1696100050 +0900");
     git(N, ["checkout", "--quiet", "main"]);
-    writeLfs(N, "vault/img/post.png", randomBytes(2000));
-    writeLfs(N, "vault/img/new.png", randomBytes(1300)); // P binary changed
-    writeLfs(N, "vault/img/x.png", randomBytes(3200)); // P binary (modified at freeze) changed again
+    writeLfs(N, "vault/img/post.png", fixtureBytes("post.png d2", 2000));
+    writeLfs(N, "vault/img/new.png", fixtureBytes("new.png d2", 1300)); // P binary changed
+    writeLfs(N, "vault/img/x.png", fixtureBytes("x.png d2", 3200)); // P binary (modified at freeze) changed again
     rmSync(join(N, "vault/notes/old.md"));
     commitAll(N, "d2 binaries", "1696100100 +0900");
     git(N, ["merge", "--quiet", "--no-ff", "-m", "vault-sync: merge mbp", "side"], { env: { GIT_AUTHOR_DATE: "1696100200 +0900", GIT_COMMITTER_DATE: "1696100200 +0900" } });
     write(N, "vault/img/empty.png", "");
     symlinkSync("a.md", join(N, "vault/link.md"));
-    writeLfs(N, "vault/talks/_media/v.mp4", randomBytes(4000));
+    writeLfs(N, "vault/talks/_media/v.mp4", fixtureBytes("v.mp4 d3", 4000));
     write(N, ".gitattributes", `${renderLfsGitattributesLines().join("\n")}\n*.foo filter=lfs\n`);
     write(N, "vault/vault.config.json", JSON.stringify({ id: "brain-main", profile: "docs", visibility: "private", remotes: { allowed: ["http://srv/v1/stores/brain-main.git"] } }));
     commitAll(N, "d3 misc", "1696100300 +0900");
@@ -391,13 +416,13 @@ describe("vault migrate rollback-export", { timeout: 120_000 }, () => {
     const post = readFileSync(join(O, "vault/notes/post.md"), "utf8");
     expect(post).toContain(`after: ${oldShas.c3.slice(0, 8)}`);
     // the tip itself is a configuration commit with no old twin: reviewed, not invented
-    expect(post).toContain(tip.slice(0, 10));
-    expect(readFileSync(join(root, "rev-review.tsv"), "utf8")).toContain(`${tip.slice(0, 10)}\tnot-in-map`);
+    expect(post).toContain(tipRef);
+    expect(readFileSync(join(root, "rev-review.tsv"), "utf8")).toContain(`${tipRef}\tnot-in-map`);
     // refs/replace in N must not make an old full sha "resolve" there
     expect(post).toContain(oldShas.c1);
     expect(readFileSync(join(root, "rev-review.tsv"), "utf8")).not.toContain(oldShas.c1);
     const ref = readFileSync(join(O, "vault/notes/ref.md"), "utf8");
-    expect(ref).toContain(oldShas.c2.slice(0, 7));
+    expect(ref).toContain(short(oldShas.c2, 7));
     expect(ref).toContain(oldShas.c1);
     expect(git(O, ["log", "-1", "--format=%s"]).text).toMatch(/^vault-migrate: 커밋 sha 참조 되돌림 \(\d+건/u);
   });

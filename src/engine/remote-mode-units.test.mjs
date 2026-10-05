@@ -1,4 +1,4 @@
-// Remote-mode engine pieces that need no server: registry v2 + `vault store`, the corpus path
+// Remote-mode engine pieces that need no server: registry v2 + `vault store`, the secret-directory
 // predicate, the reject-list generator, the PDF sidecar on an LFS pointer, lint over pointers
 // and sync-conflict copies, the locked ledger rewrite, and the commit-map lookup.
 
@@ -13,15 +13,14 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { anchorPatternsToTree, compileGitignore } from "../server/gitignore-match.mjs";
 import { renderLfsPointer } from "../server/lfs-paths.mjs";
+import { crossesSecretDir } from "../server/secret-dirs.mjs";
 import { foldGitignoreDecisions, renderRootGitignore } from "../cli/policy-commands.mjs";
 import { lookupCommitMap, parseCommitMap, reverseCommitMap } from "./commit-map.mjs";
 import { lockPathFor } from "./file-commit-lock.mjs";
 import { runVaultLifecycleHook } from "./vault-lifecycle-hook.mjs";
 import { lintVaultFiles } from "./vault-lint.mjs";
-import { crossesSecretDir, isSearchCorpusPath, walkVaultMarkdownFiles } from "./vault-search.mjs";
 import { syncVaultSidecars } from "./vault-sidecar.mjs";
 import { loadStoreRegistry, parseStoreRegistry } from "./vault-stores.mjs";
-import { VAULT_PROFILE } from "./vault-profile.mjs";
 
 const VAULT_BIN = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "vault");
 let root;
@@ -50,7 +49,7 @@ afterAll(() => {
 describe("store registry v2", () => {
   it("reads v1 strings as local stores and validates v2 entries strictly", () => {
     const v1 = parseStoreRegistry({ stores: { "kuma-brain": "/x/vault" } });
-    expect(v1.entries.get("kuma-brain")).toEqual({ root: "/x/vault", mode: "local", search: "local" });
+    expect(v1.entries.get("kuma-brain")).toEqual({ root: "/x/vault", mode: "local" });
     const v2 = parseStoreRegistry({
       version: 2,
       default: "kuma-main-vault",
@@ -63,12 +62,11 @@ describe("store registry v2", () => {
       root: "/x/vault",
       mode: "remote",
       remote: { server: "http://srv.ts.net:7741", store: "kuma-main-vault" },
-      search: "remote",
       lfsCacheMaxGB: 10,
     });
     const bad = [
       { version: 2, stores: { a: { root: "/x", mode: "remote" } } },
-      { version: 2, stores: { a: { root: "/x", search: "remote" } } },
+      { version: 2, stores: { a: { root: "/x", search: "fts" } } },
       { version: 2, stores: { a: { root: "/x", mode: "remote", remote: { server: "ftp://h", store: "a" } } } },
       { version: 2, stores: { a: { root: "/x", mode: "remote", remote: { server: "http://u:p@h", store: "a" } } } },
       { version: 2, stores: { a: { root: "/x", colour: "red" } } },
@@ -86,11 +84,13 @@ describe("store registry v2", () => {
     const brain = tree("kuma-brain");
     expect(vault(["store", "add", "kuma-brain", "--root", brain, "--default"], env).code).toBe(0);
     let doc = JSON.parse(readFileSync(registry, "utf8"));
-    expect(doc).toMatchObject({ version: 2, default: "kuma-brain", stores: { legacy: { mode: "local" }, "kuma-brain": { root: brain, mode: "local", search: "local" } } });
+    expect(doc).toMatchObject({ version: 2, default: "kuma-brain", stores: { legacy: { mode: "local" }, "kuma-brain": { root: brain, mode: "local" } } });
+    expect(doc.stores["kuma-brain"]).not.toHaveProperty("search");
 
     expect(vault(["store", "set", "kuma-brain", "--mode", "remote", "--server", "http://srv:7741", "--lfs-cache-max-gb", "5"], env).code).toBe(0);
     doc = JSON.parse(readFileSync(registry, "utf8"));
-    expect(doc.stores["kuma-brain"]).toMatchObject({ mode: "remote", search: "remote", remote: { server: "http://srv:7741", store: "kuma-brain" }, lfsCacheMaxGB: 5 });
+    expect(doc.stores["kuma-brain"]).toMatchObject({ mode: "remote", remote: { server: "http://srv:7741", store: "kuma-brain" }, lfsCacheMaxGB: 5 });
+    expect(doc.stores["kuma-brain"]).not.toHaveProperty("search");
 
     // the tree owns the id: renaming to an id the tree does not declare is refused
     const refused = vault(["store", "rename", "kuma-brain", "kuma-main-vault"], env);
@@ -113,28 +113,38 @@ describe("store registry v2", () => {
   });
 });
 
-describe("search corpus excludes secrets", () => {
-  it("the path predicate and the filesystem walk agree on _credentials/_sync-conflicts at any depth and case", async () => {
-    const dir = tree("corpus");
-    const files = {
-      "domains/a.md": true,
-      "_credentials/k.md": false,
-      "domains/_Credentials/k.md": false,
-      "_sync-conflicts/2026/plans/p.md": false,
-      "domains/_SYNC-CONFLICTS/p.md": false,
-      "domains/_credentials-notes.md": true,
-      ".hidden/x.md": false,
-      "plans/p.md": false,
-      "dispatch-log.md": false,
-    };
-    for (const path of Object.keys(files)) {
-      mkdirSync(dirname(join(dir, path)), { recursive: true });
-      writeFileSync(join(dir, path), "# x\n");
+describe("retired registry search key", () => {
+  it("is read and kept, named by vault store list/show, and removed only by --clear-search", () => {
+    const registry = join(root, "legacy-search.json");
+    const brain = tree("legacy-brain");
+    writeFileSync(registry, JSON.stringify({ version: 2, stores: { "legacy-brain": { root: brain, mode: "local", search: "local" } } }));
+    const env = { KUMA_VAULT_STORES: registry };
+    expect(loadStoreRegistry(env).invalid).toBeNull();
+
+    const notice = "legacy-brain: legacy search field ignored (remove with `vault store set legacy-brain --clear-search`)";
+    expect(vault(["store", "list"], env).stdout).toContain(notice);
+    expect(vault(["store", "show", "legacy-brain"], env).stdout).toContain(notice);
+
+    // another change leaves it as written
+    expect(vault(["store", "set", "legacy-brain", "--lfs-cache-max-gb", "3"], env).code).toBe(0);
+    expect(JSON.parse(readFileSync(registry, "utf8")).stores["legacy-brain"]).toMatchObject({ search: "local", lfsCacheMaxGB: 3 });
+
+    const cleared = vault(["store", "set", "legacy-brain", "--clear-search"], env);
+    expect(cleared.code, cleared.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(registry, "utf8")).stores["legacy-brain"]).not.toHaveProperty("search");
+    expect(vault(["store", "list"], env).stdout).not.toContain("legacy search field");
+    expect(vault(["store", "add", "x", "--root", tree("x"), "--search", "local"], env).code).not.toBe(0);
+  });
+});
+
+describe("secret directories", () => {
+  it("_credentials/_sync-conflicts match at any depth and case, and only as whole components", () => {
+    for (const path of ["_credentials/k.md", "domains/_Credentials/k.md", "_sync-conflicts/2026/plans/p.md", "domains/_SYNC-CONFLICTS/p.md", "x/_credentials"]) {
+      expect([path, crossesSecretDir(path)]).toEqual([path, true]);
     }
-    for (const [path, expected] of Object.entries(files)) expect([path, isSearchCorpusPath(path, VAULT_PROFILE)]).toEqual([path, expected]);
-    const walked = (await walkVaultMarkdownFiles(dir)).map((f) => f.relativePath).sort();
-    expect(walked).toEqual(Object.entries(files).filter(([, v]) => v).map(([p]) => p).sort());
-    expect(crossesSecretDir("x/_credentials")).toBe(true);
+    for (const path of ["domains/a.md", "domains/_credentials-notes.md"]) {
+      expect([path, crossesSecretDir(path)]).toEqual([path, false]);
+    }
   });
 });
 
@@ -213,6 +223,7 @@ describe("binaries.reject generator", () => {
     expect(spawnSync("git", ["-C", top, "check-ignore", "-q", "vault/projects/x/frames/0.png"]).status).toBe(0);
     expect(spawnSync("git", ["-C", top, "check-ignore", "-q", "projects/x/frames/0.png"]).status).not.toBe(0);
     expect(JSON.parse(out.stdout).server).toContain("--tree-prefix vault");
+    expect(readFileSync(join(top, "vault", ".rgignore"), "utf8")).toContain("_[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]");
 
     // the server takes the same list from vault.config.json, re-anchored at the tree
     const serverConfig = join(root, "server.json");

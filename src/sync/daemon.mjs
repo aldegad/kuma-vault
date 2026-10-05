@@ -1,6 +1,12 @@
 // `vault syncd` — the write-behind sync daemon of one clone (design 2.2).
 //
-//   tick: 0 read state (stale git locks)  1 AUTOSAVE  2 FETCH  3 INTEGRATE  4 PUSH  5 STATUS   (hourly: ignored scan, EVICT)
+//   tick: 0 read state (stale git locks)  1 AUTOSAVE (+ ENRICH)  2 FETCH  3 INTEGRATE  4 PUSH  5 STATUS
+//         (hourly: ignored scan, EVICT)
+//
+// ENRICH runs only on a clone that turned it on (enrich.mjs): the knowledge pages this clone
+// committed — by autosave, or by an agent's or a person's own commit the server does not have
+// yet — get their description from the configured model, committed by a second autosave pass in
+// the same tick.
 //
 // Credential directories are tightened to 0600/0700 right after a fast-forward or merge wrote
 // them, and again at STATUS (with this tick's untracked paths), which raises `credentialModes`
@@ -27,7 +33,10 @@ import {
 } from "./alerts.mjs";
 import { openConflicts } from "./conflicts.mjs";
 import { credentialModesAlert, keepCredentialModes } from "./credential-modes.mjs";
-import { BACKOFF_MS } from "./context.mjs";
+import {
+  createEnrichMemory, enrichAlert, enrichStep, enrichTargets, noteCollected, noteDirectCommits, noteFetched, persistEnrichMemory,
+} from "./enrich.mjs";
+import { BACKOFF_MS, refreshSwitches } from "./context.mjs";
 import { checkGitVersion, git, revParse } from "./git.mjs";
 import { fetchOrigin, integrate, isoLocal, pushMain } from "./integrate.mjs";
 import { createRemoteApi } from "./remote-api.mjs";
@@ -53,6 +62,11 @@ async function aheadBehind(ctx) {
   return { ahead: times.length, behind, oldestUnpushedMs: times.length ? Math.min(...times) : null, L, R };
 }
 
+/** For the log: how many times a commit's gate refusal was answered by regenerating (autosave.mjs). */
+function regenerated(committed) {
+  return committed.regenerations ? { regenerations: committed.regenerations } : {};
+}
+
 /** The judging clock of one tick: `now` (injected; real time by default) plus the real time since. */
 export function judgeClock(now = Date.now()) {
   const offset = now - Date.now();
@@ -63,7 +77,8 @@ export function judgeClock(now = Date.now()) {
 export function createMemory(ctx) {
   const previous = readStatus(ctx.statusPath);
   return {
-    autosave: { dirtySince: new Map(), gateBlockedAt: null, gateMessage: null },
+    autosave: { dirtySince: new Map(), gateBlockedAt: null, gateBlockedSince: null, gateRefusals: 0, gateMessage: null, gateDeclaration: null },
+    enrich: createEnrichMemory(previous),
     previous,
     growthWindow: Array.isArray(previous?.growthWindow) ? previous.growthWindow : [],
     failures: 0,
@@ -104,6 +119,8 @@ async function tightenCredentialModes(ctx, mem, { paths = [], now, log }) {
 export async function runTick(ctx, mem, { now = Date.now(), force = false, api = createRemoteApi(ctx), log = () => {} } = {}) {
   const judgeNow = judgeClock(now);
   mem.tickSeq += 1;
+  // A switch turned since the last tick holds from this one.
+  await refreshSwitches(ctx);
   const status = {
     store: ctx.store,
     repo: ctx.repo,
@@ -120,6 +137,31 @@ export async function runTick(ctx, mem, { now = Date.now(), force = false, api =
   let autosaveBlocked = null;
   let integration = null;
   const reject = rejectMatcher(ctx);
+  const isTarget = enrichTargets(ctx, mem.enrich);
+  // What a pass met at the gate. The state says when it is blocked; the log keeps each
+  // regenerate-and-commit-again after drift, a refusal that blocks (its reason, the drifted files
+  // repo-relative, when it is asked again) and the block a pass cleared (how long it lasted, from
+  // its first refusal), so the log alone says when and how long the autosave waited. It also
+  // names the files a pass left out because their writer deleted them after the scan. A pass that
+  // only waits out a block logs nothing.
+  const noteBlocked = (pass, name) => {
+    const files = (paths) => ({ driftedCount: paths?.length ?? 0, drifted: (paths ?? []).slice(0, 20) });
+    for (const retry of pass.driftRetries ?? []) log({ event: "autosave-drift-retry", pass: name, attempt: retry.attempt, ...files(retry.drifted) });
+    if (pass.vanished?.length) log({ event: "autosave-vanished", pass: name, count: pass.vanished.length, paths: pass.vanished.slice(0, 20) });
+    if (pass.unblocked) {
+      const blockedSeconds = Math.max(0, Math.round((judgeNow() - pass.unblocked.at) / 1000));
+      log({
+        event: "autosave-unblocked", pass: name, blockedAt: isoLocal(pass.unblocked.at), lastRefusedAt: isoLocal(pass.unblocked.lastAt),
+        refusals: pass.unblocked.refusals, blockedSeconds, commit: pass.committed?.commit ?? null,
+      });
+    }
+    if (!pass.blocked) return;
+    autosaveBlocked = `자동 저장 막힘: ${pass.blocked.message}`;
+    if (pass.attempted) {
+      const { message, reason, retries, drifted, at } = pass.blocked;
+      log({ event: "autosave-blocked", pass: name, message, reason, retries, ...files(drifted), retryAt: isoLocal(at + ctx.settings.gateRetryMs) });
+    }
+  };
 
   // 0 a lock a killed git left behind would fail every step below
   clearStaleLocks(ctx, { clock: judgeNow, log });
@@ -129,11 +171,22 @@ export async function runTick(ctx, mem, { now = Date.now(), force = false, api =
     status.paused = true;
   } else {
     // 1 AUTOSAVE
-    const saved = await autosave(ctx, mem.autosave, { clock: judgeNow, force });
+    const saved = await autosave(ctx, mem.autosave, { clock: judgeNow, force, log });
     const committed = saved.committed;
     mem.growthWindow = recordGrowth(ctx, mem.growthWindow, committed, { now: judgeNow() });
-    if (committed) log({ event: "autosave", commit: committed.commit, files: committed.files, lfsBytes: committed.lfsBytes });
-    if (saved.blocked) autosaveBlocked = `자동 저장 막힘: ${saved.blocked.message}`;
+    if (committed) log({ event: "autosave", commit: committed.commit, files: committed.files, lfsBytes: committed.lfsBytes, ...regenerated(committed) });
+    noteBlocked(saved, "autosave");
+    noteCollected(ctx, mem.enrich, isTarget, committed);
+    await noteDirectCommits(ctx, mem.enrich, isTarget, { log });
+    if (!saved.blocked) {
+      const enriched = await enrichStep(ctx, mem, { clock: judgeNow, log, isTarget });
+      const described = enriched?.saved;
+      if (described) {
+        mem.growthWindow = recordGrowth(ctx, mem.growthWindow, described.committed, { now: judgeNow() });
+        if (described.committed) log({ event: "autosave", commit: described.committed.commit, files: described.committed.files, enriched: enriched.enrich.enriched.filter((e) => e.wrote).length, ...regenerated(described.committed) });
+        noteBlocked(described, "enrich");
+      }
+    }
 
     // 2-4 FETCH, INTEGRATE, PUSH
     const network = force || judgeNow() >= mem.backoffUntil;
@@ -144,6 +197,7 @@ export async function runTick(ctx, mem, { now = Date.now(), force = false, api =
         status.state = fetched.kind === "offline" ? "offline" : "blocked";
         lastError = fetched.kind === "auth" ? `인증 실패: ${fetched.message}` : fetched.message;
       } else {
+        await noteFetched(ctx, mem.enrich);
         integration = await integrate(ctx, { clock: judgeNow });
         if (integration.records?.length) log({ event: "conflicts", count: integration.records.length, ids: integration.records.map((r) => r.id) });
         if (integration.action === "merged" || integration.action === "ff") {
@@ -151,10 +205,11 @@ export async function runTick(ctx, mem, { now = Date.now(), force = false, api =
           await tightenCredentialModes(ctx, mem, { now: judgeNow(), log }); // the checkout wrote them by the umask
           // A merge commit never passed the gate, and what came in may change folder indexes:
           // regenerate the tracked derivations now, so the next agent commit is not refused.
-          const regen = await autosave(ctx, mem.autosave, { clock: judgeNow, force: true, regenerate: true });
+          const regen = await autosave(ctx, mem.autosave, { clock: judgeNow, force: true, regenerate: true, log });
           mem.growthWindow = recordGrowth(ctx, mem.growthWindow, regen.committed, { now: judgeNow() });
+          noteCollected(ctx, mem.enrich, isTarget, regen.committed, { skip: regen.derived ?? [] });
           if (regen.committed) log({ event: "regenerated", commit: regen.committed.commit, files: regen.committed.files });
-          if (regen.blocked) autosaveBlocked = `자동 저장 막힘: ${regen.blocked.message}`;
+          noteBlocked(regen, "regenerate");
         }
         const ab = await aheadBehind(ctx);
         if (ab.ahead > 0 && integration.action !== "wait-dirty" && integration.action !== "retry") {
@@ -204,6 +259,7 @@ export async function runTick(ctx, mem, { now = Date.now(), force = false, api =
     rejectResidue: computeRejectResidue(ctx, mem.ignored.residue, held, { now: alertsAt }),
     growth: computeGrowth(ctx, mem.growthWindow, prevAlerts.growth, { now: alertsAt }),
     credentialModes: credentialAlert,
+    enrich: enrichAlert(ctx, mem.enrich, { now: judgeNow() }),
   };
 
   if (!isPaused(ctx.pausePath) && ctx.apiBase && (force || judgeNow() - mem.serverInfoAt >= SERVER_INFO_MS) && !failed) {
@@ -256,6 +312,7 @@ export async function runTick(ctx, mem, { now = Date.now(), force = false, api =
     lastEvict: mem.lastEvict,
     alerts,
     growthWindow: mem.growthWindow,
+    enrichQueue: persistEnrichMemory(mem.enrich),
     server: { ...mem.server, head: ab.R, indexedHead: mem.server.indexedHead ?? null, eventsSeq: mem.eventsSeq },
     backoffUntil: mem.backoffUntil > endAt ? isoLocal(mem.backoffUntil) : null,
   });

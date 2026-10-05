@@ -67,7 +67,6 @@ for base in "$LOOP" "$TAIL"; do
   expect_status 401 "info/refs receive-pack $base" "$base/v1/stores/$STORE.git/info/refs?service=git-receive-pack"
   expect_status 401 "POST git-receive-pack $base" -X POST -H 'Content-Type: application/x-git-receive-pack-request' --data-binary @/dev/null "$base/v1/stores/$STORE.git/git-receive-pack"
   expect_status 401 "LFS batch $base" -X POST -H 'Content-Type: application/vnd.git-lfs+json' -d '{"operation":"download","objects":[]}' "$base/v1/stores/$STORE.git/info/lfs/objects/batch"
-  expect_status 401 "search $base" -X POST -d '{"q":"x"}' "$base/v1/stores/$STORE/search"
   expect_status 401 "file $base" "$base/v1/stores/$STORE/file?path=README.md"
   expect_status 401 "events $base" "$base/v1/stores/$STORE/events?after=0"
   expect_status 401 "backup-status $base" "$base/v1/stores/$STORE/backup-status"

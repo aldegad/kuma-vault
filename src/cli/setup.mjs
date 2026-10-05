@@ -85,6 +85,35 @@ function defaultRunCommand(command, args) {
   return spawnSync(command, args, { encoding: "utf8" });
 }
 
+// One real call with the chosen provider and model, before anything is saved. A model the CLI
+// refuses (a retired id, one the user's sign-in does not cover) or a CLI that is not signed in
+// fails setup here, in the CLI's own words, instead of failing every page of the first enrich.
+export async function checkProviderModel({ provider, model, effort, serviceTier }) {
+  const generate = createCliDescriptionGenerator({ provider, model, effort, serviceTier });
+  let result;
+  try {
+    result = await generate({
+      relativePath: "setup-check.md",
+      title: "Setup check",
+      body: "kuma-vault setup checks that the enrich provider answers with this model.",
+      tagPool: [],
+    });
+  } catch (error) {
+    const said = String(error?.message ?? error).split("\n").map((line) => line.trim()).filter(Boolean).slice(-3).join(" | ").slice(0, 600);
+    throw new Error(
+      `Enrich provider check failed: ${provider} with model "${generate.model}" did not answer (${said}). ` +
+        "Nothing was saved. Pick another --model, or sign the CLI in, and run setup again.",
+    );
+  }
+  if (!String(result?.description ?? "").trim()) {
+    throw new Error(
+      `Enrich provider check failed: ${provider} with model "${generate.model}" answered without a description. ` +
+        "Nothing was saved. Pick another --model and run setup again.",
+    );
+  }
+  return { provider, model: generate.model };
+}
+
 // Persist the provider choice to the config SSoT (~/.kuma-vault/config.json), merging with
 // any existing keys so a host override or prior star target survives. Atomic write.
 export function writeProviderConfig({ configPath, provider, model, effort, serviceTier }) {
@@ -163,7 +192,7 @@ function installPrecommitHook({ root, runCommand = defaultRunCommand }) {
 
 export async function commandVaultSetup(
   options = {},
-  { input = process.stdin, output = process.stdout, runCommand = defaultRunCommand, env = process.env } = {},
+  { input = process.stdin, output = process.stdout, runCommand = defaultRunCommand, env = process.env, checkModel = checkProviderModel } = {},
 ) {
   const out = (line = "") => output.write(`${line}\n`);
   const configPath = readOptionalString(options, "config") ?? resolveEnrichConfigPath();
@@ -235,13 +264,13 @@ export async function commandVaultSetup(
     wantStar = options.star === true; // star only on an explicit opt-in flag
   }
 
-  const saved = writeProviderConfig({
-    configPath,
-    provider,
-    model,
-    effort: readOptionalString(options, "effort"),
-    serviceTier: readOptionalString(options, "service-tier"),
-  });
+  const effort = readOptionalString(options, "effort");
+  const serviceTier = readOptionalString(options, "service-tier");
+  const checkedModel = model ?? defaultModelForProvider(provider);
+  out(`Checking ${provider} with model ${checkedModel} (one real call)...`);
+  await checkModel({ provider, model: checkedModel, effort, serviceTier });
+  out(`   ${provider} answered.`);
+  const saved = writeProviderConfig({ configPath, provider, model: checkedModel, effort, serviceTier });
   out(`Saved provider config -> ${configPath}`);
   out(`   provider: ${saved.provider}`);
   out(`   model:    ${saved.model}`);

@@ -6,7 +6,8 @@
 //   vault binaries apply --from <binaries-reject.json> --root <tree> [--gitignore-decisions <csv>] [--dry-run]
 //       writes the reject list to vault.config.json `binaries.reject` (tree-relative) and the
 //       generated blocks of the repo-root .gitignore (repo-relative), folds the sub-.gitignore
-//       decisions in, and prints the server command that writes the same list to server.json.
+//       decisions in, refreshes the tree's .rgignore block (the secret directories rg skips),
+//       and prints the server command that writes the same list to server.json.
 //   vault commit-map <prefix> [--map <tsv>] [--root <tree>]
 //       old <-> new sha lookup in the commit map a history rewrite left behind.
 
@@ -19,6 +20,7 @@ import { resolveVaultDir } from "../engine/path-resolver.mjs";
 import { VAULT_CONFIG_FILENAME, loadVaultDeclaration } from "../engine/vault-config.mjs";
 import { anchorPatternsToTree, compileGitignore } from "../server/gitignore-match.mjs";
 import { DEFAULT_JUNK_PATTERNS } from "../server/lfs-paths.mjs";
+import { secretDirIgnorePatterns } from "../server/secret-dirs.mjs";
 import { readOptionalString } from "./cli-options.mjs";
 
 // ── pre-push ────────────────────────────────────────────────────────────────
@@ -147,22 +149,35 @@ export function foldGitignoreDecisions(rows, { repoTop, treePrefix }) {
   return { added, edits };
 }
 
+// rg reads `.rgignore` (git does not): the secret directories stay tracked and synced, and a
+// plain `rg` in the tree skips them. An explicit path or `--no-ignore` still reads them.
+export const RGIGNORE_FILENAME = ".rgignore";
+export const RGIGNORE_BLOCK = Object.freeze([
+  "# >>> kuma-vault generated: secret directories rg skips by default — read one by its path or with --no-ignore (kuma-vault setup, vault binaries apply) >>>",
+  "# <<< kuma-vault generated: secret directories <<<",
+]);
+
+function replaceBlock(text, [begin, end], lines, file) {
+  const block = [begin, ...lines, end].join("\n");
+  const start = text.indexOf(begin);
+  if (start < 0) return `${text.replace(/\n*$/, "")}${text.trim() ? "\n\n" : ""}${block}\n`;
+  const stop = text.indexOf(end, start);
+  if (stop < 0) throw new Error(`${file} has "${begin}" without its end marker`);
+  return text.slice(0, start) + block + text.slice(stop + end.length);
+}
+
+const endWithNewline = (text) => (text.endsWith("\n") ? text : `${text}\n`);
+
 /** Replace (or append) the two generated blocks; every other line of the file stays. */
 export function renderRootGitignore(existing, { junk, reject }) {
   let text = existing ?? "";
-  for (const [key, lines] of [["junk", junk], ["reject", reject]]) {
-    const [begin, end] = GITIGNORE_BLOCKS[key];
-    const block = [begin, ...lines, end].join("\n");
-    const start = text.indexOf(begin);
-    if (start >= 0) {
-      const stop = text.indexOf(end, start);
-      if (stop < 0) throw new Error(`.gitignore has "${begin}" without its end marker`);
-      text = text.slice(0, start) + block + text.slice(stop + end.length);
-    } else {
-      text = `${text.replace(/\n*$/, "")}${text.trim() ? "\n\n" : ""}${block}\n`;
-    }
-  }
-  return text.endsWith("\n") ? text : `${text}\n`;
+  for (const [key, lines] of [["junk", junk], ["reject", reject]]) text = replaceBlock(text, GITIGNORE_BLOCKS[key], lines, ".gitignore");
+  return endWithNewline(text);
+}
+
+/** The tree's `.rgignore`: its generated block replaced (or appended); every other line stays. */
+export function renderTreeRgignore(existing) {
+  return endWithNewline(replaceBlock(existing ?? "", RGIGNORE_BLOCK, secretDirIgnorePatterns(), RGIGNORE_FILENAME));
 }
 
 function writeAtomic(path, text) {
@@ -198,6 +213,8 @@ function commandBinariesApply(options) {
     junk: [...DEFAULT_JUNK_PATTERNS],
     reject: anchorPatternsToTree(reject, treePrefix),
   });
+  const rgignorePath = join(treeDir, RGIGNORE_FILENAME);
+  const rgignore = renderTreeRgignore(existsSync(rgignorePath) ? readFileSync(rgignorePath, "utf8") : "");
   const configPath = join(treeDir, VAULT_CONFIG_FILENAME);
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   config.binaries = { ...(config.binaries ?? {}), reject };
@@ -206,7 +223,7 @@ function commandBinariesApply(options) {
     fromFile: base.length,
     promotedFromSubGitignores: folded.added.length,
     subGitignoreEdits: [...folded.edits].map(([file, text]) => ({ file, action: text === null ? "delete" : "rewrite" })),
-    files: [configPath, gitignorePath],
+    files: [configPath, gitignorePath, rgignorePath],
     // the server reads the same list (rule 7); vault.config.json is one of the formats set-reject takes
     server: `sudo vault server set-reject --store <server store id> --from <this ${VAULT_CONFIG_FILENAME}> --tree-prefix ${treePrefix || "''"}`,
   };
@@ -215,6 +232,7 @@ function commandBinariesApply(options) {
     writeAtomic(configPath, `${JSON.stringify(config, null, 2)}\n`);
     loadVaultDeclaration(treeDir);
     writeAtomic(gitignorePath, gitignore);
+    writeAtomic(rgignorePath, rgignore);
     for (const [file, text] of folded.edits) {
       const full = join(located.top, file);
       if (text === null) rmSync(full);

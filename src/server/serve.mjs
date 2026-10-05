@@ -10,12 +10,10 @@
 //   POST /v1/stores/<id>.git/info/lfs/objects/verify       writer
 //   GET  /v1/stores/<id>/events?after=<seq>                reader — long-poll (25s)
 //   GET  /v1/stores/<id>/backup-status                     reader
-//   POST /v1/stores/<id>/search  {q, limit, mode}          reader — server index (search-index.mjs)
-//   POST /v1/stores/<id>/timeline {q, limit}               reader — same, timeline snippets
 //   GET  /v1/stores/<id>/file?path=&rev=                   reader — one regular file from git objects
 //
-// Search and file never read `tree/` (a checkout may hold symlinks) and never serve
-// `_credentials/` or `_sync-conflicts/` paths.
+// The file API never reads `tree/` (a checkout may hold symlinks) and never serves
+// `_credentials/` or `_sync-conflicts/` paths (served-file.mjs).
 //
 // Everything except health needs an identity (auth.mjs); requests from the server itself
 // need a token. Logs carry paths, sizes and oids — never content.
@@ -31,7 +29,7 @@ import { createIdentifier, isLoopback, normalizeAddress } from "./auth.mjs";
 import { CasError, casPut, casReadStream, casStat, casUsage } from "./cas.mjs";
 import { isLfsOid } from "./lfs-paths.mjs";
 import { diskFreeBytes } from "./receive-check.mjs";
-import { FileRequestError, IndexNotReadyError, readServedFile, searchStoreIndex, startIndexer } from "./search-index.mjs";
+import { FileRequestError, readServedFile } from "./served-file.mjs";
 import { ROLE_LEVEL, loadServerConfig, parseListenAddress, roleName, storeRole } from "./server-config.mjs";
 import { cleanGitEnv, runGit, storePaths } from "./store-layout.mjs";
 
@@ -524,26 +522,6 @@ export function createServeApp({ configPath, config: initialConfig, identifierOp
     sendJson(res, 200, { store: storeId, ...status });
   }
 
-  async function handleSearch(req, res, { storeId, principal, verb }) {
-    requireRole(storeId, principal, ROLE_LEVEL.reader);
-    const store = config.stores[storeId];
-    if (store.kind !== "vault") throw new HttpError(404, `${storeId} is a ${store.kind} store — no search index`);
-    const body = await readJsonBody(req);
-    const q = typeof body?.q === "string" ? body.q : "";
-    if (!q.trim()) throw new HttpError(400, "q required");
-    const mode = verb === "timeline" ? "timeline" : (body.mode ?? "search");
-    const limit = body.limit ?? 20;
-    const started = Date.now();
-    try {
-      const result = await searchStoreIndex(store.path, { query: q, mode, limit });
-      sendJson(res, 200, { store: storeId, ms: Date.now() - started, ...result });
-    } catch (error) {
-      if (error instanceof IndexNotReadyError) throw new HttpError(503, error.message, { "Retry-After": "5" });
-      if (/^(query required|unsupported mode|limit must)/.test(error.message)) throw new HttpError(400, error.message);
-      throw error;
-    }
-  }
-
   async function handleFile(req, res, { storeId, principal, url }) {
     requireRole(storeId, principal, ROLE_LEVEL.reader);
     const store = config.stores[storeId];
@@ -599,7 +577,6 @@ export function createServeApp({ configPath, config: initialConfig, identifierOp
       if (!config.stores[storeId]) throw new HttpError(404, `no such store: ${storeId}`);
       if (verb === "events" && req.method === "GET") return handleEvents(req, res, { storeId, principal, url });
       if (verb === "backup-status" && req.method === "GET") return handleBackupStatus(req, res, { storeId, principal });
-      if ((verb === "search" || verb === "timeline") && req.method === "POST") return handleSearch(req, res, { storeId, principal, verb });
       if (verb === "file" && req.method === "GET") return handleFile(req, res, { storeId, principal, url });
     }
     throw new HttpError(404, "not found");
@@ -638,8 +615,6 @@ export function createServeApp({ configPath, config: initialConfig, identifierOp
     }
   }
 
-  // the indexer asks every few seconds: a store removed from server.json stops being indexed
-  // even when no request arrives to trigger the reload
   return {
     handler,
     refreshGrowth,
@@ -671,11 +646,8 @@ function listenWithRetry(app, entry, { retryMs = 5000, log }) {
 }
 
 /** Start serving: one HTTP server per listen address, bind retried every 5s. */
-export async function startServe({ configPath, config, identifierOptions, log = (line) => process.stdout.write(`${line}\n`), retryMs = 5000, indexIntervalMs = 5000 }) {
+export async function startServe({ configPath, config, identifierOptions, log = (line) => process.stdout.write(`${line}\n`), retryMs = 5000 }) {
   const app = createServeApp({ configPath, config, identifierOptions, log });
-  const indexer = indexIntervalMs > 0
-    ? startIndexer({ getConfig: app.getConfig, intervalMs: indexIntervalMs, log: (record) => log(JSON.stringify({ ts: new Date().toISOString(), ...record })) })
-    : null;
   const servers = [];
   const ready = app.getConfig().listen.map((entry) => listenWithRetry(app, entry, { retryMs, log }).then((s) => servers.push(s)));
   void app.refreshGrowth();
@@ -685,10 +657,8 @@ export async function startServe({ configPath, config, identifierOptions, log = 
     app,
     ready: Promise.all(ready).then(() => servers),
     servers,
-    indexer,
     close: async () => {
       clearInterval(timer);
-      indexer?.stop();
       await Promise.all(servers.map((s) => new Promise((r) => { s.closeAllConnections?.(); s.close(() => r()); })));
     },
   };

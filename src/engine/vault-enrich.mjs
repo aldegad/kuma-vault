@@ -1,11 +1,11 @@
 // LLM metadata enrichment for the Compiler Vault pipeline (DEC vault-compiler step 6).
 //
-// The vault-index README lines and vault-search summaries are *pure functions* of each
+// The vault-index README lines are *pure functions* of each
 // leaf page's frontmatter. This pass fills a small, fixed allowlist of leaf-page frontmatter
 // fields — `description`, `tags`, `aliases` — from a single injected model call, stamping each
 // field it writes with the body content hash so a second run over an unchanged tree is a no-op.
 // It is the ONE place a model is ever allowed to write in the vault — never a README, a sidecar,
-// the FTS index, or a log.
+// or a log.
 //
 //   - `description` — the canonical one-line synopsis (the folder README index line derives from it).
 //   - `tags`        — bounded-vocab topic tags (the enrich prompt is seeded with the tree's existing
@@ -18,7 +18,7 @@
 //     and within each it only rewrites the enrich fields it owns + their per-field hash stamps
 //     (`description`/`description_hash`, `tags`/`tags_hash`, `aliases`/`aliases_hash`). The body is
 //     preserved byte-for-byte and every other frontmatter line is preserved verbatim (audit C).
-//     README index pages, sidecars, the FTS index, and logs are never touched.
+//     README index pages, sidecars, and logs are never touched.
 //   - IDEMPOTENT: each field is gated on its `<field>_hash` (sha256 of the body content). A field is
 //     (re)generated only when it is absent, or carries a stamp that no longer matches its body. A
 //     field with a matching stamp is left as-is, so a second sync regenerates nothing.
@@ -34,11 +34,26 @@
 //     behavior. The vault's own CLI opts into the full `["description","tags","aliases"]` set.
 //   - NO SILENT FALLBACK: a model failure (or an empty `description` when a description is needed) is
 //     reported per file and the file is left untouched; it is never written with partial metadata.
+//   - SECRETS NEVER REACH A MODEL: a path that crosses a secret directory (`_credentials/`,
+//     `_sync-conflicts/` — the one resolver in ../server/secret-dirs.mjs) is never a target, whatever
+//     prefix the tree declares for its owner-local buckets.
+//   - A PAGE EDITED MEANWHILE IS NOT OVERWRITTEN: the file is read again just before the write; when
+//     it changed while the model ran, the page is reported `raced` and left as its writer left it.
+//
+// `paths` narrows a run to the named pages (the sync daemon passes the pages its clone committed).
+// Every named path goes through the same target resolver as the walk, must be a regular file
+// reached without a symlink, and is reported `excluded` with its reason when it is not a target.
+// A `paths` run writes its pages together, after its last model call: a page with a new description
+// under a README not yet regenerated is a tree the commit gate refuses for every writer in the
+// clone, and the caller's index pass comes right after this one. A walk writes each page as it is
+// described, so a long run that is stopped keeps what it has paid for.
 
 import { createHash } from "node:crypto";
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 
+import { compileGitignore } from "../server/gitignore-match.mjs";
+import { crossesSecretDir, isSecretDirName } from "../server/secret-dirs.mjs";
 import { resolveVaultDir } from "./path-resolver.mjs";
 import {
   formatFrontmatterValue,
@@ -96,13 +111,36 @@ function isMarkdownFileName(name) {
 //   - owner-local `_*` bucket -> evidence/asset holder, not a nav page
 //   - archive tree           -> not part of nav topology
 //   - root log.md/dispatch-log.md -> curated root prose only
-// Every predicate is imported from the vault-ingest topology SSoT (원칙 3 Consistency).
+//   - a secret directory      -> `_credentials/`, `_sync-conflicts/` at any depth, any case
+//   - a hidden or vendored directory -> `.obsidian/`, `node_modules/` (the walk never enters one)
+//   - a page the tree declares out    -> `enrichExclude` (gitignore syntax, tree-relative): the
+//                                        files a person alone writes, such as decision ledgers
+// Every predicate is imported from the vault-ingest topology SSoT and the secret-dirs resolver
+// (원칙 3 Consistency). This is the one resolver: the walk, a `paths` run and the sync daemon's
+// queue all ask it.
+// The compiled `enrichExclude` list of a profile, compiled once per profile object.
+const enrichExcludeMatchers = new WeakMap();
+
+/** The `enrichExclude` pattern of the tree's declaration that covers `relativePath`, or null. */
+export function enrichExcludedBy(relativePath, profile = VAULT_PROFILE) {
+  let match = enrichExcludeMatchers.get(profile);
+  if (!match) {
+    match = compileGitignore(profile.enrichExclude ?? [], { ignoreCase: true });
+    enrichExcludeMatchers.set(profile, match);
+  }
+  return match(normalizePathSeparators(relativePath).replace(/^\.\//u, ""));
+}
+
 export function isEnrichTargetPath(relativePath, profile = VAULT_PROFILE) {
   const normalized = normalizePathSeparators(relativePath).replace(/^\.\//u, "");
-  if (!normalized || !isMarkdownFileName(normalized)) {
+  if (!normalized || !isMarkdownFileName(normalized) || crossesSecretDir(normalized)) {
     return false;
   }
-  const name = normalized.split("/").pop() ?? "";
+  const parts = normalized.split("/");
+  const name = parts.pop() ?? "";
+  if (parts.some((dir) => dir.startsWith(".") || ENRICH_WALK_SKIP_DIRS.has(dir))) {
+    return false;
+  }
   if (name === "README.md" || name === "index.md") {
     return false;
   }
@@ -113,6 +151,9 @@ export function isEnrichTargetPath(relativePath, profile = VAULT_PROFILE) {
     return false;
   }
   if (isPlansSlotPath(normalized, profile) || isOwnerLocalBucketPath(normalized, profile)) {
+    return false;
+  }
+  if (enrichExcludedBy(normalized, profile)) {
     return false;
   }
   return !isArchiveTreeRelativePath(normalized, profile);
@@ -259,7 +300,7 @@ async function collectEnrichTargets(vaultDir, ctx, currentDir = vaultDir, out = 
     const fullPath = join(currentDir, entry.name);
     const relativePath = normalizePathSeparators(relative(vaultDir, fullPath));
     if (entry.isDirectory()) {
-      if (entry.name.startsWith(".") || ENRICH_WALK_SKIP_DIRS.has(entry.name)) {
+      if (entry.name.startsWith(".") || ENRICH_WALK_SKIP_DIRS.has(entry.name) || isSecretDirName(entry.name)) {
         continue;
       }
       // Prune whole non-nav subtrees so the walk never descends into plans/bucket/archive —
@@ -282,6 +323,59 @@ async function collectEnrichTargets(vaultDir, ctx, currentDir = vaultDir, out = 
     out.push({ absolutePath: fullPath, relativePath });
   }
   return out;
+}
+
+// The named pages of a `paths` run, each judged by the walk's own rules: a target path, inside the
+// tracked scope, a regular file whose real path is the named one (no symlinked file or directory
+// on the way — a link must not carry a model into a place the walk never enters). Returns
+// `{ targets, excluded }`; `excluded` rows carry the reason.
+async function resolveNamedTargets(vaultDir, ctx, paths) {
+  const { profile, trackedDirs } = ctx;
+  const realRoot = await realpath(vaultDir);
+  const targets = [];
+  const excluded = [];
+  const seen = new Set();
+  for (const raw of paths) {
+    const relativePath = normalizePathSeparators(raw).replace(/^\.\//u, "");
+    if (!relativePath || seen.has(relativePath)) {
+      continue;
+    }
+    seen.add(relativePath);
+    const parts = relativePath.split("/");
+    if (parts.some((part) => part === "" || part === "." || part === "..")) {
+      excluded.push({ path: relativePath, reason: "not-a-tree-path" });
+      continue;
+    }
+    if (!isEnrichTargetPath(relativePath, profile)) {
+      excluded.push({ path: relativePath, reason: enrichExcludedBy(relativePath, profile) ? "declared-exclude" : "not-a-target" });
+      continue;
+    }
+    const dirs = parts.slice(0, -1);
+    const outOfScope = dirs.some((_, index) => !isDirInTrackedScope(dirs.slice(0, index + 1).join("/"), trackedDirs));
+    if (outOfScope) {
+      excluded.push({ path: relativePath, reason: "outside-scope" });
+      continue;
+    }
+    const absolutePath = join(vaultDir, ...parts);
+    let real;
+    try {
+      const stat = await lstat(absolutePath);
+      if (!stat.isFile()) {
+        excluded.push({ path: relativePath, reason: "not-a-file" });
+        continue;
+      }
+      real = await realpath(absolutePath);
+    } catch {
+      excluded.push({ path: relativePath, reason: "missing" });
+      continue;
+    }
+    if (real !== join(realRoot, ...parts)) {
+      excluded.push({ path: relativePath, reason: "symlinked" });
+      continue;
+    }
+    targets.push({ absolutePath, relativePath });
+  }
+  return { targets, excluded };
 }
 
 // --- Enrich ----------------------------------------------------------------------------
@@ -392,7 +486,9 @@ function collectTagPool(parsedTargets) {
 // `check: true` never writes and never calls the model — it reports which pages (and which fields)
 // WOULD be enriched (the dry-run / drift gate). `maxFiles` bounds how many pages one write run may
 // enrich; the overflow is reported (`capped`/`remaining`), never silently dropped. `fields` selects
-// the enrich field set (default: description only).
+// the enrich field set (default: description only). `paths` (tree-relative) narrows the run to
+// those pages and writes them together after the last model call; `null` walks the tree and writes
+// each page as it is described. `modelCalls` counts the generator calls the run made.
 export async function enrichVaultDescriptions({
   vaultDir,
   check = false,
@@ -400,6 +496,7 @@ export async function enrichVaultDescriptions({
   maxFiles = Infinity,
   fields,
   profile = VAULT_PROFILE,
+  paths = null,
 } = {}) {
   const activeVaultDir = vaultDir ?? resolveVaultDir();
   if (!check && typeof generateDescription !== "function") {
@@ -413,14 +510,17 @@ export async function enrichVaultDescriptions({
     profile: resolvedProfile,
     trackedDirs: resolveNavScopeTrackedDirs(activeVaultDir, resolvedProfile),
   };
-  const targets = await collectEnrichTargets(activeVaultDir, ctx);
+  const named = Array.isArray(paths) ? await resolveNamedTargets(activeVaultDir, ctx, paths) : null;
+  const targets = named ? named.targets : await collectEnrichTargets(activeVaultDir, ctx);
   targets.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 
   const enriched = [];
   const skipped = [];
   const failed = [];
+  const raced = [];
   const pending = [];
   const parsedTargets = [];
+  let modelCalls = 0;
 
   for (const target of targets) {
     let raw;
@@ -441,13 +541,45 @@ export async function enrichVaultDescriptions({
     pending.push({ ...target, raw, parsed, ...need });
   }
 
-  // Bounded vocabulary: seed the model with the tree's existing tags so it reuses them.
-  const tagPool = activeFieldSet.has("tags") ? collectTagPool(parsedTargets) : [];
-  const tagPoolSet = new Set(tagPool.map((tag) => tag.toLowerCase()));
-
   const limit = Number.isFinite(maxFiles) ? Math.max(0, Math.floor(maxFiles)) : pending.length;
   const selected = pending.slice(0, limit);
   const overflow = pending.slice(limit);
+
+  // Bounded vocabulary: seed the model with the tree's existing tags so it reuses them. A `paths`
+  // run reads the tree's pages for it only when it is about to call the model.
+  let tagPool = [];
+  if (activeFieldSet.has("tags")) {
+    if (!named) {
+      tagPool = collectTagPool(parsedTargets);
+    } else if (!check && selected.length > 0) {
+      tagPool = collectTagPool(await readTagPoolPages(activeVaultDir, ctx));
+    }
+  }
+  const tagPoolSet = new Set(tagPool.map((tag) => tag.toLowerCase()));
+
+  // Write one described page — unless whoever writes it saved it while the model ran. Their bytes
+  // win: the page is left as they wrote it and is enriched when it is collected again.
+  const writeDescribed = async ({ item, next, row }) => {
+    let current;
+    try {
+      current = await readFile(item.absolutePath, "utf8");
+    } catch (error) {
+      failed.push({ path: item.relativePath, error: `read failed: ${error.message}` });
+      return;
+    }
+    if (current !== item.raw) {
+      raced.push({ path: item.relativePath });
+      return;
+    }
+    try {
+      await writeFile(item.absolutePath, next, "utf8");
+    } catch (error) {
+      failed.push({ path: item.relativePath, error: `write failed: ${error.message}` });
+      return;
+    }
+    enriched.push(row);
+  };
+  const described = []; // a `paths` run: written together below, once the model is done
 
   for (const item of selected) {
     if (check) {
@@ -460,6 +592,7 @@ export async function enrichVaultDescriptions({
       : (item.relativePath.split("/").pop() ?? item.relativePath).replace(/\.md$/iu, "");
 
     let generated;
+    modelCalls += 1;
     try {
       generated = await generateDescription({
         relativePath: item.relativePath,
@@ -509,21 +642,19 @@ export async function enrichVaultDescriptions({
       continue;
     }
 
-    const next = upsertFrontmatterFields(item.raw, writes);
-
-    try {
-      await writeFile(item.absolutePath, next, "utf8");
-    } catch (error) {
-      failed.push({ path: item.relativePath, error: `write failed: ${error.message}` });
-      continue;
+    const page = {
+      item,
+      next: upsertFrontmatterFields(item.raw, writes),
+      row: { path: item.relativePath, reason: item.reason, fields: writtenFields, newTags, wrote: true },
+    };
+    if (named) {
+      described.push(page);
+    } else {
+      await writeDescribed(page);
     }
-    enriched.push({
-      path: item.relativePath,
-      reason: item.reason,
-      fields: writtenFields,
-      newTags,
-      wrote: true,
-    });
+  }
+  for (const page of described) {
+    await writeDescribed(page);
   }
 
   return {
@@ -538,10 +669,27 @@ export async function enrichVaultDescriptions({
     capped: overflow.length > 0,
     remaining: overflow.length,
     tagPoolSize: tagPool.length,
+    modelCalls,
     enriched,
     skipped,
     failed,
+    raced,
+    ...(named ? { excluded: named.excluded } : {}),
     overflow: overflow.map((item) => ({ path: item.relativePath, reason: item.reason })),
     ok: failed.length === 0,
   };
+}
+
+// Every target page's frontmatter, for the tag pool of a `paths` run (unreadable pages are skipped:
+// the pool is a prompt hint, and the walk run reports read failures itself).
+async function readTagPoolPages(vaultDir, ctx) {
+  const parsed = [];
+  for (const target of await collectEnrichTargets(vaultDir, ctx)) {
+    try {
+      parsed.push(parseFrontmatterDocument(await readFile(target.absolutePath, "utf8")));
+    } catch {
+      // not a pool source
+    }
+  }
+  return parsed;
 }

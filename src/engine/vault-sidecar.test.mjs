@@ -6,9 +6,8 @@ import { tmpdir } from "node:os";
 
 import { describe, expect, it } from "vitest";
 
-import { isSidecarPath, SIDECAR_SOURCE_EXTENSIONS, syncVaultIndex } from "./vault-ingest.mjs";
+import { isSidecarPath, parseFrontmatterDocument, SIDECAR_SOURCE_EXTENSIONS, syncVaultIndex } from "./vault-ingest.mjs";
 import { SIDECAR_EXTRACTORS, syncVaultSidecars } from "./vault-sidecar.mjs";
-import { searchVault } from "./vault-search.mjs";
 import { lintVaultFiles } from "./vault-lint.mjs";
 
 // Minimal dependency-free single-page PDF containing the given lines. Enough for pdfjs/kordoc to
@@ -153,16 +152,17 @@ describe("vault-sidecar sync (kordoc PDF extractor)", () => {
     expect(updated).not.toContain("FIRSTTOKEN11");
   }, 30000);
 
-  it("audit D: searching an extracted token surfaces the sidecar path and source meta", async () => {
+  it("audit D: an extracted token lands in a Markdown sidecar that names its source", async () => {
     const vaultDir = await scaffoldVault();
     const pdfPath = join(vaultDir, "domains", "tools", "fixture.pdf");
     await writeFile(pdfPath, makePdf(["Search integration doc.", "Token: QWXZSEARCH99."]));
     await syncVaultSidecars({ vaultDir });
 
-    const result = await searchVault({ query: "QWXZSEARCH99", vaultDir });
-    const sidecarHit = result.hits.find((hit) => hit.path === "domains/tools/fixture.pdf.md");
-    expect(sidecarHit).toBeDefined();
-    expect(sidecarHit.source).toBe("domains/tools/fixture.pdf");
+    // A text search over the tree (rg) finds the token in the sidecar, and the sidecar says which
+    // binary it came from.
+    const sidecar = await readFile(`${pdfPath}.md`, "utf8");
+    expect(sidecar).toContain("QWXZSEARCH99");
+    expect(parseFrontmatterDocument(sidecar).frontmatter.source).toBe("domains/tools/fixture.pdf");
   }, 30000);
 
   it("No Silent Fallback: an unparseable binary is reported, not written as an empty sidecar", async () => {

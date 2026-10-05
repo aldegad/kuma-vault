@@ -37,28 +37,15 @@ export {
 // Lint (drift gate) + report formatting.
 export { lintVaultFiles, formatVaultLintReport } from "./engine/vault-lint.mjs";
 
-// Search + get.
-export {
-  searchVault,
-  searchVaultStores,
-  searchVaultTree,
-  searchOneStore,
-  isSearchCorpusPath,
-  crossesSecretDir,
-  getVaultDocuments,
-  formatVaultSearchText,
-  formatVaultGetText,
-} from "./engine/vault-search.mjs";
+// Get: read pages by path or `<store>:<path>` pointer (no index; finding is a scoped `rg`).
+export { getVaultDocuments, formatVaultGetText } from "./engine/vault-get.mjs";
 
-// Full-text search index (node:sqlite FTS5).
-export {
-  buildFtsIndex,
-  checkFtsIndex,
-  healFtsIndex,
-  searchFtsIndex,
-  resolveFtsDbPath,
-  ftsIndexAvailable,
-} from "./engine/vault-fts.mjs";
+// The secret directories (`_credentials/`, `_sync-conflicts/`) no surface reads or serves.
+export { crossesSecretDir } from "./server/secret-dirs.mjs";
+
+// Retired search names a host branch cut before the removal still imports: they load and throw
+// on call. Remove after the next app install.
+export { searchVault, formatVaultSearchText, resolveFtsDbPath } from "./engine/retired-search.mjs";
 
 // Sidecar extraction.
 export { syncVaultSidecars, SIDECAR_EXTRACTORS } from "./engine/vault-sidecar.mjs";
@@ -75,7 +62,7 @@ export {
   sanitizeAliases,
 } from "./engine/vault-enrich.mjs";
 
-// The composed `vault sync` pipeline (sidecar → enrich → index → fts → lint), its report
+// The composed `vault sync` pipeline (sidecar → enrich → index → lint), its report
 // formatter, and its exit gate. Every consumer's `vault sync` is an adapter over this: flags in,
 // host generator + matching enrich field set injected, report out. Nobody re-composes the order
 // or re-decides the gate — that judgement has one home (원칙 1).

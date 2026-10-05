@@ -2,9 +2,8 @@
 //
 // The index generator and lint already bound their walks by the profile's navScope;
 // these tests pin the same bound onto the DERIVED passes — sidecar extraction, LLM
-// enrich candidate collection, and the scan/FTS corpus — so an untracked vendored or
-// secret subtree inside a git-tracked knowledge repo is never extracted, sent to a
-// model, or indexed (원칙 3 Consistency). Also pins:
+// enrich candidate collection — so an untracked vendored or secret subtree inside a
+// git-tracked knowledge repo is never extracted or sent to a model (원칙 3 Consistency). Also pins:
 //   - dot-directory parity: `.claude/`-style config dirs are never knowledge pages
 //     (lint walk == generator descent).
 //   - `genericPageSections` profile knob: `[]` keeps frontmatter enforcement without
@@ -18,9 +17,7 @@ import { describe, expect, it } from "vitest";
 
 import { loadVaultDeclaration, resolveDeclaredProfile } from "./vault-config.mjs";
 import { enrichVaultDescriptions } from "./vault-enrich.mjs";
-import { buildFtsIndex } from "./vault-fts.mjs";
 import { lintVaultFiles } from "./vault-lint.mjs";
-import { resolveSearchScope, walkVaultMarkdownFiles } from "./vault-search.mjs";
 import { syncVaultSidecars } from "./vault-sidecar.mjs";
 
 function git(repoDir, ...args) {
@@ -142,23 +139,6 @@ describe("derived-pass scope bounding (git-tracked navScope)", () => {
     const seen = [...candidatePaths, ...report.skipped.map((entry) => entry.path ?? entry)];
     expect(report.total).toBe(1);
     expect(seen.some((p) => String(p).startsWith("secrets/") || String(p).startsWith("vendor/") || String(p).startsWith("."))).toBe(false);
-  });
-
-  it("scan/FTS corpus excludes untracked subtrees and profile root non-nav files", async () => {
-    const { repo, profile } = await scaffoldTrackedRepo();
-
-    const files = await walkVaultMarkdownFiles(repo, repo, resolveSearchScope(repo, profile));
-    const paths = files.map((file) => file.relativePath);
-    expect(paths).toContain("notes/page.md");
-    expect(paths.some((p) => p.startsWith("secrets/") || p.startsWith("vendor/") || p.startsWith("."))).toBe(false);
-    expect(paths).not.toContain("AGENTS.md");
-
-    // walkVaultMarkdownFiles with no ctx discovers the declaration itself (same corpus).
-    const discovered = await walkVaultMarkdownFiles(repo);
-    expect(discovered.map((file) => file.relativePath)).toEqual(paths);
-
-    const fts = await buildFtsIndex({ vaultDir: repo, profile });
-    expect(fts.docCount).toBe(paths.length);
   });
 });
 

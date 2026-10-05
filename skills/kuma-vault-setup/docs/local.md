@@ -57,8 +57,9 @@ Setup creates, in this order:
    `kuma-main-vault` is the default id of your main vault (`--store <id>` picks another).
 2. A generated `.gitattributes` (which file types go to LFS; append-only ledgers merge
    line by line) and a generated `.gitignore` (junk and derived files). These are the same
-   rules a server store uses, so moving to a server later needs no rewrite. Do not edit the
-   generated blocks by hand.
+   rules a server store uses, so moving to a server later needs no rewrite. Also
+   `vault/.rgignore`, so a plain `rg` in the vault skips `_credentials/` and
+   `_sync-conflicts/` (git still tracks them). Do not edit the generated blocks by hand.
 3. `vault/vault.config.json` with `"id": "kuma-main-vault"`, `"visibility": "private"`, an
    empty `"remotes": { "allowed": [] }` (the [storage policy](../../kuma-vault/docs/storage-policy.md))
    and `"binaries": { "reject": [] }`, plus `vault/README.md` when the tree has none.

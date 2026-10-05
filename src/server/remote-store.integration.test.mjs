@@ -1,11 +1,10 @@
-// End-to-end: remote search. `vault serve` (own process) indexes a scratch store from git
-// objects as pushes arrive (events.jsonl), answers search/timeline/file, and the client
-// (`vault search` against a registry v2 entry) adds what the clone wrote after the index.
+// End-to-end: a remote store behind `vault serve` (own process). The file API reads one regular
+// file from git objects; `vault migrate to-remote` moves a local store onto the server.
 //
 // Secrets: `_credentials/` and `_sync-conflicts/` (any depth, any case) and symlinks in the
-// checkout — including ones that point outside the store — must not come out of ANY of the
-// search, timeline or file APIs. The git transport itself is the sync channel and serves the
-// whole tree to authorized clones by design; it is not one of these APIs.
+// checkout — including ones that point outside the store — must not come out of the file API.
+// The git transport itself is the sync channel and serves the whole tree to authorized clones by
+// design; it is not that API. The search and timeline APIs (and the server index) are gone.
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -70,22 +69,6 @@ async function api(path, { method = "GET", token = TOKENS.reader, body } = {}) {
   return { status: response.status, text: await response.text(), headers: response.headers };
 }
 
-async function waitIndexed(commit, timeoutMs = 20_000) {
-  const statePath = join(store.state, "index.json");
-  const started = Date.now();
-  for (;;) {
-    if (existsSync(statePath)) {
-      const state = JSON.parse(readFileSync(statePath, "utf8"));
-      const lastSeq = JSON.parse(readFileSync(store.events, "utf8").trim().split("\n").at(-1)).seq;
-      // the ref moves before post-receive appends its event: a tick in between indexes the
-      // commit first and records the event on the next tick
-      if (state.indexedCommit === commit && state.lastSeq === lastSeq) return state;
-    }
-    if (Date.now() - started > timeoutMs) throw new Error(`index did not reach ${commit}`);
-    await new Promise((r) => setTimeout(r, 100));
-  }
-}
-
 function vault(args, { env = {}, allowFail = true } = {}) {
   return sh(VAULT_BIN, args, { cwd: clone, allowFail, env: { KUMA_VAULT_STORES: registryPath, KUMA_VAULT_DIR: join(clone, "vault"), ...env } });
 }
@@ -96,7 +79,7 @@ function pushHead() {
 }
 
 beforeAll(async () => {
-  root = mkdtempSync(join(tmpdir(), "kv-search-it-"));
+  root = mkdtempSync(join(tmpdir(), "kv-remote-it-"));
   home = join(root, "home");
   mkdirSync(home);
   const storeRoot = join(root, "stores", "brain");
@@ -118,7 +101,6 @@ beforeAll(async () => {
   store = storePaths(storeRoot);
   serve = spawn(process.execPath, [SERVER_CLI, "serve", "--config", configPath], {
     stdio: ["ignore", "pipe", "inherit"],
-    env: { ...process.env, KUMA_VAULT_INDEX_INTERVAL_MS: "200" },
   });
   const port = await new Promise((resolve, reject) => {
     let buffered = "";
@@ -143,7 +125,7 @@ beforeAll(async () => {
   writeFileSync(registryPath, JSON.stringify({
     version: 2,
     default: "brain",
-    stores: { brain: { root: join(clone, "vault"), mode: "remote", remote: { server: base, store: "brain", tokenFile }, search: "remote" } },
+    stores: { brain: { root: join(clone, "vault"), mode: "remote", remote: { server: base, store: "brain", tokenFile } } },
   }));
 }, 30_000);
 
@@ -152,8 +134,8 @@ afterAll(() => {
   if (root) rmSync(root, { recursive: true, force: true });
 });
 
-describe("remote search — server index, secrets, read-your-writes", { timeout: 60_000 }, () => {
-  it("indexes a push from git objects; secrets and checkout symlinks never enter", async () => {
+describe("remote store — file API, secrets, no search index", { timeout: 60_000 }, () => {
+  it("takes a push whose checkout carries secrets and symlinks out of the store", async () => {
     writeFileSync(join(root, "outside.md"), "# outside\n\nzebracorn SECRET-OUTSIDE\n");
     writeIn(clone, "README.md", "# brain\n");
     writeIn(clone, "vault/vault.config.json", JSON.stringify({ id: "brain", profile: "kuma-vault", visibility: "private" }));
@@ -168,34 +150,19 @@ describe("remote search — server index, secrets, read-your-writes", { timeout:
     git(clone, ["add", "-A"]);
     git(clone, ["commit", "--quiet", "-m", "first"]);
     firstCommit = pushHead();
-    const state = await waitIndexed(firstCommit);
-    expect(state).toMatchObject({ mode: "full", docCount: 2 });
     // the threat is real: the follow-only checkout carries both symlinks
     expect(lstatSync(join(store.tree, "vault/domains/links/abs-leak.md")).isSymbolicLink()).toBe(true);
     expect(lstatSync(join(store.tree, "vault/domains/links/passwd.md")).isSymbolicLink()).toBe(true);
-    const lastSeq = JSON.parse(readFileSync(store.events, "utf8").trim().split("\n").at(-1)).seq;
-    expect(state.lastSeq).toBe(lastSeq);
   });
 
-  it("search and timeline answer from the index and carry no secret", async () => {
+  it("has no search or timeline API and builds no index", async () => {
     for (const verb of ["search", "timeline"]) {
-      const res = await api(`/v1/stores/brain/${verb}`, { method: "POST", body: { q: "zebracorn", limit: 50 } });
-      expect(res.status).toBe(200);
-      const body = JSON.parse(res.text);
-      expect(body.indexedCommit).toBe(firstCommit);
-      expect(body.hits.map((h) => h.path)).toEqual(["domains/x/alpha.md"]);
+      const res = await api(`/v1/stores/brain/${verb}`, { method: "POST", body: { q: "zebracorn" } });
+      expect(res.status).toBe(404);
       for (const marker of SECRET_MARKERS) expect(res.text).not.toContain(marker);
     }
-    // exact secret words find nothing (scan fallback included: "SECRET" + short Korean term)
-    for (const q of ["SECRET-CRED", "SECRET-OUTSIDE", "SECRET-CONFLICT", "SECRET-CASE", "root:x", "비밀 SECRET"]) {
-      const res = await api("/v1/stores/brain/search", { method: "POST", body: { q } });
-      expect(res.status).toBe(200);
-      const body = JSON.parse(res.text);
-      expect(body.hits).toEqual([]);
-      // the response echoes the query itself; nothing else may carry a marker
-      const { query: _echo, ...rest } = body;
-      for (const marker of SECRET_MARKERS) expect(JSON.stringify(rest)).not.toContain(marker);
-    }
+    expect(existsSync(join(dirname(store.state), "index"))).toBe(false);
+    expect(existsSync(join(store.state, "index.json"))).toBe(false);
   });
 
   it("file serves regular files from git objects and refuses secrets, symlinks, .git and traversal", async () => {
@@ -225,74 +192,21 @@ describe("remote search — server index, secrets, read-your-writes", { timeout:
     expect(bad.status).toBe(404);
     const noToken = await fetch(`${base}/v1/stores/brain/file?path=domains/x/alpha.md`);
     expect(noToken.status).toBe(401);
-    const noTokenSearch = await fetch(`${base}/v1/stores/brain/search`, { method: "POST", body: "{\"q\":\"zebracorn\"}" });
-    expect(noTokenSearch.status).toBe(401);
   });
 
-  it("a later push is indexed incrementally (events consumed past lastSeq)", async () => {
-    writeIn(clone, "vault/domains/x/gamma.md", "# Gamma\n\nnow zebracorn too\n");
+  it("an older revision stays readable by sha after a later push", async () => {
     git(clone, ["rm", "--quiet", "vault/domains/x/alpha.md"]);
-    git(clone, ["add", "-A"]);
     git(clone, ["commit", "--quiet", "-m", "second"]);
-    const second = pushHead();
-    const state = await waitIndexed(second);
-    expect(state).toMatchObject({ mode: "incremental", docCount: 1, changed: 2 });
-    const res = JSON.parse((await api("/v1/stores/brain/search", { method: "POST", body: { q: "zebracorn" } })).text);
-    expect(res.hits.map((h) => h.path)).toEqual(["domains/x/gamma.md"]);
-    // the old revision is still readable by sha
+    pushHead();
+    expect((await api("/v1/stores/brain/file?path=domains/x/alpha.md")).status).toBe(404);
     const old = await api(`/v1/stores/brain/file?path=domains/x/alpha.md&rev=${firstCommit}`);
     expect(old.status).toBe(200);
+    expect(old.text).toContain("zebracorn alpha line");
   });
 
-  it("vault search reads its own writes: unpushed commits and uncommitted edits replace the server's answer", () => {
-    writeIn(clone, "vault/domains/x/beta.md", "# Beta\n\nzebracorn committed but not pushed\n");
-    git(clone, ["add", "-A"]);
-    git(clone, ["commit", "--quiet", "-m", "local only"]);
-    writeIn(clone, "vault/domains/x/fresh.md", "# Fresh\n\nzebracorn not even committed\n");
-    writeIn(clone, "vault/domains/x/gamma.md", "# Gamma\n\nedited away locally\n");
-    writeIn(clone, "vault/_credentials/local.md", "zebracorn SECRET-CRED local\n");
-    const out = vault(["search", "zebracorn", "--json"], { allowFail: false });
-    const result = JSON.parse(out.stdout);
-    expect(result.engine).toBe("remote");
-    expect(result.hits.map((h) => h.path).sort()).toEqual(["domains/x/beta.md", "domains/x/fresh.md"]);
-    expect(result.remote).toMatchObject({ store: "brain", supplementHits: 2 });
-    expect(result.remote.supplementFiles).toBeGreaterThanOrEqual(4);
-    expect(out.stdout).not.toContain("SECRET");
-    const text = vault(["search", "zebracorn"], { allowFail: false }).stdout;
-    expect(text).toMatch(/brain: 색인 기준 [0-9a-f]{9} · 로컬 보충 \d+파일/u);
-  });
-
-  it("an unreachable server is a loud failure that names --local; --local scans this copy", () => {
-    const dead = JSON.parse(readFileSync(registryPath, "utf8"));
-    dead.stores.brain.remote.server = "http://127.0.0.1:9";
-    const deadPath = join(home, "dead-stores.json");
-    writeFileSync(deadPath, JSON.stringify(dead));
-    const failed = vault(["search", "zebracorn"], { env: { KUMA_VAULT_STORES: deadPath } });
-    expect(failed.code).not.toBe(0);
-    expect(failed.stderr).toContain("서버 검색 불가");
-    expect(failed.stderr).toContain("--local");
-    expect(failed.stdout).not.toContain("domains/x");
-    // a second, local store in the union does not turn the failure into a partial answer
-    const otherRoot = join(root, "other", "vault");
-    writeIn(join(root, "other"), "vault/vault.config.json", JSON.stringify({ id: "other", profile: "kuma-vault" }));
-    writeIn(join(root, "other"), "vault/n.md", "zebracorn in other store\n");
-    dead.stores.other = { root: otherRoot, mode: "local" };
-    writeFileSync(deadPath, JSON.stringify(dead));
-    const union = vault(["search", "zebracorn"], { env: { KUMA_VAULT_STORES: deadPath } });
-    expect(union.code).not.toBe(0);
-    expect(union.stderr).toContain("서버 검색 불가");
-
-    const local = vault(["search", "zebracorn", "--local", "--json"], { env: { KUMA_VAULT_STORES: deadPath }, allowFail: false });
-    const result = JSON.parse(local.stdout);
-    const brain = result.stores.find((s) => s.storeId === "brain");
-    expect(brain).toMatchObject({ engine: "scan", engineReason: "local-copy (--local)" });
-    expect(result.hits.some((h) => h.path === "domains/x/fresh.md")).toBe(true);
-    expect(local.stdout).not.toContain("SECRET");
-  });
-
-  it("the commit gate of a remote-search store builds no local .fts", () => {
+  it("the commit gate of a remote store builds no local .fts", () => {
     const out = vault(["sync", "--check", "--root", join(clone, "vault")]);
-    expect(out.stdout).toContain("fts: skipped (remote store brain");
+    expect(out.stdout).not.toMatch(/^fts:/mu);
     expect(existsSync(join(clone, "vault", ".fts"))).toBe(false);
   });
 });
@@ -336,7 +250,8 @@ describe("vault migrate to-remote", { timeout: 60_000 }, () => {
     const entry = JSON.parse(readFileSync(registry, "utf8")).stores.moved;
     // the token is copied behind the clone's credential helper; the registry points at the copy
     const tokenCopy = join(dir, ".git/kuma-vault/token");
-    expect(entry).toMatchObject({ mode: "remote", search: "remote", remote: { server: base, store: "moved", tokenFile: tokenCopy } });
+    expect(entry).toMatchObject({ mode: "remote", remote: { server: base, store: "moved", tokenFile: tokenCopy } });
+    expect(entry).not.toHaveProperty("search");
     expect(readFileSync(tokenCopy, "utf8").trim()).toBe(readFileSync(writerToken, "utf8").trim());
     // and now a push anywhere else is refused by the hook
     const elsewhere = join(root, "elsewhere.git");

@@ -1,14 +1,17 @@
-import { mkdtemp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
 
 import { describe, expect, it } from "vitest";
 
+import { resolveDeclaredProfile, resolveTreeContract } from "./vault-config.mjs";
 import { parseFrontmatterDocument } from "./vault-ingest.mjs";
+import { VAULT_PROFILE } from "./vault-profile.mjs";
 import {
   DEFAULT_ENRICH_FIELDS,
   ENRICH_FIELDS_ALL,
   ENRICH_HASH_FIELD,
+  enrichExcludedBy,
   enrichStampField,
   enrichVaultDescriptions,
   isEnrichTargetPath,
@@ -135,6 +138,11 @@ describe("isEnrichTargetPath", () => {
     expect(isEnrichTargetPath("dispatch-log.md")).toBe(false);
     // non-markdown
     expect(isEnrichTargetPath("domains/tools/sample.pdf")).toBe(false);
+    // a hidden or vendored directory: the walk never enters one, so a named path there is no target
+    expect(isEnrichTargetPath(".obsidian/notes.md")).toBe(false);
+    expect(isEnrichTargetPath("domains/tools/.trash/alpha.md")).toBe(false);
+    expect(isEnrichTargetPath("domains/tools/node_modules/pkg/readme.md")).toBe(false);
+    expect(isEnrichTargetPath("domains/tools/.draft.md")).toBe(true); // a hidden file name is still a page
   });
 });
 
@@ -765,5 +773,287 @@ describe("enrichVaultDescriptions — description + tags + aliases (fields)", ()
     const needyCall = gen.calls.find((call) => call.relativePath === "domains/tools/needy.md");
     expect(needyCall.tagPool).toEqual(["Rust"]);
     expect(result.tagPoolSize).toBe(1);
+  });
+});
+
+// --- Named pages (the sync daemon's autosave paths) and secret directories ----------------
+
+describe("enrichVaultDescriptions with paths", () => {
+  async function addSecrets(vaultDir) {
+    await mkdir(join(vaultDir, "domains", "personal", "_credentials"), { recursive: true });
+    await mkdir(join(vaultDir, "domains", "tools", "_Credentials"), { recursive: true });
+    await mkdir(join(vaultDir, "domains", "tools", "_assets"), { recursive: true });
+    await writeFile(join(vaultDir, "domains", "personal", "_credentials", "svc.md"), "# svc\n\ntoken: s3cret-value\n", "utf8");
+    await writeFile(join(vaultDir, "domains", "tools", "_Credentials", "other.md"), "# other\n\ntoken: s3cret-other\n", "utf8");
+    await writeFile(join(vaultDir, "domains", "tools", "_assets", "shot.md"), "# shot\n\nasset note\n", "utf8");
+    await writeFile(join(vaultDir, "dispatch-log.md"), "# dispatch log\n\n- a row\n", "utf8");
+    await writeFile(join(vaultDir, "domains", "tools", "gamma.md"), "---\ntitle: Gamma\n---\n\n# Gamma\n\nGamma body.\n", "utf8");
+  }
+  const sentBodies = (generate) => generate.calls.map((call) => call.body).join("\n");
+
+  it("describes only the named knowledge pages; records, buckets and secrets are excluded with a reason", async () => {
+    const { vaultDir } = await scaffoldVault();
+    await addSecrets(vaultDir);
+    const before = await snapshotTree(vaultDir);
+    const generate = makeMockGenerator();
+
+    const result = await enrichVaultDescriptions({
+      vaultDir,
+      generateDescription: generate,
+      paths: [
+        "domains/tools/alpha.md",
+        "domains/tools/beta.md",
+        "plans/acme-app/some-plan.md",
+        "results/r1.md",
+        "dispatch-log.md",
+        "log.md",
+        "domains/tools/_evidence/note.md",
+        "domains/tools/_assets/shot.md",
+        "domains/personal/_credentials/svc.md",
+        "domains/tools/_Credentials/other.md",
+        "domains/tools/README.md",
+        "domains/tools/.trash/old.md",
+        "domains/tools/gone.md",
+      ],
+    });
+
+    expect(generate.calls.map((call) => call.relativePath)).toEqual(["domains/tools/alpha.md"]);
+    expect(sentBodies(generate)).not.toMatch(/s3cret/u);
+    expect(result.modelCalls).toBe(1);
+    expect(result.enriched.map((e) => e.path)).toEqual(["domains/tools/alpha.md"]);
+    expect(result.skipped).toEqual(["domains/tools/beta.md"]); // hand-written description
+    expect(Object.fromEntries(result.excluded.map((e) => [e.path, e.reason]))).toEqual({
+      "plans/acme-app/some-plan.md": "not-a-target",
+      "results/r1.md": "not-a-target",
+      "dispatch-log.md": "not-a-target",
+      "log.md": "not-a-target",
+      "domains/tools/_evidence/note.md": "not-a-target",
+      "domains/tools/_assets/shot.md": "not-a-target",
+      "domains/personal/_credentials/svc.md": "not-a-target",
+      "domains/tools/_Credentials/other.md": "not-a-target",
+      "domains/tools/README.md": "not-a-target",
+      "domains/tools/.trash/old.md": "not-a-target",
+      "domains/tools/gone.md": "missing",
+    });
+    // gamma needs a description too, but was not named: a paths run never walks for work.
+    expect(changedPaths(before, await snapshotTree(vaultDir))).toEqual(["domains/tools/alpha.md"]);
+  });
+
+  it("never sends a secret directory, even when the tree declares another bucket prefix", async () => {
+    const { vaultDir } = await scaffoldVault();
+    await addSecrets(vaultDir);
+    const profile = { ...VAULT_PROFILE, ownerLocalBucketPrefix: "~" }; // `_` no longer marks a bucket
+
+    expect(isEnrichTargetPath("domains/personal/_credentials/svc.md", profile)).toBe(false);
+    expect(isEnrichTargetPath("domains/x/_SYNC-conflicts/a.md", profile)).toBe(false);
+    expect(isEnrichTargetPath("domains/tools/_assets/shot.md", profile)).toBe(true); // an ordinary folder now
+
+    const walked = makeMockGenerator();
+    await enrichVaultDescriptions({ vaultDir, profile, generateDescription: walked });
+    const named = makeMockGenerator();
+    await enrichVaultDescriptions({
+      vaultDir,
+      profile,
+      generateDescription: named,
+      paths: ["domains/personal/_credentials/svc.md", "domains/tools/_Credentials/other.md"],
+    });
+
+    expect(walked.calls.map((call) => call.relativePath)).not.toContain("domains/personal/_credentials/svc.md");
+    expect(walked.calls.some((call) => /_credentials\//iu.test(call.relativePath))).toBe(false);
+    expect(sentBodies(walked)).not.toMatch(/s3cret/u);
+    expect(named.calls.length).toBe(0);
+  });
+
+  it("does not follow a symlink into a secret directory (named or walked)", async () => {
+    const { vaultDir } = await scaffoldVault();
+    await addSecrets(vaultDir);
+    await symlink(join(vaultDir, "domains", "personal", "_credentials", "svc.md"), join(vaultDir, "domains", "tools", "link.md"));
+    await symlink(join(vaultDir, "domains", "personal", "_credentials"), join(vaultDir, "domains", "tools", "linked-dir"));
+
+    const named = makeMockGenerator();
+    const result = await enrichVaultDescriptions({
+      vaultDir,
+      generateDescription: named,
+      paths: ["domains/tools/link.md", "domains/tools/linked-dir/svc.md"],
+    });
+    const walked = makeMockGenerator();
+    await enrichVaultDescriptions({ vaultDir, generateDescription: walked });
+
+    expect(named.calls.length).toBe(0);
+    expect(Object.fromEntries(result.excluded.map((e) => [e.path, e.reason]))).toEqual({
+      "domains/tools/link.md": "not-a-file",
+      "domains/tools/linked-dir/svc.md": "symlinked",
+    });
+    expect(sentBodies(walked)).not.toMatch(/s3cret/u);
+  });
+
+  it("caps model calls at maxFiles and leaves the rest as overflow", async () => {
+    const { vaultDir } = await scaffoldVault();
+    await addSecrets(vaultDir);
+    const generate = makeMockGenerator();
+    const result = await enrichVaultDescriptions({
+      vaultDir,
+      generateDescription: generate,
+      maxFiles: 1,
+      paths: ["domains/tools/gamma.md", "domains/tools/alpha.md"],
+    });
+    expect(result.modelCalls).toBe(1);
+    expect(result.enriched.map((e) => e.path)).toEqual(["domains/tools/alpha.md"]);
+    expect(result.overflow.map((e) => e.path)).toEqual(["domains/tools/gamma.md"]);
+  });
+
+  it("reads the tag pool only when it calls the model", async () => {
+    const { vaultDir } = await scaffoldVault();
+    const generate = makeMockGenerator({ description: "Synopsis.", tags: ["cli"], aliases: [] });
+    const result = await enrichVaultDescriptions({
+      vaultDir,
+      generateDescription: generate,
+      fields: ENRICH_FIELDS_ALL,
+      paths: ["domains/tools/alpha.md"],
+    });
+    expect(generate.calls[0].tagPool).toEqual(["alpha", "cli"]);
+    expect(result.tagPoolSize).toBe(2);
+    const idle = await enrichVaultDescriptions({ vaultDir, fields: ENRICH_FIELDS_ALL, generateDescription: generate, paths: ["domains/tools/alpha.md"] });
+    expect(idle.modelCalls).toBe(0); // alpha is described now: nothing to ask, no pool read
+    expect(idle.tagPoolSize).toBe(0);
+  });
+});
+
+describe("when a described page is written", () => {
+  const second = "---\ntitle: Gamma\n---\n\n# Gamma\n\nGamma body.\n";
+
+  // The generator reads the first page from disk each time it is called for the second one.
+  async function runTwoPages(paths) {
+    const { vaultDir } = await scaffoldVault();
+    await writeFile(join(vaultDir, "domains", "tools", "gamma.md"), second, "utf8");
+    const alpha = join(vaultDir, "domains", "tools", "alpha.md");
+    const seen = [];
+    const generate = makeMockGenerator(async ({ relativePath }) => {
+      if (relativePath === "domains/tools/gamma.md") seen.push(await readFile(alpha, "utf8"));
+      return "Synopsis.";
+    });
+    const result = await enrichVaultDescriptions({ vaultDir, generateDescription: generate, ...(paths ? { paths } : {}) });
+    return { result, seen, alpha: await readFile(alpha, "utf8"), gamma: await readFile(join(vaultDir, "domains", "tools", "gamma.md"), "utf8") };
+  }
+
+  it("a paths run writes nothing until its last model call has returned, then every page", async () => {
+    const { result, seen, alpha, gamma } = await runTwoPages(["domains/tools/alpha.md", "domains/tools/gamma.md"]);
+    expect(result.modelCalls).toBe(2);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).not.toMatch(/^description:/mu); // alpha was described already, and is not on disk yet
+    expect(result.enriched.map((e) => e.path)).toEqual(["domains/tools/alpha.md", "domains/tools/gamma.md"]);
+    expect(alpha).toMatch(/^description: Synopsis\.$/mu);
+    expect(gamma).toMatch(/^description: Synopsis\.$/mu);
+  });
+
+  it("a walk writes each page as it is described", async () => {
+    const { result, seen, gamma } = await runTwoPages(null);
+    expect(result.modelCalls).toBe(2);
+    expect(seen[0]).toMatch(/^description: Synopsis\.$/mu);
+    expect(gamma).toMatch(/^description: Synopsis\.$/mu);
+  });
+
+  it("a paths run still leaves a page saved during a later call as its writer saved it", async () => {
+    const { vaultDir } = await scaffoldVault();
+    await writeFile(join(vaultDir, "domains", "tools", "gamma.md"), second, "utf8");
+    const alpha = join(vaultDir, "domains", "tools", "alpha.md");
+    const edited = "---\ntitle: Alpha Tool\n---\n\n# Alpha Tool\n\nRewritten during the second call.\n";
+    const generate = makeMockGenerator(async ({ relativePath }) => {
+      if (relativePath === "domains/tools/gamma.md") await writeFile(alpha, edited, "utf8");
+      return "Synopsis.";
+    });
+    const result = await enrichVaultDescriptions({
+      vaultDir,
+      generateDescription: generate,
+      paths: ["domains/tools/alpha.md", "domains/tools/gamma.md"],
+    });
+    expect(await readFile(alpha, "utf8")).toBe(edited);
+    expect(result.raced).toEqual([{ path: "domains/tools/alpha.md" }]);
+    expect(result.enriched.map((e) => e.path)).toEqual(["domains/tools/gamma.md"]);
+  });
+});
+
+describe("a page edited while the model ran", () => {
+  it("is left as its writer saved it and reported raced", async () => {
+    const { vaultDir } = await scaffoldVault();
+    const page = join(vaultDir, "domains", "tools", "alpha.md");
+    const edited = "---\ntitle: Alpha Tool\n---\n\n# Alpha Tool\n\nRewritten while the model was thinking.\n";
+    const generate = makeMockGenerator(async () => {
+      await writeFile(page, edited, "utf8");
+      return "Stale synopsis.";
+    });
+
+    const result = await enrichVaultDescriptions({ vaultDir, generateDescription: generate });
+
+    expect(await readFile(page, "utf8")).toBe(edited);
+    expect(result.raced).toEqual([{ path: "domains/tools/alpha.md" }]);
+    expect(result.enrichedCount).toBe(0);
+    expect(result.failedCount).toBe(0);
+    expect(result.modelCalls).toBe(1);
+  });
+});
+
+describe("pages a tree declares out of enrich (enrichExclude)", () => {
+  // A tree's decision ledgers: the person alone writes them, so no model may touch them — not even
+  // a description in the frontmatter. The tree names them; the engine names none.
+  const DECLARATION = {
+    profile: "kuma-vault",
+    enrichExclude: ["/decisions.md", "projects/*.project-decisions.md"],
+  };
+
+  async function addDecisionFiles(vaultDir) {
+    await mkdir(join(vaultDir, "projects", "acme"), { recursive: true });
+    await writeFile(join(vaultDir, "vault.config.json"), `${JSON.stringify(DECLARATION, null, 2)}\n`, "utf8");
+    await writeFile(join(vaultDir, "decisions.md"), "---\ntitle: Decisions\n---\n\n# Decisions\n\n- the owner decided this\n", "utf8");
+    await writeFile(join(vaultDir, "projects", "acme.project-decisions.md"), "---\ntitle: Acme decisions\n---\n\n# Acme decisions\n\n- keep it small\n", "utf8");
+    await writeFile(join(vaultDir, "projects", "acme", "decisions.md"), "---\ntitle: Acme notes on decisions\n---\n\n# Notes\n\nnot a ledger\n", "utf8");
+  }
+
+  it("the one resolver leaves out what the declaration names, case-insensitively, and only that", async () => {
+    const profile = resolveDeclaredProfile(DECLARATION);
+    expect(isEnrichTargetPath("decisions.md", profile)).toBe(false);
+    expect(isEnrichTargetPath("Decisions.md", profile)).toBe(false);
+    expect(isEnrichTargetPath("projects/acme.project-decisions.md", profile)).toBe(false);
+    expect(enrichExcludedBy("projects/acme.project-decisions.md", profile)).toBe("projects/*.project-decisions.md");
+    // anchored patterns: a page of the same name elsewhere is still a page
+    expect(isEnrichTargetPath("projects/acme/decisions.md", profile)).toBe(true);
+    expect(isEnrichTargetPath("projects/acme/x.project-decisions.md", profile)).toBe(true);
+    expect(isEnrichTargetPath("domains/tools/alpha.md", profile)).toBe(true);
+    // without the declaration the engine excludes nothing of the kind
+    expect(isEnrichTargetPath("decisions.md")).toBe(true);
+    expect(enrichExcludedBy("decisions.md")).toBeNull();
+  });
+
+  it("a declared decision file costs no model call and keeps its bytes, walked or named", async () => {
+    const { vaultDir } = await scaffoldVault();
+    await addDecisionFiles(vaultDir);
+    const profile = resolveTreeContract(vaultDir);
+    const before = await snapshotTree(vaultDir);
+
+    const walked = makeMockGenerator();
+    await enrichVaultDescriptions({ vaultDir, profile, generateDescription: walked, fields: ENRICH_FIELDS_ALL });
+    const walkedPaths = walked.calls.map((call) => call.relativePath);
+    expect(walkedPaths).not.toContain("decisions.md");
+    expect(walkedPaths).not.toContain("projects/acme.project-decisions.md");
+    expect(walkedPaths).toContain("projects/acme/decisions.md");
+
+    const named = makeMockGenerator();
+    const result = await enrichVaultDescriptions({
+      vaultDir,
+      profile,
+      generateDescription: named,
+      fields: ENRICH_FIELDS_ALL,
+      paths: ["decisions.md", "projects/acme.project-decisions.md"],
+    });
+    expect(named.calls.length).toBe(0);
+    expect(result.modelCalls).toBe(0);
+    expect(Object.fromEntries(result.excluded.map((e) => [e.path, e.reason]))).toEqual({
+      "decisions.md": "declared-exclude",
+      "projects/acme.project-decisions.md": "declared-exclude",
+    });
+
+    const after = await snapshotTree(vaultDir);
+    expect(after.get("decisions.md")).toBe(before.get("decisions.md"));
+    expect(after.get("projects/acme.project-decisions.md")).toBe(before.get("projects/acme.project-decisions.md"));
   });
 });

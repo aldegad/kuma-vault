@@ -62,11 +62,10 @@ variables, never into files, chat or logs.
    restic -r "s3:$EP/<bucket>" init
    restic -r "s3:$EP/<bucket>" backup <repo-path> \
      --exclude "**/node_modules" --exclude "**/.venv" --exclude "**/__pycache__" \
-     --exclude "/.fts" --exclude "**/*.log" --exclude ".DS_Store" --exclude "tmp/"
+     --exclude "**/*.log" --exclude ".DS_Store" --exclude "tmp/"
    ```
 
-   Derived files (the `.fts/` search index, build output, caches) are left out: `vault sync`
-   regenerates them.
+   Build output and caches are left out; they are regenerated.
 5. **Run it nightly.** A small runner script reads the keychain, runs `backup`, then
    `forget --keep-daily 14 --keep-weekly 8 --keep-monthly 12 --prune`, and prints
    `snapshots --latest 1`. Schedule it with cron or launchd and make a failure visible — a

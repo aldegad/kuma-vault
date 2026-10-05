@@ -17,8 +17,8 @@ The common cause is one: **the truth lives in two places.**
 
 ## Every view is a pure function of the source
 
-People and agents maintain one thing: the source pages. Folder indexes, binary-file sidecars
-and the search index are all **derived** by one `vault sync`. Derivation is content-hash
+People and agents maintain one thing: the source pages. Folder indexes and binary-file
+sidecars are **derived** by one `vault sync`. Derivation is content-hash
 idempotent — when the source has not changed, running it again changes nothing — so an index
 cannot drift from its pages.
 
@@ -33,21 +33,17 @@ flowchart LR
         S1["1. Sidecar extraction<br/>sha256 stamp — changed files only"]
         S2["2. Enrich (--enrich)<br/>description · tags · aliases<br/>for empty or stale fields only<br/>one model call per page"]
         S3["3. Folder README indexes<br/>from descriptions · fixed point"]
-        S4["4. Full-text index<br/>SQLite FTS5, trigram"]
     end
 
     subgraph OUT["Derived (always regenerable)"]
         SC["Sidecars &lt;file&gt;.pdf.md"]
         IDX["Folder README<br/>vault-index region"]
-        FTS[".fts/ search index"]
     end
 
     BIN --> S1 --> SC
     MD --> S2 --> MD
     MD --> S3 --> IDX
     SC --> S3
-    MD --> S4 --> FTS
-    SC --> S4
 ```
 
 ## The folder tree is the ownership map
@@ -69,18 +65,31 @@ A model writes in exactly one place: three search fields in a page's frontmatter
 abbreviations, other-language search terms) — plus their idempotency stamps
 `description_hash`, `tags_hash` and `aliases_hash`. One model call fills all three.
 
-1. When a page is new or its body changes, the next `vault sync --enrich` picks it up.
+1. When a page is new or its body changes, the next `vault sync --enrich` picks it up — or,
+   on a server-backed clone that turned it on, the [sync daemon](sync.md#descriptions-enrich-on-autosave)
+   right after the page is committed there, by its autosave or by an agent's own commit
+   (`--enrich-paths-from`, capped per tick and per hour). Such a run writes its pages together
+   after its last model call, so a description never sits in the tree without its index line
+   for longer than the index pass that follows.
 2. Only pages with an empty field, or a field whose stamp no longer matches the body hash, get
    a call. A page whose three fields are current costs nothing.
-3. The description flows into the folder index and the search index, tags and aliases into
-   the search index — always by derivation. The model never writes an index.
+3. The description flows into the folder index by derivation; tags and aliases stay in the
+   page's frontmatter, where `rg` finds them. The model never writes an index.
 4. A value a person wrote (a field with no stamp) is never overwritten, field by field.
    Filling only tags and aliases on a page whose description is already stamped does not
    regenerate the description. New tags reuse the tree's existing tag pool first; a new tag
    is allowed when none fits.
 5. A failed call leaves the file untouched and is reported per file. There is no fallback.
+6. Which pages are targets is one resolver (`isEnrichTargetPath`) under the tree's declared
+   profile: leaf knowledge pages, not the plans slot, archive slots, root ledgers, indexes,
+   sidecars or owner-local buckets, and not the pages the tree declares out (`enrichExclude`,
+   below) — the files a person alone writes, such as decision ledgers, get no model-written
+   field at all. A secret directory (`_credentials/`, `_sync-conflicts/`,
+   the resolver in `src/server/secret-dirs.mjs`) is never a target whatever the declaration
+   says, and a page is never reached through a symlink, so a secret is never sent to a model.
+7. A page saved again while the model ran is not overwritten; it is reported `raced`.
 
-`vault sync` without `--enrich` calls no model at all: sidecars, indexes and search are pure
+`vault sync` without `--enrich` calls no model at all: sidecars and indexes are pure
 functions, offline and free. Enrich is an optional layer on top.
 
 **The provider is plugged in.** The pure enrich engine needs one injected function,
@@ -122,53 +131,48 @@ before each autosave commit.)
 
 | Event | Who handles it | What happens |
 |---|---|---|
-| **Page added** | script, plus one model call with `--enrich` | the next sync lists it in its folder index; enrich fills `description`, `tags` and `aliases` in one call and stamps each field, so a rerun makes no call |
-| **Page body changed** | script, plus one model call with `--enrich` | the body hash no longer matches a field's stamp, so only that page is enriched again; person-written fields are kept |
+| **Page added** | script, plus one model call with `--enrich` or the daemon's enrich on autosave | the next sync lists it in its folder index; enrich fills `description`, `tags` and `aliases` in one call and stamps each field, so a rerun makes no call |
+| **Page body changed** | script, plus one model call with `--enrich` or the daemon's enrich on autosave | the body hash no longer matches a field's stamp, so only that page is enriched again; person-written fields are kept |
 | **Page moved** | script only | the search fields travel with the file's frontmatter; the next sync removes it from the old folder's index and adds it to the new one. No model call |
-| **Page deleted** | script only | its index line and search entry go. No model call |
+| **Page deleted** | script only | its index line goes. No model call |
 | **Folder created** | script only | a folder holding pages gets a generated `README.md` and an entry in its parent's index; the chain converges within one sync |
-| **Binary added or changed** (PDF, ...) | script plus extractor | only files whose sha256 changed get their sidecar (`<file>.pdf.md`) extracted again; sidecars are indexed and searched like pages |
+| **Binary added or changed** (PDF, ...) | script plus extractor | only files whose sha256 changed get their sidecar (`<file>.pdf.md`) extracted again; sidecars are indexed like pages and are plain text for `rg` |
 | **Binary deleted** | script, report only | the leftover sidecar is reported as an orphan, never deleted silently; a person decides |
 | **Model call failed** | explicit report | the file is untouched and listed among the per-file failures |
 
 ## The commit gate
 
-`vault sync --check` is a gate on **the tree being committed**. It treats derived files by
-where they live:
-
-- **Tracked derived files** (the folder README `vault-index` regions, binary sidecars) are
-  inside the commit. If they disagree with their generator, the snapshot being committed
-  contradicts itself, and regenerating during the commit would only fix unstaged files → exit
-  1; run `vault sync` and commit again.
-- **The cache** (the `.fts/` search index) is outside the commit. A stale cache says nothing
-  about the commit, so the gate rebuilds it from the live tree and passes, reporting
-  `fts: healed`. A failed rebuild is an error.
-
-Without this split, every edit another session made to some page would shift the search
-index signature and block a commit that was itself correct. A cache miss is something to heal,
-not something to call a person about.
+`vault sync --check` is a gate on **the tree being committed**. Every derived file (the folder
+README `vault-index` regions, binary sidecars) is inside the commit. If one disagrees with its
+generator, the snapshot being committed contradicts itself, and regenerating during the commit
+would only fix unstaged files → exit 1; run `vault sync` and commit again. An edit that moves no
+derived file (a page body) passes.
 
 On a server-backed store the gate also refuses commits during a freeze, binaries in
-`binaries.reject` places and oversized non-LFS files, and builds no local `.fts/` — see
+`binaries.reject` places and oversized non-LFS files — see
 [remote mode](remote-mode.md#the-commit-gate-vault-sync---check-the-pre-commit-hook).
 
-## Search — from a vague question to the right file
+## Finding a page — from a vague question to the right file
 
 ```mermaid
 flowchart LR
-    Q["vague question"] --> F["FTS search (engine: auto)<br/>trigram — CJK substrings too"]
+    Q["vague question"] --> F["scoped rg over the tree<br/>files (-l), then lines (-n -C2)"]
     F --> R["topology entry point<br/>folder README = owner"]
-    R --> G["read the page (get)"]
+    R --> G["read the page (vault get)"]
     G --> V["check the source, then answer"]
 ```
 
-- The engine used is always printed: `engine: fts (auto)`, `engine: scan
-  (query-below-trigram-min)`, `engine: scan (fts-index-absent)`. Nothing switches silently.
-- Without an index, search scans the live tree and says so in the `engine` field.
-- The FTS index is a pure cache of the Markdown (SQLite FTS5, trigram tokenizer), so its
-  substring recall for ASCII and CJK equals a linear scan.
-- **Volatile slots** — work plans and append-only machine logs — are left out of the search
-  corpus, so "the index changes only when knowledge changes" holds even in a busy vault.
+- The pages are plain Markdown on disk, so `rg` reads them directly: no index to build, keep in
+  step or wait for. Sidecars put a binary's text beside it for the same search.
+- Scope it — Markdown only (`-t md`) and a folder when one is known; an unscoped `rg` also reads
+  every binary in the tree.
+- `_credentials/` and `_sync-conflicts/` are skipped by default: setup writes a generated
+  `.rgignore` naming them. git does not read it, so they stay tracked and synced; an explicit
+  path or `--no-ignore` still reads them.
+- There is no search index. The earlier one (`vault search`, SQLite FTS5 with a trigram
+  tokenizer) could not match a word shorter than three characters, left `plans/` out and was
+  rebuilt on the server after every push; a scoped `rg` has none of those limits, so it was
+  removed.
 
 ## Engine, host and content trees
 
@@ -177,12 +181,12 @@ The engine is one of three separate roles, and it hard-codes no tree:
 ```mermaid
 flowchart TD
     HOST["Host application (e.g. Kuma Studio)<br/>consumes the engine; injects task-result paths,<br/>a project registry and the enrich model policy"]
-    ENG["kuma-vault (this repository)<br/>sync / lint / search / enrich compiler,<br/>the vault CLI and the git hook installer"]
+    ENG["kuma-vault (this repository)<br/>sync / lint / enrich compiler,<br/>the vault CLI and the git hook installer"]
     K1["Knowledge tree A<br/>declares itself in vault.config.json"]
     K2["Knowledge tree B<br/>declares itself in vault.config.json"]
     HOST -->|"depends on"| ENG
-    ENG -->|"sync / lint / search"| K1
-    ENG -->|"sync / lint / search"| K2
+    ENG -->|"sync / lint"| K1
+    ENG -->|"sync / lint"| K2
 ```
 
 - **The engine** is the only owner of the contract and the compiler, the `vault` CLI and the
@@ -190,7 +194,7 @@ flowchart TD
 - **A host** consumes the engine and injects its own concerns ([design](design.md)); it owns
   no engine code.
 - **Knowledge trees** are siblings, never nested, all governed by the same engine. What
-  differs per tree — index scope, checks, sidecar / enrich / FTS switches — is declared at
+  differs per tree — index scope, checks, sidecar / enrich switches — is declared at
   that tree's root.
 
 No tree gets a fork of the engine; an engine improvement reaches every tree at once.
@@ -208,10 +212,15 @@ a base contract id (`profile`, one of the engine's built-in profiles), tree-loca
 Decisions that need the tree's own names live there too. For example, persona-memory pages at
 the top of `domains/` are listed by the tree, `"personaMemoryPages": ["domains/<name>.md", …]`
 (no default — a page's shape cannot tell a persona page from a misplaced topic page). An
-undeclared top-level page is `domain-top-level-drift`.
+undeclared top-level page is `domain-top-level-drift`. Likewise the pages no model may write
+in, `"enrichExclude": ["/decisions.md", "projects/*.project-decisions.md"]` — gitignore syntax,
+relative to the tree, matched without regard to case, no default. A declaration is read strictly:
+an engine older than a key it carries refuses the whole file (`unknown key(s) …`) rather than
+ignoring the key, so a tree adopts a new key after every engine that reads it (each clone's
+`vault`, the server) has the release that knows it.
 
 A profile is plain data: which slots are not navigation, which root files are ledgers, whether
-sidecars, enrich and FTS are on. One declaration gives the full pipeline; another gives only a
+sidecars and enrich are on. One declaration gives the full pipeline; another gives only a
 pre-commit gate that checks the git-tracked topology.
 
 The CLI resolves **root and contract together** from this declaration, so a root can never be
@@ -239,7 +248,7 @@ resolve. Implementation: `src/engine/vault-config.mjs`.
 |---|---|---|
 | 1 | Every view is a pure function of the source | the sync pipeline is the only derivation path |
 | 2 | A model writes only the enrich fields of a page's frontmatter | a write-allowlist test fails on any other change |
-| 3 | Derivation is hash-idempotent: a second run is a no-op | sha256, per-field enrich stamps, corpus signature |
+| 3 | Derivation is hash-idempotent: a second run is a no-op | sha256, per-field enrich stamps |
 | 4 | The checker (lint) and the generator share their rules | shared predicate modules |
-| 5 | Failures are reported, never silently replaced | per-file failure lists, convergence failure throws, the `engine` field |
-| 6 | Volatile slots are left out of derivation and search | one exclusion rule shared by the corpus and index walks |
+| 5 | Failures are reported, never silently replaced | per-file failure lists, convergence failure throws |
+| 6 | Volatile slots are left out of derivation | one exclusion rule shared by the index and enrich walks |

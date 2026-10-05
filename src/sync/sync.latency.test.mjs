@@ -67,7 +67,7 @@ beforeAll(async () => {
     put("vault/vault.config.json", '{"profile":"kuma-vault"}\n');
     put("vault/README.md", "# Vault\n");
     put("vault/dispatch-log.md", "# dispatch log\n");
-    world.sh(VAULT_BIN, ["sync", "--no-fts", "--root", join(seed, "vault")]);
+    world.sh(VAULT_BIN, ["sync", "--root", join(seed, "vault")]);
     world.git(seed, ["add", "-A"]);
     world.git(seed, ["commit", "--quiet", "-m", "latency fixture"]);
     world.git(seed, ["push", "--quiet", "origin", "HEAD:main"]);

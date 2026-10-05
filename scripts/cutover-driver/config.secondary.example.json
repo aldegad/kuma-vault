@@ -1,0 +1,82 @@
+{
+  "_about": "cutover driver configuration, secondary mode: one more vault moves to a server that already serves the main one. The runtime is not stopped; one project is frozen. Placeholders (the upper-case to-do marker) are filled by the cutover plan on the day; the driver refuses to start (pre no-go) while any remains.",
+  "mode": "secondary",
+  "workDir": "~/Documents/workspace/.kuma/work/second-vault-cutover",
+  "plan": "TODO: cutover plan id <project>/<stem>",
+  "freezeReason": "second vault cutover",
+  "launchdLabel": "ai.kuma-vault.cutover-driver.second",
+  "gate": "~/.kuma/vault/projects/<project>/remote/second-gate.json",
+  "env": {
+    "PATH": "/Users/you/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  },
+  "mac": {
+    "repo": "~/Documents/workspace/work/second-vault-old",
+    "engine": "~/Documents/workspace/personal/agent-extensions/kuma-vault",
+    "toolsSha256": "~/.kuma/vault/projects/<project>/remote/brain-rewrite-tools.sha256",
+    "vault": ["/Users/you/.local/bin/vault"],
+    "git": "/opt/homebrew/bin/git",
+    "freezeFile": "~/.kuma/vault-freeze.json",
+    "rsync": "/usr/bin/rsync",
+    "newClone": "~/.kuma/vaults/second-vault",
+    "links": [],
+    "_links": "empty: step 10 leaves a link at mac.repo (the old path) to the new clone",
+    "storesFile": "~/.kuma/vault-stores.json",
+    "beforeFreeze": [["/Users/you/.local/bin/vault", "sync", "--root", "~/Documents/workspace/work/second-vault-old"]],
+    "storeCommands": [
+      ["store", "rename", "second-vault-old", "second-vault", "--root", "~/.kuma/vaults/second-vault"],
+      ["store", "set", "second-vault", "--mode", "remote", "--server", "http://brain.example.ts.net:7741",
+       "--remote-store", "second-vault", "--lfs-cache-max-gb", "10"]
+    ],
+    "_storeCommands": "no --default: the main vault stays the default store",
+    "cloneUrl": "http://brain.example.ts.net:7741/v1/stores/second-vault.git",
+    "cloneTokenFile": null,
+    "projectsJson": "~/.kuma/projects.json",
+    "daemonInstall": [["/Users/you/.local/bin/vault", "sync", "install", "--repo", "~/.kuma/vaults/second-vault"]],
+    "backupRetarget": []
+  },
+  "prereq": {
+    "engineMasterRef": "master",
+    "checks": ["ssh -o BatchMode=yes -o ConnectTimeout=20 brain-server true"],
+    "checkTimeoutSeconds": 60
+  },
+  "project": {
+    "id": "second-vault-old",
+    "statusCmd": ["kuma", "status", "--project", "second-vault-old"],
+    "freezeCommands": ["TODO: e.g. the route disconnect and the routine pause of this project, one command each"],
+    "undoCommands": ["TODO: what puts the project back as it was (rollback and no-go)"],
+    "releaseCommands": ["TODO: what opens the project again after the cutover, e.g. the route connected to the new project name"],
+    "waitMinutes": 30,
+    "pollSeconds": 30
+  },
+  "server": {
+    "ssh": "brain-server",
+    "work": "/data/work/TODO-stem",
+    "snapshot": "/data/second-vault-old",
+    "store": "second-vault",
+    "tree": "",
+    "sourceBranch": "main",
+    "owner": "you@example.com",
+    "allowedRemote": "http://brain.example.ts.net:7741/v1/stores/second-vault.git",
+    "commitMapRel": "_meta/remote/commit-map.tsv",
+    "rejectRel": "_meta/remote/binaries-reject.json",
+    "_rejectRel": "a reject list in the old tree (tracked or written before the freeze); it must cover every mustIgnore place",
+    "mustIgnore": ["intake/batch/name/source/probe.py"],
+    "_mustIgnore": "probe paths that the generated .gitignore block must ignore (pre, 6, 8, and a real file in 12)",
+    "filterRepo": "/data/work/tools/git-filter-repo",
+    "workRoot": "/data/work",
+    "receipts": "/data/work/_receipts/TODO-stem",
+    "cleanAbsent": []
+  },
+  "smoke": {
+    "planFile": null,
+    "logFile": "_meta/remote/_evidence/cutover-smoke.md",
+    "blobPath": "TODO: a small tracked LFS-extension file in HEAD (repo-relative)",
+    "rejectPath": "TODO: a png path inside a reject place",
+    "bigPath": "_meta/remote/_evidence/cutover-too-big.txt",
+    "launchdRestart": true,
+    "alarmsWaitSeconds": 300
+  },
+  "notify": {
+    "command": "TODO: command that reaches the orchestrator; gets C8_OUTCOME, C8_REPORT_FILE, C8_REPORT_JSON in its environment"
+  }
+}

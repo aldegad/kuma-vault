@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import { createIdentifier } from "./auth.mjs";
@@ -10,12 +12,27 @@ import { externalOrigin } from "./serve.mjs";
 const OID = "a".repeat(64);
 
 describe("lfs paths", () => {
-  it("compares extensions lower-case and keeps the 41-entry list", () => {
-    expect(LFS_EXTENSIONS).toHaveLength(41);
+  it("compares extensions lower-case and keeps the 64-entry list", () => {
+    expect(LFS_EXTENSIONS).toHaveLength(64);
     expect(isLfsPath("vault/a/B.PNG")).toBe(true);
     expect(isLfsPath("vault/x.Blend1")).toBe(true);
     expect(isLfsPath("vault/x.md")).toBe(false);
     expect(isLfsPath("vault/png")).toBe(false);
+  });
+
+  it("routes 3D outputs, print jobs, audio, images and office files to LFS, text 3D formats included", () => {
+    const added = ["ply", "stl", "3mf", "obj", "gcode", "bgcode", "step", "stp", "model", "fbx", "gltf", "vdb", "exr", "tif", "tiff", "flac", "aif", "aiff", "bmp", "doc", "hwpx", "odp", "wasm"];
+    for (const ext of added) {
+      expect(isLfsPath(`vault/out/part.${ext}`), ext).toBe(true);
+      expect(isLfsPath(`vault/out/PART.${ext.toUpperCase()}`), ext).toBe(true);
+    }
+    expect(isLfsPath("vault/out/slice.gcode.md")).toBe(false); // a text sidecar stays text
+    expect(renderLfsGitattributesLines()).toContain("*.3[mM][fF] filter=lfs diff=lfs merge=lfs -text");
+  });
+
+  it("is the same ordered list the history rewrite tools read", () => {
+    const tools = JSON.parse(readFileSync(new URL("../../scripts/brain-rewrite/lfs-extensions.json", import.meta.url), "utf8"));
+    expect(tools.extensions).toEqual([...LFS_EXTENSIONS]);
   });
 
   it("renders case-insensitive gitattributes patterns", () => {

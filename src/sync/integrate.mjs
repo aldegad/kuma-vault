@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { compileGitignore } from "../server/gitignore-match.mjs";
+import { DAEMON_SUBJECT } from "./context.mjs";
 import { git, gitEnv, gitRetry, isAncestor, revParse, splitNul } from "./git.mjs";
 
 const NULL_SHA = "0000000000000000000000000000000000000000";
@@ -249,7 +250,7 @@ export async function buildMerge(ctx, L, R, { clock = Date.now } = {}) {
   }
   const body = records.length ? `\n\n${records.length} conflict(s) kept under ${copyRoot}` : "";
   const commit = (
-    await git(["commit-tree", finalTree, "-p", L, "-p", R, "-m", `vault-sync: merge ${ctx.host}${body}`], { cwd: ctx.repo })
+    await git(["commit-tree", finalTree, "-p", L, "-p", R, "-m", `${DAEMON_SUBJECT}merge ${ctx.host}${body}`], { cwd: ctx.repo })
   ).stdout.toString("utf8").trim();
   return { commit, records };
 }

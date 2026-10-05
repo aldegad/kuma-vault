@@ -7,7 +7,7 @@ sudo -u "$SERVE_USER" env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
   git clone -q --no-local --filter=blob:limit=1m "file://$VAULTS/$STORE/origin.git" "$C/clone"
 sudo chown -R "$ADMIN_USER:$ADMIN_USER" "$C" && du -sB1 "$C/clone" | cut -f1 > "$R/clone-alloc"
 { tail -n +2 "$R/refmap-applied.tsv" | cut -f1 | sort -u
-  printf '%s\n' .gitignore "$TREE/vault.config.json" "$TREE/$MAPREL"
+  printf '%s\n' .gitignore "$(tp vault.config.json)" "$(tp "$MAPREL")"
   git -c core.quotePath=false -C "$C/clone" diff --name-only --diff-filter=D "$(jq -r .p "$R/pointer-commit.json")" HEAD -- '*/.gitattributes'
 } > "$R/allowed-changes.txt"
 $PY/stage8_compare.py --old-worktree "$O" --clone "$C/clone" --run "$R" --allowed-changes "$R/allowed-changes.txt" --report "$REP/stage8.json"

@@ -22,14 +22,14 @@ const USAGE = `Usage:
   vault store list [--json]
   vault store show <id> [--json]
   vault store add <id> --root <tree> [--mode local|remote] [--server <url>] [--remote-store <id>]
-                  [--search local|remote] [--token-file <path>] [--lfs-cache-max-gb <n>] [--default]
-  vault store set <id> [--root <tree>] [--mode …] [--server …] [--remote-store …] [--search …]
-                  [--token-file …] [--lfs-cache-max-gb …] [--default]
+                  [--token-file <path>] [--lfs-cache-max-gb <n>] [--default]
+  vault store set <id> [--root <tree>] [--mode …] [--server …] [--remote-store …]
+                  [--token-file …] [--lfs-cache-max-gb …] [--default] [--clear-search]
   vault store rename <old-id> <new-id> [--root <tree>]
   vault store rm <id>
 `;
 
-const ENTRY_FLAGS = ["root", "mode", "server", "remote-store", "search", "token-file", "lfs-cache-max-gb", "default"];
+const ENTRY_FLAGS = ["root", "mode", "server", "remote-store", "token-file", "lfs-cache-max-gb", "default"];
 
 function assertOnly(options, allowed, verb) {
   const unknown = Object.keys(options).filter((key) => key !== "_" && !allowed.includes(key));
@@ -64,13 +64,9 @@ function applyEntryFlags(id, base, options) {
     if (tokenFile) next.remote.tokenFile = resolve(resolveHomeRelative(tokenFile));
   }
   if (next.mode === "remote" && next.remote && !next.remote.store) next.remote.store = id;
-  if (next.mode === "local") {
-    delete next.remote;
-    if (!readOptionalString(options, "search")) next.search = "local";
-  }
-  const search = readOptionalString(options, "search");
-  if (search) next.search = search;
-  else if (next.mode === "remote" && base.mode !== "remote") next.search = "remote";
+  if (next.mode === "local") delete next.remote;
+  // The retired `search` key stays as written until it is cleared on purpose.
+  if (options["clear-search"] === true) delete next.search;
   if (options["lfs-cache-max-gb"] !== undefined) next.lfsCacheMaxGB = Number(options["lfs-cache-max-gb"]);
   return normalizeStoreEntry(id, next);
 }
@@ -78,7 +74,6 @@ function applyEntryFlags(id, base, options) {
 function describe(id, entry, isDefault) {
   const parts = [`${id}${isDefault ? " (default)" : ""}`, entry.mode, entry.rootDir ?? entry.root];
   if (entry.remote) parts.push(`${entry.remote.server} store=${entry.remote.store}`);
-  parts.push(`search=${entry.search}`);
   if (entry.status && entry.status !== "ok") parts.push(`[${entry.status}${entry.declaredId ? ` declares ${entry.declaredId}` : ""}]`);
   return parts.join("\t");
 }
@@ -110,6 +105,11 @@ export async function commandVaultStore(options) {
       }
       if (!registry.present) process.stdout.write(`no store registry at ${registry.path}\n`);
       for (const id of ids) process.stdout.write(`${describe(id, registry.stores.get(id), registry.default === id)}\n`);
+      for (const id of ids) {
+        if (registry.stores.get(id).search !== undefined) {
+          process.stdout.write(`${id}: legacy search field ignored (remove with \`vault store set ${id} --clear-search\`)\n`);
+        }
+      }
       return;
     }
     case "add": {
@@ -127,7 +127,7 @@ export async function commandVaultStore(options) {
       return;
     }
     case "set": {
-      assertOnly(rest, ENTRY_FLAGS, verb);
+      assertOnly(rest, [...ENTRY_FLAGS, "clear-search"], verb);
       const id = args[0];
       const { path } = updateStoreRegistry((doc) => {
         if (!doc.stores[id]) throw new Error(`no store "${id}" — use vault store add`);

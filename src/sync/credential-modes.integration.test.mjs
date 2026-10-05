@@ -57,7 +57,7 @@ function expectTight(root) {
 /** Push from the seed clone with plain git (no daemon), as another machine would. */
 function seedPush(files, message) {
   for (const [rel, data] of Object.entries(files)) writeAt(seedDir, rel, data);
-  world.sh(VAULT_BIN, ["sync", "--no-fts", "--root", join(seedDir, "vault")]);
+  world.sh(VAULT_BIN, ["sync", "--root", join(seedDir, "vault")]);
   world.git(seedDir, ["add", "-A"]);
   world.git(seedDir, ["commit", "--quiet", "-m", message]);
   world.git(seedDir, ["push", "--quiet", "origin", "HEAD:main"]);
@@ -165,7 +165,7 @@ describe.sequential("credential modes", { timeout: 120_000 }, () => {
 
   it("a merge of diverged branches keeps them 0600/0700 too", async () => {
     writeAt(a.dir, "vault/domains/notes/local.md", "---\ntitle: Local\ndescription: local note\n---\n\n# Local\n");
-    world.sh(VAULT_BIN, ["sync", "--no-fts", "--root", join(a.dir, "vault")]);
+    world.sh(VAULT_BIN, ["sync", "--root", join(a.dir, "vault")]);
     world.git(a.dir, ["add", "-A"]);
     world.git(a.dir, ["commit", "--quiet", "-m", "local"]);
     seedPush({ [`${CRED}/service-merge.json`]: '{"token":"synthetic-m"}\n' }, "server side");

@@ -1,5 +1,5 @@
 {
-  "description": "Repo-agnostic knowledge-base compiler: frontmatter sync, lint (git pre-commit drift gate), search, FTS, sidecar, and provider-injected enrich. Bundles the bundled skills plus the `vault` CLI.",
+  "description": "Repo-agnostic knowledge-base compiler: frontmatter sync, lint (git pre-commit drift gate), get, sidecar, and provider-injected enrich. Bundles the bundled skills plus the `vault` CLI.",
   "author": {
     "name": "Soohong Kim",
     "url": "https://github.com/aldegad/kuma-vault"

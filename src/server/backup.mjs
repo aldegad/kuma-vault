@@ -1,7 +1,7 @@
 // Server backup: restic -> offsite repository (docs/server.md "Backup", design 3.4).
 //
 // Thin by design: per store only `origin.git`, `lfs/objects`, `state` and the config directory
-// (minus the credential directory). `tree/` and its FTS index are rebuilt from `origin.git`;
+// (minus the credential directory). `tree/` is rebuilt from `origin.git`;
 // `lfs/incoming/` holds only unverified uploads.
 //
 // Every snapshot carries `--host <backup.host>` and `--tag <store id>`. Retention (`forget`)

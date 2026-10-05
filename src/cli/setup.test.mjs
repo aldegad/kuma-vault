@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -11,6 +11,7 @@ import {
   writeProviderConfig,
   starRepository,
   commandVaultSetup,
+  checkProviderModel,
   DEFAULT_STAR_REPO,
   SETUP_PROVIDERS,
 } from "./setup.mjs";
@@ -22,6 +23,18 @@ function makeOutput() {
 }
 
 // A scripted `gh`/bin runner: pops one result per call and records the argv.
+// The provider check as setup calls it: records what it was asked, fails when told to.
+function makeCheck(failure) {
+  const calls = [];
+  const check = async (args) => {
+    calls.push(args);
+    if (failure) throw new Error(failure);
+    return args;
+  };
+  check.calls = calls;
+  return check;
+}
+
 function makeRunner(results) {
   const calls = [];
   const queue = [...results];
@@ -72,7 +85,7 @@ describe("writeProviderConfig", () => {
   it("writes {provider, model} with the default model when omitted", () => {
     const configPath = join(tmp, "config.json");
     const saved = writeProviderConfig({ configPath, provider: "claude" });
-    expect(saved).toEqual({ provider: "claude", model: "claude-sonnet-5" });
+    expect(saved).toEqual({ provider: "claude", model: "sonnet" });
     expect(JSON.parse(readFileSync(configPath, "utf8"))).toEqual(saved);
   });
 
@@ -155,9 +168,9 @@ describe("commandVaultSetup (non-interactive / agent + CI path)", () => {
     const run = makeRunner([]);
     const saved = await commandVaultSetup(
       { provider: "claude", yes: true, config: configPath },
-      { input: notty, output, runCommand: run },
+      { input: notty, output, runCommand: run, checkModel: makeCheck() },
     );
-    expect(saved).toMatchObject({ provider: "claude", model: "claude-sonnet-5" });
+    expect(saved).toMatchObject({ provider: "claude", model: "sonnet" });
     expect(JSON.parse(readFileSync(configPath, "utf8")).provider).toBe("claude");
     expect(run.calls).toHaveLength(0); // no star attempted
     expect(output.text()).toMatch(/Skipped the GitHub star/);
@@ -169,13 +182,37 @@ describe("commandVaultSetup (non-interactive / agent + CI path)", () => {
     const run = makeRunner([{ status: 0 }, { status: 0 }, { status: 0 }]);
     await commandVaultSetup(
       { provider: "codex", yes: true, star: true, repo: "me/fork", config: configPath },
-      { input: notty, output, runCommand: run },
+      { input: notty, output, runCommand: run, checkModel: makeCheck() },
     );
     expect(run.calls.at(-1)).toEqual({
       command: "gh",
       args: ["api", "--method", "PUT", "/user/starred/me/fork"],
     });
     expect(output.text()).toMatch(/Starred me\/fork/);
+  });
+
+  it("checks the chosen model with one real call before saving anything", async () => {
+    const configPath = join(tmp, "config.json");
+    const check = makeCheck();
+    const output = makeOutput();
+    await commandVaultSetup(
+      { provider: "codex", model: "gpt-6-astra", effort: "low", yes: true, config: configPath },
+      { input: notty, output, runCommand: makeRunner([]), checkModel: check },
+    );
+    expect(check.calls).toEqual([{ provider: "codex", model: "gpt-6-astra", effort: "low", serviceTier: null }]);
+    expect(output.text()).toMatch(/Checking codex with model gpt-6-astra/);
+  });
+
+  it("fails, saving nothing, when the provider refuses the model", async () => {
+    const configPath = join(tmp, "config.json");
+    const check = makeCheck("Enrich provider check failed: codex with model \"gpt-5.4-mini\" did not answer");
+    await expect(
+      commandVaultSetup(
+        { provider: "codex", model: "gpt-5.4-mini", yes: true, config: configPath },
+        { input: notty, output: makeOutput(), runCommand: makeRunner([]), checkModel: check },
+      ),
+    ).rejects.toThrow(/check failed: codex with model "gpt-5.4-mini"/);
+    expect(existsSync(configPath)).toBe(false);
   });
 
   it("rejects an unsupported provider up front", async () => {
@@ -217,9 +254,9 @@ describe("commandVaultSetup (interactive TTY readline path)", () => {
     const { input, output } = interactiveHarness(["banana", "2", "", "y", ""]);
     const saved = await commandVaultSetup(
       { config: configPath, repo: "me/fork" },
-      { input, output, runCommand: run },
+      { input, output, runCommand: run, checkModel: makeCheck() },
     );
-    expect(saved).toMatchObject({ provider: "codex", model: "gpt-5.4-mini" });
+    expect(saved).toMatchObject({ provider: "codex", model: "gpt-6-luna" });
     expect(JSON.parse(readFileSync(configPath, "utf8")).provider).toBe("codex");
     // star consented in the prompt -> routed through the injected runner (PUT /user/starred/me/fork)
     expect(run.calls.at(-1)).toEqual({
@@ -237,9 +274,51 @@ describe("commandVaultSetup (interactive TTY readline path)", () => {
     const run = makeRunner([]);
     // answers: provider = Enter (default = first = claude); model = Enter; star = Enter (No); hook = Enter
     const { input, output } = interactiveHarness(["", "", "", ""]);
-    const saved = await commandVaultSetup({ config: configPath }, { input, output, runCommand: run });
+    const saved = await commandVaultSetup({ config: configPath }, { input, output, runCommand: run, checkModel: makeCheck() });
     expect(saved.provider).toBe("claude");
     expect(run.calls).toHaveLength(0); // star declined by default
     expect(output.text()).toMatch(/Skipped the GitHub star/);
+  });
+});
+
+describe("checkProviderModel (the real call, against a stand-in CLI)", () => {
+  // A codex stand-in that refuses a model the way codex-cli 0.160.0 does for a ChatGPT sign-in,
+  // and answers in the adapter's contract for any other.
+  const FAKE_CODEX = `#!/usr/bin/env node
+const { writeFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+const model = args[args.indexOf("--model") + 1];
+if (model === "gpt-5.4-mini") {
+  process.stderr.write('ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The \\'gpt-5.4-mini\\' model is not supported when using Codex with a ChatGPT account."}}\\n');
+  process.exit(1);
+}
+writeFileSync(args[args.indexOf("--output-last-message") + 1], model === "silent" ? "\\n" : "DESCRIPTION: Checks the provider.\\nTAGS: setup\\nALIASES: \\n");
+`;
+  let savedPath;
+
+  beforeEach(() => {
+    mkdirSync(join(tmp, "bin"));
+    writeFileSync(join(tmp, "bin", "codex"), FAKE_CODEX);
+    chmodSync(join(tmp, "bin", "codex"), 0o755);
+    savedPath = process.env.PATH;
+    process.env.PATH = `${join(tmp, "bin")}:${process.env.PATH}`;
+  });
+
+  afterEach(() => {
+    process.env.PATH = savedPath;
+  });
+
+  it("passes when the CLI answers with a description", async () => {
+    await expect(checkProviderModel({ provider: "codex", model: "gpt-6-luna" })).resolves.toEqual({ provider: "codex", model: "gpt-6-luna" });
+  });
+
+  it("fails loudly, in the CLI's words, when the CLI refuses the model", async () => {
+    await expect(checkProviderModel({ provider: "codex", model: "gpt-5.4-mini" })).rejects.toThrow(
+      /check failed: codex with model "gpt-5\.4-mini" did not answer \(.*not supported when using Codex with a ChatGPT account/,
+    );
+  });
+
+  it("fails when the CLI answers with no description", async () => {
+    await expect(checkProviderModel({ provider: "codex", model: "silent" })).rejects.toThrow(/answered without a description/);
   });
 });

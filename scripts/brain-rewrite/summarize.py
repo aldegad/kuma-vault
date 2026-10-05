@@ -84,8 +84,7 @@ def main():
     fm_cold, fm_warm = rep("final-map-cold.json"), rep("final-map-warm.json")
     strip = rep("strip.json")
     sizes = rep("7d-sizes.json")
-    fts = rep("fts-build.json")
-    server_side = t_warm + phases.get("tree-fts", {}).get("seconds", 0) + phases["clone"]["seconds"] + \
+    server_side = t_warm + phases.get("tree", {}).get("seconds", 0) + phases["clone"]["seconds"] + \
         phases["compare"]["seconds"]
     out = dict(
         pass_=None,
@@ -108,7 +107,7 @@ def main():
         testCloneBytes=num("clone-alloc"), testCloneApparentBytes=num("clone-apparent"),
         testCloneGitBytes=num("clone-git-alloc"),
         treeBytes=num("tree-alloc"),
-        fts=fts, tailReplay=tail, receiveRules=rep("receive.json"),
+        tailReplay=tail, receiveRules=rep("receive.json"),
         refmap=rep("refmap.json") or dict(status="not run"),
         freezeWindowServerSeconds=round(server_side, 1),
         checks=checks, phases=phases)

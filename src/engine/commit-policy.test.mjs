@@ -100,6 +100,9 @@ describe("verdict functions", () => {
     expect(judgeBinaryWrite({ ...png, path: "a/canvas/notes.md", head: Buffer.from("text") })).toBeNull();
     expect(judgeBinaryWrite({ path: "big.bin", size: 33 * MiB, head: null, declaration })?.rule).toBe("size");
     expect(judgeBinaryWrite({ path: "big.png", size: 300 * MiB, head: null, declaration })).toBeNull();
+    for (const path of ["out/mesh.ply", "out/SLICE.GCODE", "out/part.obj", "out/plate.3mf", "out/cad.step"]) {
+      expect(judgeBinaryWrite({ path, size: 300 * MiB, head: Buffer.from("G1 X0 Y0\n"), declaration }), path).toBeNull();
+    }
     expect(judgeBinaryWrite({ path: "big.bin", size: 33 * MiB, head: null, declaration: {} })).toBeNull();
   });
 

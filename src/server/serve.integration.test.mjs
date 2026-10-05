@@ -445,7 +445,7 @@ describe("vault serve — two clones over git smart HTTP + LFS", { timeout: 60_0
       expect(r.code, r.stderr).toBe(0);
     });
 
-    it("rule 4: a 33MiB plain blob is refused even when a later commit deletes it; 11MiB passes with a warning", () => {
+    it("rule 4: a 33MiB plain blob is refused even when a later commit deletes it, a big .gcode falls under rule 3; 11MiB passes with a warning", () => {
       resetTo(a);
       commitRaw(a, { "vault/big.bin": Buffer.alloc(33 * MiB, 1) }, "big");
       git(a, ["rm", "--quiet", "vault/big.bin"]);
@@ -453,6 +453,14 @@ describe("vault serve — two clones over git smart HTTP + LFS", { timeout: 60_0
       let r = push(a);
       expect(r.code).not.toBe(0);
       expect(r.stderr).toContain("[규칙 4] 32MiB 넘는 일반 blob: vault/big.bin");
+
+      // a print job is text but an LFS extension: a raw one is refused as a non-pointer (rule 3), not by size
+      resetTo(a);
+      commitRaw(a, { "vault/slice.gcode": Buffer.from("G1 X0 Y0\n".repeat(Math.ceil((33 * MiB) / 9))) }, "raw gcode");
+      r = push(a);
+      expect(r.code).not.toBe(0);
+      expect(r.stderr).toContain("[규칙 3] LFS 포인터가 아닙니다: vault/slice.gcode");
+      expect(r.stderr).not.toContain("[규칙 4]");
 
       resetTo(a);
       commitRaw(a, { "vault/medium.bin": Buffer.alloc(11 * MiB, 2) }, "medium");
@@ -639,7 +647,6 @@ describe("vault serve — two clones over git smart HTTP + LFS", { timeout: 60_0
         ["POST", "/v1/stores/scratch.git/git-receive-pack"],
         ["POST", "/v1/stores/scratch.git/info/lfs/objects/batch"],
         ["GET", "/v1/stores/scratch/events?after=0"],
-        ["POST", "/v1/stores/scratch/search"],
         ["GET", "/v1/stores/scratch/file?path=README.md"],
         ["GET", "/v1/stores/scratch/backup-status"],
         ["GET", "/v1/stores/nope.git/info/refs?service=git-upload-pack"],

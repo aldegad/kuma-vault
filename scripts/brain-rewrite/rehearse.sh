@@ -8,10 +8,12 @@
 #   rehearse.sh <env-file> cleanup        unmount, findmnt check, delete the large copies
 #
 # env-file (sourced): ORIG (original repo), WORK (empty work dir on the same
-# filesystem), GIT_FILTER_REPO, optional NODE + ENGINE (kuma-vault checkout) for
-# the FTS build, TAIL (commits for the tail-replay test, default 50),
+# filesystem), GIT_FILTER_REPO, optional NODE (the refmap and receive steps), TAIL (commits for
+# the tail-replay test, default 50),
 # EXTRA_DELETE_PATHS (repo-specific junk rules for delete_paths.py), ENGINE_SERVER
-# (engine checkout whose src/server receive rules the result must pass).
+# (engine checkout whose src/server receive rules the result must pass), SOURCE_BRANCH
+# (the branch the original works on, default master), VAULT_TREE (the vault tree inside
+# the repository, default vault; empty when the repository root is the tree).
 #
 # Steps, with the cutover step they stand for:
 #   inventory-before   source content inventory + fsck --full of ORIG
@@ -19,7 +21,7 @@
 #   freeze             step 3 imitation in snap: text-only commit, hooks disabled
 #   delete-paths mime map-cold map-warm strip         pipeline steps 1-2 (and the MIME audit)
 #   src filter independent pointer verify             pipeline steps 3-7 (= cutover step 5)
-#   tree-fts           step 7: linked worktree of src.git + FTS full build
+#   tree               step 7: linked worktree of src.git
 #   clone compare      step 8: partial test clone + comparison with the old worktree
 #   tail               tail replay of the last $TAIL commits vs the full rewrite
 #   refmap             step 6 sha references: refmap dry-run counts (optional REFMAP_ENGINE)
@@ -35,6 +37,7 @@ ENVF=$(realpath "${1:?env file}"); shift
 source "$ENVF"
 : "${ORIG:?}" "${WORK:?}" "${GIT_FILTER_REPO:?}"
 TAIL=${TAIL:-50}
+SOURCE_BRANCH=${SOURCE_BRANCH:-master}; VAULT_TREE=${VAULT_TREE-vault}
 export GIT_FILTER_REPO GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null LC_ALL=C
 export GIT_AUTHOR_NAME="kuma-vault rehearsal" GIT_AUTHOR_EMAIL=rehearsal@localhost
 export GIT_COMMITTER_NAME="kuma-vault rehearsal" GIT_COMMITTER_EMAIL=rehearsal@localhost
@@ -55,6 +58,12 @@ sampler_start() {
   echo $! > "$R/sampler.pid"
 }
 sampler_stop() { [ -f "$R/sampler.pid" ] && kill "$(cat "$R/sampler.pid")" 2>/dev/null; rm -f "$R/sampler.pid"; }
+# The sampler lives as long as this invocation, whatever its steps: a partial run
+# (`rehearse.sh env snap freeze`) or an interrupted one must not leave the 2 s loop
+# behind. The next invocation starts a new one and appends to the same df.log.
+trap 'sampler_stop || true' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 run_step() {
   local name=$1; shift
@@ -88,7 +97,7 @@ s_freeze() {
   git -C "$SNAP" rev-parse HEAD > "$R/head-final"
   git -C "$SNAP" diff --stat --no-renames HEAD^ HEAD | tail -1 > "$R/freeze-stat.txt"
 }
-s_delete_paths() { $PY/delete_paths.py --repo "$SNAP" --worktree "$SNAP" ${EXTRA_DELETE_PATHS:+--extra-rules "$EXTRA_DELETE_PATHS"} --out "$R/delete-paths.txt" --report "$REP/delete-paths.json"; }
+s_delete_paths() { $PY/delete_paths.py --repo "$SNAP" --worktree "$SNAP" --tree "$VAULT_TREE" ${EXTRA_DELETE_PATHS:+--extra-rules "$EXTRA_DELETE_PATHS"} --out "$R/delete-paths.txt" --report "$REP/delete-paths.json"; }
 s_mime() { $PY/mime_audit.py --repo "$SNAP" --worktree "$SNAP" --delete-paths "$R/delete-paths.txt" --tmp "$WORK/mime.tmp" --report "$REP/mime-audit.json"; }
 map_args() { echo --worktree "$SNAP" --cache "$R/map-cache.tsv" --cas "$CAS" --lfs-objects "$ORIG/.git/lfs/objects" --delete-paths "$R/delete-paths.txt"; }
 s_map_cold() {
@@ -108,7 +117,7 @@ s_filter() { "$HERE/rewrite.sh" filter "$SRC" "$R"; }
 s_independent() { "$HERE/rewrite.sh" independent "$SRC"; "$HERE/isolate.sh" umount "$MP"; }
 s_pointer() {
   $PY/pointer_commit.py --gitdir "$SRC" --final-map "$R/final-map.tsv" --run "$R" --worktree "$SNAP" \
-    --source-branch master --branch main --report "$R/pointer-commit.json"
+    --source-branch "$SOURCE_BRANCH" --branch main --report "$R/pointer-commit.json"
   cp "$R/pointer-commit.json" "$REP/pointer-commit.json"
 }
 s_verify() {
@@ -118,18 +127,8 @@ s_verify() {
   $PY/verify.py cas --gitdir "$SRC" --run "$R" --cas "$CAS" --report "$REP/7c-cas.json"
   $PY/verify.py sizes --gitdir "$SRC" --run "$R" --cas "$CAS" --report "$REP/7d-sizes.json"
 }
-s_tree_fts() {
+s_tree() {
   git -C "$SRC" worktree add -q --detach "$TREE" main
-  if [ -n "${NODE:-}" ] && [ -n "${ENGINE:-}" ]; then
-    "$NODE" --no-warnings --input-type=module -e "
-      import { buildFtsIndex } from '$ENGINE/src/engine/vault-fts.mjs';
-      const t = Date.now();
-      const r = await buildFtsIndex({ vaultDir: '$TREE/vault', dbPath: '$TREE/vault/.fts/vault-fts.db', force: true });
-      console.log(JSON.stringify({ ms: Date.now() - t, docCount: r.docCount, rebuilt: r.rebuilt }));
-    " > "$REP/fts-build.json"
-  else
-    echo '{"skipped": "NODE/ENGINE not set"}' > "$REP/fts-build.json"
-  fi
   du -sB1 --apparent-size "$TREE" | cut -f1 > "$R/tree-apparent"; du -sB1 "$TREE" | cut -f1 > "$R/tree-alloc"
 }
 # Commit-sha references in the text: dry-run of `vault migrate refmap`
@@ -162,10 +161,10 @@ s_tail() {
   rm -rf "$R2"; mkdir -p "$R2"
   cp "$R/delete-paths.txt" "$R/final-map.tsv" "$R/strip-blob-ids.txt" "$R2/"
   "$HERE/isolate.sh" bare "$SNAP/.git" "$SRC2" "$SNAP/.git/objects"
-  git -C "$SRC2" update-ref refs/heads/master "$base"
+  git -C "$SRC2" update-ref "refs/heads/$SOURCE_BRANCH" "$base"
   "$HERE/rewrite.sh" filter "$SRC2" "$R2"
   cmp "$R/attrs-blob.txt" "$R2/attrs-blob.txt"
-  $PY/tail_replay.py --old-gitdir "$SNAP" --gitdir "$SRC2" --run "$R2" --from "$base" --to "$hf" --branch master \
+  $PY/tail_replay.py --old-gitdir "$SNAP" --gitdir "$SRC2" --run "$R2" --from "$base" --to "$hf" --branch "$SOURCE_BRANCH" \
     --check-against "$SRC/filter-repo/commit-map" --report "$REP/tail-replay.json"
 }
 s_mount() { mounted || "$HERE/isolate.sh" mount "$ORIG/.git/objects" "$MP"; }
@@ -210,7 +209,7 @@ s_cleanup() {
 
 steps=("$@")
 [ "${steps[0]:-}" = all ] && steps=(inventory-before snap freeze delete-paths mime map-cold map-warm strip src filter
-  independent pointer verify tree-fts refmap clone compare tail receive release inventory-after summary)
+  independent pointer verify tree refmap clone compare tail receive release inventory-after summary)
 for s in "${steps[@]}"; do
   fn="s_${s//-/_}"
   declare -F "$fn" >/dev/null || { echo "unknown step $s" >&2; exit 2; }

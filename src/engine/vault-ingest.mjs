@@ -1706,7 +1706,7 @@ async function collectReadmePaths(vaultDir, currentDir = vaultDir, ctx = buildNa
       continue;
     }
     // Dot-directories are machine/vcs artifacts, never navigable knowledge folders: `.git`, and
-    // the `.fts/` FTS index cache (DEC vault-compiler step 7). Skipping them here keeps the README
+    // the `.fts/` cache an engine before the search removal left behind (DEC vault-compiler step 7). Skipping them here keeps the README
     // generator's descent identical to the parent-index child listing, which already skips
     // dot-entries (원칙 3 Consistency) — so sync never mints a README inside a derived-cache dir.
     if (entry.name.startsWith(".") || entry.name === "node_modules") {

@@ -16,7 +16,6 @@ what the engine does differently for such a store. The sync daemon (`vault syncd
       "root": "/Users/me/.kuma/vaults/kuma-main-vault/vault",
       "mode": "remote",
       "remote": { "server": "http://vault-server.example.ts.net:7741", "store": "kuma-main-vault" },
-      "search": "remote",
       "lfsCacheMaxGB": 10
     },
     "acme-ops": { "root": "/Users/me/work/acme-ops", "mode": "local" }
@@ -27,39 +26,36 @@ what the engine does differently for such a store. The sync daemon (`vault syncd
 - A v1 file (`"id": "/path"`) still reads; every entry is then `mode: "local"`.
 - `root` is the declared tree (the directory with `vault.config.json`); the repository root is
   found with git. The tree's `vault.config.json` `id` must equal the registry key.
+- `"search": "local" | "remote"` is a retired key (it chose where `vault search` ran). A registry
+  that still has it reads and nothing acts on it; `vault store list|show` prints
+  "legacy search field ignored" for each entry carrying it, with the command that removes it,
+  `vault store set <id> --clear-search`.
 - `remote.tokenFile` (optional) is a file holding a bearer token, plain or `{"token": "…"}` —
   needed off the tailnet or from the server itself. `KUMA_VAULT_TOKEN` overrides it.
 - Write it with `vault store`, not by hand:
 
 ```sh
 vault store add <id> --root <tree> [--mode remote --server <url> [--remote-store <id>]] [--default]
-vault store set <id> [--root …] [--mode …] [--server …] [--search local|remote] [--token-file …] [--lfs-cache-max-gb n]
+vault store set <id> [--root …] [--mode …] [--server …] [--token-file …] [--lfs-cache-max-gb n] [--clear-search]
 vault store rename <old> <new> [--root <tree>]   # the tree must already declare <new>
 vault store rm <id>
 vault store list | show <id> [--json]
 ```
 
-## Search
+## Finding and reading pages
 
-`vault search|timeline` asks the server of every store registered with `search: "remote"`
-(`POST /v1/stores/<id>/search`). The answer is as of the server's `indexedCommit`, so the
-client adds what this clone changed after it: paths changed since the merge-base of that commit
-and `HEAD` (unpushed commits) plus every uncommitted change, untracked included. Those paths are
-searched locally with the same analyzer; the server's hits for them are dropped and the local
-hits take their place, and a deleted path drops out. The output ends with
-`<store>: 색인 기준 <sha> · 로컬 보충 N파일` ("indexed at <sha> · N files supplemented
- locally"; the CLI's messages are in Korean).
-
-When the server cannot be reached or refuses, the search fails with
-`서버 검색 불가(<reason>). 맥 사본에서 찾으려면 --local` ("server search unavailable;
-use --local to search this copy"). It never switches to the local copy
-by itself, and a failing remote store fails a multi-store search as a whole. `--local` scans
-this clone's copy (no index).
+There is no search index, on the server or here: the clone is a tree on disk, and a scoped `rg`
+over it finds pages (`vault search|timeline`, the server index and its API were removed). What
+`rg` reads is this clone: its unpushed and uncommitted changes included, another computer's
+newest pushes only after the sync daemon has pulled them.
 
 `vault get` reads local files. A large file there may be an LFS pointer; `get` says so.
 
-`_credentials/` and `_sync-conflicts/` (any depth, any case) are outside the search corpus
-everywhere — the server index, the local scan and FTS, and the read-your-writes supplement.
+A plain `rg` in a clone skips `_credentials/` and `_sync-conflicts/` (any depth, any case): the
+tree's `.rgignore` has a generated block with both names (from the one resolver,
+`src/server/secret-dirs.mjs`), written by setup and refreshed by `vault binaries apply`. git does
+not read `.rgignore`, so they stay tracked and synced; `rg` on an explicit path or with
+`--no-ignore` still reads them.
 
 ## The commit gate (`vault sync --check`, the pre-commit hook)
 
@@ -72,8 +68,7 @@ Before the derivation checks, the gate judges what is staged:
 | size | a non-LFS-extension file over 32 MiB (the server refuses it on push) | trees declaring `binaries` |
 
 The same verdict is exported for hosts that write binaries into a vault
-(`judgeBinaryWrite` in `src/engine/commit-policy.mjs`). For a store registered with remote
-search the gate does not build a local `.fts/` and says `fts: skipped (remote store …)`.
+(`judgeBinaryWrite` in `src/engine/commit-policy.mjs`).
 
 ## Hooks (`vault hook install --root <tree> [--bin <vault>]`)
 
@@ -102,6 +97,9 @@ vault binaries apply --from binaries-reject.json --root <tree> [--gitignore-deci
 - The repository-root `.gitignore` gets two generated blocks: trash/derived files and the
   reject list re-anchored at the tree (`domains/**` under `vault/` becomes `vault/domains/**`;
   an unanchored `canvas/` becomes `vault/**/canvas/`). Lines outside the blocks are kept.
+- The tree's `.rgignore` gets its generated block (the secret directories `rg` skips); lines
+  outside it are kept. On a vault set up before the block existed, add it with
+  `vault binaries apply --from <tree>/vault.config.json --root <tree>`.
 - `--gitignore-decisions` (CSV `ignore_file,rule,…,decision`): a sub-`.gitignore` rule marked
   `reject로 올림` ("promote to reject") joins the list re-anchored at its directory, a rule marked
   `하위 줄 삭제 권고` ("delete the sub-rule") is only removed; decided lines leave their sub-`.gitignore`, and a file
@@ -134,7 +132,7 @@ store needs a history rewrite), then commits `visibility: private` + the remote 
 `remotes.allowed`, adds the remote, installs the hooks, pushes to `main` (git-lfs uploads the
 objects), and registers the store as remote. With `--token-file` the token is copied to
 `.git/kuma-vault/token` (0600) behind the same git credential helper `vault clone` sets, so the
-sync daemon (`vault sync install --repo <repo>`), git-lfs and remote search use it afterwards.
+sync daemon (`vault sync install --repo <repo>`) and git-lfs use it afterwards.
 
 `kuma-vault setup --storage local|oracle|remote` creates a store in this layout from the start
 ([setup › Storage](setup.md#storage)).

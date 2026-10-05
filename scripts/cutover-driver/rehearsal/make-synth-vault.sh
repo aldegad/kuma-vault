@@ -4,13 +4,59 @@
 # junk paths in history, two sub-folder .gitattributes, commit-sha references in text, branch
 # master, a reject list and a junk-rules file where the cutover reads them.
 #
-#   make-synth-vault.sh <repo-dir> <engine-dir>    (engine: installs the pre-commit gate hook)
+#   make-synth-vault.sh <repo-dir> <engine-dir> [secondary <declared id> [noref]]
+#
+# secondary: shaped like a company / second vault instead — the tree is the repository root,
+# branch main, two merges, a derived .graph/ only in history, a 3D output file, the hand-written
+# root .gitignore safety net for outside source clones and the reject list that declares the
+# same place (binaries-reject.json at the root), the commit gate installed. One text line refers
+# to the first commit by its full id (rewritten in step 6); `noref`: no reference at all (step 6
+# then has nothing to rewrite and makes no commit).
 set -euo pipefail
-R=${1:?repo dir}; ENG=${2:?engine}
+R=${1:?repo dir}; ENG=${2:?engine}; KIND=${3:-main}; SECID=${4:-synth-secondary}; REF=${5:-ref}
 [ -e "$R" ] && { echo "exists: $R" >&2; exit 1; }
 export GIT_AUTHOR_NAME=synth GIT_AUTHOR_EMAIL=synth@localhost GIT_COMMITTER_NAME=synth GIT_COMMITTER_EMAIL=synth@localhost
 rnd() { head -c "$2" /dev/urandom > "$1"; }
 mkdir -p "$R"; cd "$R"
+if [ "$KIND" = secondary ]; then
+  git init -q -b main .
+  git config gc.auto 0; git config maintenance.auto false
+  c() { git add -A -- "${@:2}"; git commit -q -m "$1"; }
+  mkdir -p notes assets models scratch .graph
+  printf '.DS_Store\n/.fts/\n*.tmp\n\n# outside source clones live outside the vault; this hand-written line is the old safety net\nintake/**/source/\n' > .gitignore
+  printf '{\n  "id": "%s",\n  "profile": "kuma-vault"\n}\n' "$SECID" > vault.config.json
+  printf '{\n  "reject": [\n    "scratch/",\n    "intake/**/source/"\n  ]\n}\n' > binaries-reject.json
+  echo '# second vault' > README.md
+  echo 'first note' > notes/a.md
+  rnd assets/img1.png 4096; rnd assets/old.png 3000
+  echo '{"derived": true}' > .graph/graph.json
+  c "sec: start" .
+  C1=$(git rev-parse HEAD)
+  git rm -q -r .graph assets/old.png
+  rnd assets/big.png 2200000
+  [ "$REF" = noref ] || printf 'see %s for the start\n' "$C1" >> notes/a.md
+  c "sec: big png, drop the derived cache" .
+  git checkout -q -b side
+  echo 'side note' > notes/side.md; rnd models/part.stl 9000
+  c "sec: side work with a print file" .
+  git checkout -q main
+  echo 'main line' >> notes/a.md; c "sec: main moves" .
+  git merge -q --no-ff -m "sec: merge side" side
+  git checkout -q side; echo 'side again' >> notes/side.md; c "sec: side again" .
+  git checkout -q main; git merge -q --no-ff -m "sec: merge side again" side
+  git branch -q -D side
+  mkdir -p intake/r1/a; echo '# a: review' > intake/r1/a/eval.md; c "sec: intake notes" .
+  "$ENG/bin/vault" sync --root "$R" >/dev/null 2>&1 || true
+  git add -A; git commit -q --allow-empty -m "sec: derived index"
+  # working tree at freeze time: an untracked note, a modified text, junk, an untracked binary
+  echo 'untracked note' > notes/untracked.md; echo 'uncommitted line' >> notes/a.md
+  rnd assets/new.webp 5000; touch .DS_Store
+  mkdir -p .git/lfs/objects
+  git config kuma-vault.bin "$ENG/bin/vault"
+  "$ENG/bin/vault" hook install --root "$R" >/dev/null
+  git rev-parse HEAD
+  exit 0
+fi
 git init -q -b master .
 git config gc.auto 0
 git config maintenance.auto false

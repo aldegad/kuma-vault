@@ -25,7 +25,7 @@ history.
 
 Why P1 and P2 belong together: P1 keeps secrets in the repository so the vault stays the
 single source of truth; P2 is what keeps that safe. The server API also never returns
-`_credentials/**` paths through search or file reads. Together, secrets stay on machines
+`_credentials/**` paths through its file reads. Together, secrets stay on machines
 you own.
 
 ## What this means for a user

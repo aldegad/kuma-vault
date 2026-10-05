@@ -2,8 +2,8 @@
 
 A fact lives in exactly one vault store. When a page in one store needs a fact owned by
 another, it points at it with a **cross-store pointer**. `vault lint` checks that every pointer
-resolves to a real file in the target store and fails loudly when one does not; `vault search`,
-`vault get` and `vault graph` follow the same pointers. What a pointer *means* in a given vault
+resolves to a real file in the target store and fails loudly when one does not; `vault get`
+follows the same pointers. What a pointer *means* in a given vault
 is up to that tree's `schema.md`; this page is how the engine reads and checks it.
 
 ## Pointer form
@@ -78,30 +78,12 @@ Implementation: `src/engine/vault-stores.mjs` (registry loader) and `src/engine/
 (parser and resolution). Tests: `src/engine/vault-stores.test.mjs`,
 `src/engine/vault-cross-store.test.mjs`.
 
-## Search and get across stores
+## Get across stores
 
-`vault search` searches **every registered store by default**. With no registry, or a broken
-one, it searches the primary store and prints `stores_skipped:` — a machine without a registry
-has simply not opted in, so this is not an error (unlike `vault graph --all-stores`, which asks
-for the registry explicitly). In a multi-store result each hit id is a pointer,
-`<store-id>:<path>`, and `vault get` resolves it through the same registry, so
-`search → timeline → get` works across store boundaries.
+`vault get <store-id>:<path>` reads a page of another registered store: the store id resolves
+through the same registry `vault lint` reads, and a missing registry, an unknown id or an
+unusable store is an error that says which. Finding the page is a scoped `rg` over that store's
+tree on disk; every registered store has one (a remote store's clone).
 
-`--vault-dir <path>` narrows the search to that one tree, `--store <id>` to one registered
-store. Hits from different stores are ranked by the number of matches they show, because the
-engines' own scores (bm25 for FTS, match counts for a scan) cannot be compared. The primary
-store gets no bonus: otherwise an exact hit in another store would sink below a weak one in the
-primary — the very miss this feature exists to prevent.
-
-Implementation: `src/engine/vault-search.mjs` (`searchVaultStores`, pointer resolution in
-`getVaultDocuments`). Tests: `src/engine/vault-search.test.mjs`, `describe("searchVaultStores")`.
-
-## The graph's xstore layer
-
-`vault graph` draws its **xstore** layer with the same parser (`extractCrossStorePointers`) and
-the same registry: referencing page → external page → external store hub. The graph has no
-parser of its own. Because it is a viewer, not a checker, an unknown store id is counted rather
-than failed, and a pointer into a store it scanned (itself, or every registered store with
-`--all-stores`) resolves to that store's real page node — in the union view those edges are the
-bridges between stores. Details: the `kuma-vault` skill's
-[graph reference](../skills/kuma-vault/docs/graph.md).
+Implementation: `src/engine/vault-get.mjs` (`getVaultDocuments`). Tests:
+`src/engine/vault-get.test.mjs`.

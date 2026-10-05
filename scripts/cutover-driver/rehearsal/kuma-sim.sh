@@ -33,6 +33,8 @@ case "$1 ${2:-}" in
   "control core-version")
     [ ! -f "$D/core-delay" ] || sleep "$(cat "$D/core-delay")"
     echo "CORE source: CURRENT — simulated" ;;
-  "notify "*|"routine "*) : ;;
+  # recorded only (the events file): notify, a routine retarget, a daemon install argument, and the
+  # project freeze of secondary mode (route disconnect / connect)
+  "notify "*|"routine "*|"daemon "*|"route "*) : ;;
   *) echo "kuma-sim: unknown $*" >&2; exit 2 ;;
 esac

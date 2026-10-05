@@ -110,3 +110,38 @@ describe("package barrel — reading a partial clone", () => {
     await expect(blobGet({ repo: scratch(), paths: ["a.png"] })).rejects.toThrow(/not inside a git work tree/);
   });
 });
+
+describe("package barrel — search removed", () => {
+  const RETIRED = ["formatVaultSearchText", "resolveFtsDbPath", "searchVault"];
+
+  it("exports get and the secret-directory predicate, and no search or FTS symbol but the retired stubs", async () => {
+    const barrel = await import("kuma-vault");
+    for (const name of ["getVaultDocuments", "formatVaultGetText", "crossesSecretDir", "runVaultSync", "formatVaultSyncReport"]) {
+      expect([name, typeof barrel[name]]).toEqual([name, "function"]);
+    }
+    const searchish = Object.keys(barrel).filter((name) => /search|fts/iu.test(name)).sort();
+    expect(searchish).toEqual(RETIRED);
+  });
+
+  it("a host's named import of a retired search export loads, and calling it throws with the rg route", async () => {
+    // The import line an older host branch carries: it must resolve, or the host's whole module graph fails.
+    const { searchVault, formatVaultSearchText, resolveFtsDbPath } = await import("kuma-vault");
+    const calls = {
+      searchVault: () => searchVault({ query: "x", vaultDir: scratch() }),
+      formatVaultSearchText: () => formatVaultSearchText({ results: [] }),
+      resolveFtsDbPath: () => resolveFtsDbPath(scratch()),
+    };
+    for (const name of RETIRED) {
+      let thrown;
+      try {
+        calls[name]();
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown, `${name} returned instead of throwing`).toBeInstanceOf(Error);
+      expect(thrown.code).toBe("vault-search-removed");
+      expect(thrown.message).toMatch(new RegExp(`^vault search was removed: ${name}\\(\\)`, "u"));
+      expect(thrown.message).toMatch(/\brg\b.*vault get/su);
+    }
+  });
+});

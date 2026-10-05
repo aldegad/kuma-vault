@@ -1,39 +1,82 @@
 #!/usr/bin/env bash
 # Rehearsal "S": the whole driver, steps pre-13b, on a Linux server scratch directory. The
-# server blocks are the real ones (real serve, real server config, a scratch store id); the
-# client role is a synthetic vault on the same machine, the agent runtime is kuma-sim.sh.
+# server blocks are the real ones; they run against a scratch `vault serve` of their own — its
+# own server configuration, port, data directory, token and backup credentials under $RT — so a
+# server that already serves live stores is not touched (its configuration and data directory
+# are fingerprinted at setup and compared at teardown). The client role is a synthetic vault on
+# the same machine, the agent runtime is kuma-sim.sh.
 #
 #   RT=<scratch dir> STORE=<scratch store id> server-s.sh setup | <scenario>... | teardown
-#   scenarios: nogo success drift fail7 fail8 fail10 idem wait unknown rbinc corestop warmwrite freeze_gc slowversion
+#   main mode:      nogo success drift fail7 fail8 fail10 idem wait unknown rbinc corestop warmwrite freeze_gc slowversion
+#   secondary mode: sec_success sec_rename sec_busy sec_refs sec_mustignore sec_fail10
 #
-# Needs: passwordless sudo, an installed engine (/opt/kuma-vault/current), its node, git-lfs,
-# restic, the filter-repo file (FILTER_REPO), the rehearsal result (REHEARSAL_JSON), the tool
-# list (TOOLS_SHA256), an engine git checkout with history (ENGINE_CK).
+# Needs: passwordless sudo, the serve user (an installed engine made it), node, git-lfs, restic,
+# the filter-repo file (FILTER_REPO), the rehearsal result (REHEARSAL_JSON), the tool list
+# (TOOLS_SHA256), a clean engine git checkout of the commit under test (ENGINE_CK): setup
+# unpacks that commit as the engine the server blocks and the client use.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 DRV=$(dirname "$HERE")
 : "${RT:?}" "${STORE:?}" "${FILTER_REPO:?}" "${REHEARSAL_JSON:?}" "${TOOLS_SHA256:?}" "${ENGINE_CK:?}"
-E=$(readlink -f /opt/kuma-vault/current); NODEB=/opt/node/current/bin
-VS="sudo env PATH=$NODEB:/usr/bin:/bin $E/bin/vault"
+NODEB=${NODEB:-/opt/node/current/bin}; SERVE_USER=${SERVE_USER:-kuma-vault}; PORT=${PORT:-17761}
+SHA=$(git -C "$ENGINE_CK" rev-parse HEAD)
+E=$RT/runtime/$SHA
+# the configuration has a directory of its own, like /etc/kuma-vault: a backup takes that directory
+CFG=$RT/etc/server.json; VAULTS=$RT/vaults; CRED=$RT/etc/credentials; BACKUP_REPO=$VAULTS/backup-restic
+VS="sudo env PATH=$NODEB:/usr/bin:/bin KUMA_VAULT_SERVER_CONFIG=$CFG $E/bin/vault"
 TOKEN_ID=${TOKEN_ID:-c8a-rehearsal}
-CFG=/etc/kuma-vault/server.json
-URL=http://127.0.0.1:7741
+EXISTING=${EXISTING:-s-existing}             # the store a secondary cutover finds already served
+PROD_CFG=${PROD_CFG:-/etc/kuma-vault/server.json}; PROD_VAULTS=${PROD_VAULTS:-/data/vaults}
+URL=http://127.0.0.1:$PORT
 REC=$RT/receipts
 mkdir -p "$RT" "$REC"
 export PATH=$NODEB:$PATH
 
 say() { printf '\n### %s %s\n' "$(date +%T)" "$*"; }
 registered() { sudo jq -e --arg s "$1" '.stores | has($s)' "$CFG" >/dev/null; }
-unregister() {
-  sudo env PATH="$NODEB:/usr/bin:/bin" node --input-type=module -e "
-    import { loadServerConfig, writeServerConfig } from '$E/src/server/server-config.mjs';
-    const [p, id] = process.argv.slice(1); const c = loadServerConfig(p); delete c.stores[id]; writeServerConfig(p, c);" "$CFG" "$1"
+# what the live server looks like: must be the same before and after
+production() {
+  echo "config sha256: $(sudo sha256sum "$PROD_CFG" 2>/dev/null | cut -d' ' -f1)"
+  echo "stores: $(sudo jq -c '.stores | keys' "$PROD_CFG" 2>/dev/null)"
+  echo "backup.stores: $(sudo jq -c '.backup.stores' "$PROD_CFG" 2>/dev/null)"
+  echo "data entries: $(sudo ls "$PROD_VAULTS" 2>/dev/null | tr '\n' ' ')"
+  echo "serve: $(systemctl is-active kuma-vault-serve 2>&1 || true)"
+  echo "backup timer: $(systemctl is-enabled kuma-vault-backup.timer 2>&1 || true)"
 }
+# the scratch server configuration from nothing: token auth, no store, a backup block with the
+# scratch credentials (so a backup never reads the machine's own credentials)
+write_config() {
+  sudo env PATH="$NODEB:/usr/bin:/bin" node --input-type=module -e "
+    import { readFileSync } from 'node:fs';
+    import { hashToken, writeServerConfig } from '$E/src/server/server-config.mjs';
+    const [path, port, data, tokenId, tokenFile, cred, repo] = process.argv.slice(1);
+    writeServerConfig(path, { version: 1, listen: ['127.0.0.1:' + port], dataDir: data, auth: { mode: 'token' },
+      tokens: [{ id: tokenId, sha256: hashToken(readFileSync(tokenFile, 'utf8').trim()), role: 'writer', stores: ['*'] }],
+      stores: {}, backup: { repository: repo, host: 'rehearsal', credentialsDir: cred, stores: null } });
+  " "$CFG" "$PORT" "$VAULTS" "$TOKEN_ID" "$RT/token" "$CRED" "$BACKUP_REPO"
+  sudo chown "$SERVE_USER:$SERVE_USER" "$CFG"
+}
+serve_up() { curl -fs "$URL/v1/health" >/dev/null 2>&1; }
 
 setup() {
   say setup
-  if ! sudo jq -e --arg t "$TOKEN_ID" '[.tokens[].id] | index($t)' "$CFG" >/dev/null; then
-    (umask 077; $VS server token add --id "$TOKEN_ID" --store '*' --role writer --note "cutover driver rehearsal, removed after" > "$RT/token")
+  [ -z "$(git -C "$ENGINE_CK" status --porcelain)" ] || { echo "ENGINE_CK is not clean" >&2; exit 1; }
+  production > "$REC/production-before.txt"
+  if [ ! -d "$E" ]; then mkdir -p "$E"; git -C "$ENGINE_CK" archive HEAD | tar -x -C "$E"; fi
+  ln -sfn "$SHA" "$RT/runtime/current"
+  [ -f "$RT/token" ] || (umask 077; head -c 24 /dev/urandom | base64 | tr -d '/+=' > "$RT/token")
+  sudo install -d -o root -g root -m 0755 "$RT/etc"
+  sudo install -d -o root -g root -m 0700 "$CRED"
+  sudo test -f "$CRED/restic-password" || for f in restic-password s3-access-key-id s3-secret-access-key; do
+    head -c 24 /dev/urandom | base64 | sudo tee "$CRED/$f" >/dev/null; sudo chmod 0600 "$CRED/$f"; done
+  sudo install -d -o "$SERVE_USER" -g "$SERVE_USER" -m 0750 "$VAULTS"
+  write_config
+  if ! serve_up; then
+    ! ss -ltn | grep -q ":$PORT " || { echo "port $PORT is taken" >&2; exit 1; }
+    sudo -u "$SERVE_USER" env PATH="$NODEB:/usr/bin:/bin" setsid nohup "$NODEB/node" "$E/src/server/server-cli.mjs" \
+      serve --config "$CFG" > "$RT/serve.log" 2>&1 < /dev/null &
+    for _ in $(seq 1 50); do serve_up && break; sleep 0.2; done
+    serve_up || { echo "scratch serve did not come up" >&2; tail -20 "$RT/serve.log" >&2; exit 1; }
   fi
   # a fake runtime-repo history: backup change B0 on main, landed runtime change C1, installed app C2 (after C1)
   rm -rf "$RT/studio"; git init -q -b main "$RT/studio"
@@ -55,20 +98,29 @@ stop_syncd() {
   ! pgrep -f "syncd --repo $RT/" >/dev/null
 }
 
-teardown_store() {
+# the scratch server back to its start: no client daemon, no mount, an empty data directory, the
+# configuration from nothing. `secondary`: one store already served and in backup.stores, the
+# backup repository initialised — what a secondary cutover finds.
+reset_server() {
   stop_syncd
-  if sudo jq -e '.backup != null' "$CFG" >/dev/null; then $VS server backup unconfigure; $VS server install >/dev/null; fi
-  registered "$STORE" && unregister "$STORE"
-  # the backup drill leaves its (empty) work dir in the data dir: ours, from the 13b rehearsal
-  sudo rm -rf "/data/vaults/${STORE:?}" "/data/vaults/${STORE}-restic" /data/vaults/.backup-drill
   for m in $(findmnt -rn -o TARGET | grep "^$RT/" || true); do sudo umount "$m"; done
+  sudo find "${VAULTS:?}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  write_config
+  if [ "${1:-main}" = secondary ]; then
+    $VS server init-store "$EXISTING" --owner rehearsal@example.invalid >/dev/null
+    $VS server backup configure --stores "$EXISTING" >/dev/null 2>&1
+    sudo env RESTIC_PASSWORD_FILE="$CRED/restic-password" restic init --repo "$BACKUP_REPO" >/dev/null
+    sudo chown -R "$SERVE_USER:$SERVE_USER" "$BACKUP_REPO"
+  fi
+  sleep 1.2      # serve re-reads its configuration at most once a second
 }
 
 # a fresh case directory: client repo, home, links, stores file, plans, gate, config
 fresh() {
   local name=$1 c4c=${2:-C1}
-  teardown_store
+  reset_server main
   C=$RT/case-$name; sudo rm -rf "$C"; mkdir -p "$C/home/.kuma" "$C/srv" "$C/plans/p" "$C/sim"
+  CREPO=$C/mac/kuma-brain; CSNAP=$C/srv/kuma-brain
   "$HERE/make-synth-vault.sh" "$C/mac/kuma-brain" "$E" > "$C/synth-head"
   ln -s "$C/mac/kuma-brain/vault" "$C/home/.kuma/vault"; ln -s "$C/mac/kuma-brain/vault/plans" "$C/home/.kuma/plans"
   printf '{\n  "stores": {\n    "kuma-brain": "%s"\n  }\n}\n' "$C/home/.kuma/vault" > "$C/home/.kuma/vault-stores.json"
@@ -103,7 +155,7 @@ cfg = {
    "beforeFreeze": [[V, "sync", "--root", C + "/mac/kuma-brain/vault"]],
    "storeCommands": [["store", "rename", "kuma-brain", STORE, "--root", NC + "/vault"],
                      ["store", "set", STORE, "--mode", "remote", "--server", URL, "--remote-store", STORE,
-                      "--search", "remote", "--lfs-cache-max-gb", "10", "--token-file", RT + "/token", "--default"]],
+                      "--lfs-cache-max-gb", "10", "--token-file", RT + "/token", "--default"]],
    "cloneUrl": URL + "/v1/stores/" + STORE + ".git", "cloneTokenFile": RT + "/token",
    "projectsJson": C + "/home/.kuma/projects.json", "kumaStudio": RT + "/studio",
    "daemonInstall": ["cd / && nohup %s syncd --repo %s > %s/syncd.log 2>&1 &" % (V, NC, C)],
@@ -113,7 +165,7 @@ cfg = {
  "prereq": {"studioBackupCommit": open(RT + "/studio-B0").read().strip(), "studioMainRef": "main",
             "c4cLandedSha": open(RT + "/studio-$c4c").read().strip(),
             "launcherVersionCmd": sim("control", "launcher-version", "--json"),
-            "coreVersionCmd": sim("control", "core-version"), "engineMasterRef": "master",
+            "coreVersionCmd": sim("control", "core-version"), "engineMasterRef": "HEAD",
             "checks": ["sudo -n true", ["git", "--version"]]},
  "c14d": {"summary": C + "/c14d-summary.json", "maxAgeHours": 6},
  "core": {"statusCmd": sim("status"), "waitMinutes": 0.1, "pollSeconds": 2,
@@ -126,10 +178,13 @@ cfg = {
             "extraDeletePathsRel": "vault/projects/kuma-vault/remote-brain/rewrite-extra-delete-paths.txt",
             "filterRepo": "$FILTER_REPO", "workRoot": RT, "receipts": C + "/srv/receipts",
             "ignoreTokenIds": ["$TOKEN_ID"],
-            "backup": {"repository": "/data/vaults/" + STORE + "-restic", "credentialFiles": ["restic-password"],
-                       "initLocalRepository": True}},
+            # the scratch server: its own engine, configuration and data directory; no systemd unit is written
+            "engineLink": RT + "/runtime/current", "vaultsDir": "$VAULTS", "serverConfig": "$CFG",
+            "healthUrl": URL + "/v1/health", "installUnits": False,
+            "backup": {"repository": "$BACKUP_REPO", "host": "rehearsal", "credentialsDir": "$CRED",
+                       "credentialFiles": ["restic-password"], "initLocalRepository": True}},
  "smoke": {"planFile": "vault/plans/kuma-vault/c8-smoke.md", "logFile": "vault/_c8-smoke/log.md",
-           "searchQuery": "note", "blobPath": "vault/domains/a/_assets/big.png",
+           "blobPath": "vault/domains/a/_assets/big.png",
            "rejectPath": "vault/domains/a/_assets/scratch/x.png", "bigPath": "vault/_c8-smoke/too-big.txt",
            "launchdRestart": False},
  "notify": {"command": sim("notify")},
@@ -145,17 +200,20 @@ PY
 snapshot_client() {
   local C=${C:?}
   echo "freeze=$([ -e "$C/home/.kuma/vault-freeze.json" ] && echo present || echo absent)"
-  echo "repo=$([ -d "$C/mac/kuma-brain/.git" ] && echo present || echo absent)"
-  echo "renamed=$([ -e "$C/mac/kuma-brain.pre-cutover" ] && echo present || echo absent)"
-  echo "link.vault=$(readlink "$C/home/.kuma/vault")"
-  echo "link.plans=$(readlink "$C/home/.kuma/plans")"
+  echo "repo=$([ -d "$CREPO/.git" ] && echo present || echo absent)"
+  echo "repo.kind=$(stat -c %F "$CREPO" 2>/dev/null || echo absent)"
+  echo "renamed=$([ -e "$CREPO.pre-cutover" ] && echo present || echo absent)"
+  echo "link.vault=$(readlink "$C/home/.kuma/vault" 2>/dev/null || echo none)"
+  echo "link.plans=$(readlink "$C/home/.kuma/plans" 2>/dev/null || echo none)"
   echo "stores=$(sha256sum < "$C/home/.kuma/vault-stores.json" | cut -c1-16)"
   echo "newclone=$([ -e "$C/home/.kuma/vaults/$STORE" ] && echo present || echo absent)"
   echo "store.registered=$(registered "$STORE" && echo yes || echo no)"
-  echo "store.dir=$(sudo test -e "/data/vaults/$STORE" && echo present || echo absent)"
+  echo "store.dir=$(sudo test -e "$VAULTS/$STORE" && echo present || echo absent)"
+  echo "server.stores=$(sudo jq -c '.stores | keys' "$CFG")"
+  echo "server.backup.stores=$(sudo jq -c '.backup.stores' "$CFG")"
   echo "server.workdir=$([ -e "$C/srv/work/c8" ] && echo present || echo absent)"
   echo "core=$(cat "$C/sim/core")"
-  echo "srv.notowned=$( [ -d "$C/srv/kuma-brain" ] && sudo find "$C/srv/kuma-brain" ! -user "$(id -un)" | wc -l || echo 0)"
+  echo "srv.notowned=$( [ -d "$CSNAP" ] && sudo find "$CSNAP" ! -user "$(id -un)" | wc -l || echo 0)"
 }
 
 # a change to the staged configuration the driver runs with: a python statement on c
@@ -201,7 +259,9 @@ out = {"scenario": name, "driverExit": int(rc), "outcome": st.get("outcome"), "r
        "rollback": st.get("rollback"),
        "values": {k: st["values"].get(k) for k in ("HEAD_pre", "HEAD_final", "pointerCommit", "cutoverTip", "drift",
                                                     "sessionsCutAtStop", "coreAlreadyStopped", "statusUnknown", "macClone", "stage8", "smoke", "server13",
-                                                    "backup13b", "c9Ready", "refmap")},
+                                                    "backup13b", "c9Ready", "refmap", "freezeStore", "projectSessionsAtFreeze",
+                                                    "projectFrozen", "refsPre", "refs4", "mustIgnorePre", "mustIgnore", "alarms",
+                                                    "oldPathLinked", "platformNoise")},
        "simEvents": open(C + "/sim/events").read().splitlines() if os.path.exists(C + "/sim/events") else []}
 for f in ("before.txt", "after.txt", "restore-diff.txt"):
     if os.path.exists(os.path.join(C, f)):
@@ -239,7 +299,7 @@ s_drift() {
 s_fail7() {
   fresh fail7
   $RUN --stop-after 6
-  sudo mkdir -p "/data/vaults/$STORE"; sudo touch "/data/vaults/$STORE/origin.git"     # step 7 must refuse
+  sudo mkdir -p "$VAULTS/$STORE"; sudo touch "$VAULTS/$STORE/origin.git"     # step 7 must refuse
   local rc=0; $RUN || rc=$?
   receipt fail7 "$rc"; [ "$rc" = 4 ]
   expect_restored fail7
@@ -299,7 +359,7 @@ s_unknown() {
 s_rbinc() {
   fresh rbinc
   $RUN --stop-after 6
-  sudo mkdir -p "/data/vaults/$STORE"; sudo touch "/data/vaults/$STORE/origin.git"     # step 7 must refuse (as fail7)
+  sudo mkdir -p "$VAULTS/$STORE"; sudo touch "$VAULTS/$STORE/origin.git"     # step 7 must refuse (as fail7)
   touch "$C/sim/start-fails"                                                          # and the runtime start (undo of 2) fails
   local rc=0; $RUN || rc=$?
   receipt rbinc "$rc"; [ "$rc" = 6 ]
@@ -391,28 +451,269 @@ s_slowversion() {
   receipt slowversion "$rc"; [ "$rc" = 0 ]
 }
 
-final_cleanup() {
-  say teardown
-  teardown_store
-  sudo jq -e --arg t "$TOKEN_ID" '[.tokens[].id] | index($t)' "$CFG" >/dev/null && $VS server token rm --id "$TOKEN_ID"
-  rm -f "$RT/token"
-  sudo rm -rf "$RT"/case-*
-  {
-    echo "vaults entries: $(sudo find /data/vaults -mindepth 1 -maxdepth 1 | wc -l)"
-    echo "config clean: $(sudo jq -e '(.stores | length) == 0 and (.tokens | length) == 0' "$CFG")"
-    echo "backup block: $(sudo jq -c .backup "$CFG")"
-    echo "backup timer: $(systemctl is-enabled kuma-vault-backup.timer 2>&1 || true)"
-    echo "mounts under $RT: $(findmnt -rn -o TARGET | grep -c "^$RT/" || true)"
-    echo "client daemons under $RT: $(pgrep -fc "syncd --repo $RT/" || true)"
-    echo "serve: $(systemctl is-active kuma-vault-serve)"; curl -s "$URL/v1/health" | jq -c '{ok, configError}'
-  } | tee "$REC/cleanup.txt"
+# --- secondary mode --------------------------------------------------------------------------
+
+# a fresh secondary case: the old vault declares <old id>, the server already serves $EXISTING and
+# backs it up, the machine has a main store registered that the cutover must leave alone.
+#   fresh_sec <name> same|rename      same: the store keeps its id; rename: <STORE>-old -> STORE
+fresh_sec() {
+  local name=$1 kind=${2:-same}
+  reset_server secondary
+  C=$RT/case-$name; sudo rm -rf "$C"; mkdir -p "$C/home/.kuma/main-live" "$C/srv" "$C/plans/p" "$C/sim"
+  OLDID=$STORE; [ "$kind" = rename ] && OLDID=$STORE-old
+  CREPO=$C/mac/second-vault; CSNAP=$C/srv/old
+  # the renamed store has no commit reference in its text: step 6 rewrites nothing and commits nothing
+  "$HERE/make-synth-vault.sh" "$CREPO" "$E" secondary "$OLDID" "$([ "$kind" = rename ] && echo noref || echo ref)" > "$C/synth-head"
+  printf '{\n  "stores": {\n    "main-live": "%s",\n    "%s": "%s"\n  }\n}\n' "$C/home/.kuma/main-live" "$OLDID" "$CREPO" > "$C/home/.kuma/vault-stores.json"
+  printf '{"other": "%s", "second": {"repo": "%s"}}\n' "$RT/other" "$CREPO" > "$C/home/.kuma/projects.json"
+  for p in p1 p2; do printf -- '---\nstatus: completed\n---\n' > "$C/plans/p/$p.md"; done
+  # the client daemon commits as the machine's user (its autosave needs an identity)
+  git config --file "$C/home/.gitconfig" user.name synth; git config --file "$C/home/.gitconfig" user.email synth@localhost
+  mkdir -p "$CSNAP"
+  cat > "$C/gate.json" <<JSON
+{"plansDir": "$C/plans", "prerequisites": ["p/p1", "p/p2"],
+ "rehearsal": "$REHEARSAL_JSON", "server": {"ssh": null, "dataPath": "/data", "snapshotPath": "$CSNAP"},
+ "mac": {"repo": "$CREPO"}, "diskReserveGB": 8, "marginGB": 5}
+JSON
+  echo up > "$C/sim/core"
+  printf 'kuma-vault\tsniffed\tworking (sniffing)\nother-project\tbusy\tworking\n' > "$C/sim/working"   # other projects at work
+  local K="$HERE/kuma-sim.sh" V="$E/bin/vault" NC=$C/home/.kuma/vaults/$STORE
+  python3 - "$C" "$kind" <<PYSEC
+import json, sys
+C, kind = sys.argv[1:]
+K, V, NC, RT, STORE, OLDID, URL, REPO = "$K", "$V", "$NC", "$RT", "$STORE", "$OLDID", "$URL", "$CREPO"
+sim = lambda *a: [K] + list(a)
+store_set = ["store", "set", STORE, "--root", NC, "--mode", "remote", "--server", URL, "--remote-store", STORE,
+             "--lfs-cache-max-gb", "10", "--token-file", RT + "/token"]
+cfg = {
+ "mode": "secondary",
+ "workDir": C + "/c8work", "plan": "rehearsal/plan", "freezeReason": "secondary cutover rehearsal",
+ "launchdLabel": "ai.kuma-vault.cutover-driver.rehearsal",
+ "gate": C + "/gate.json",
+ "env": {"PATH": "$NODEB:/usr/local/bin:/usr/bin:/bin", "SIM_DIR": C + "/sim"},
+ "mac": {
+   "repo": REPO, "engine": "$ENGINE_CK", "toolsSha256": "$TOOLS_SHA256",
+   "vault": [V], "freezeFile": C + "/home/.kuma/vault-freeze.json", "rsync": "rsync",
+   "newClone": NC, "links": [], "storesFile": C + "/home/.kuma/vault-stores.json",
+   "beforeFreeze": [[V, "sync", "--root", REPO]],
+   "storeCommands": ([["store", "rename", OLDID, STORE, "--root", NC]] if kind == "rename" else []) + [store_set],
+   "cloneUrl": URL + "/v1/stores/" + STORE + ".git", "cloneTokenFile": RT + "/token",
+   "projectsJson": C + "/home/.kuma/projects.json",
+   # a list argument with ~ (expanded by the driver), then the client daemon
+   "daemonInstall": [sim("daemon", "install", "~/.kuma/vaults/" + STORE),
+                     "cd / && nohup %s syncd --repo %s > %s/syncd.log 2>&1 &" % (V, NC, C)],
+   "backupRetarget": [],
+   "env": {"HOME": C + "/home", "GIT_AUTHOR_NAME": "synth", "GIT_AUTHOR_EMAIL": "synth@localhost",
+           "GIT_COMMITTER_NAME": "synth", "GIT_COMMITTER_EMAIL": "synth@localhost"}},
+ "prereq": {"engineMasterRef": "HEAD", "checks": ["sudo -n true"]},
+ "project": {"id": "second", "statusCmd": sim("status", "--project", "second"),
+             "freezeCommands": [sim("route", "disconnect", "chat-1"), sim("routine", "pause", "second-backup")],
+             "undoCommands": [sim("route", "connect", "chat-1", "--project", "second"), sim("routine", "resume", "second-backup")],
+             "releaseCommands": [sim("route", "connect", "chat-1", "--project", STORE)],
+             "waitMinutes": 0.1, "pollSeconds": 2},
+ "core": {"controlStatusCmd": sim("control", "status"), "stopCmd": sim("control", "stop-core"),
+          "startCmd": sim("control", "start"), "aliveCmd": sim("control", "alive")},
+ "server": {"ssh": None, "work": C + "/srv/work/c8", "snapshot": "$CSNAP", "store": STORE,
+            "tree": "", "sourceBranch": "main",
+            "owner": "rehearsal@example.invalid", "allowedRemote": URL + "/v1/stores/" + STORE + ".git",
+            "commitMapRel": "_meta/commit-map.tsv", "rejectRel": "binaries-reject.json",
+            "mustIgnore": ["intake/r1/a/source/app.py", "intake/r2/b/source/lib/util.js"],
+            "filterRepo": "$FILTER_REPO", "workRoot": RT, "receipts": C + "/srv/receipts",
+            "engineLink": RT + "/runtime/current", "vaultsDir": "$VAULTS", "serverConfig": "$CFG",
+            "healthUrl": URL + "/v1/health", "installUnits": False},
+ "smoke": {"planFile": None, "logFile": "_smoke/log.md", "blobPath": "assets/big.png",
+           "rejectPath": "scratch/x.png", "bigPath": "_smoke/too-big.txt", "launchdRestart": False,
+           "alarmsWaitSeconds": 180, "alarmsPollSeconds": 5},
+ "notify": {"command": sim("notify")},
+}
+json.dump(cfg, open(C + "/c8.json", "w"), indent=2)
+PYSEC
+  python3 "$DRV/driver.py" stage --config "$C/c8.json" > /dev/null
+  RUN="python3 $C/c8work/driver/driver.py run --config $C/c8work/c8.json"
+  snapshot_client > "$C/before.txt"
 }
 
+# the runtime stand-in was never called with this (the events file may not exist yet)
+never() { if grep -q "$1" "$C/sim/events" 2>/dev/null; then echo "unexpected runtime call: $1"; return 1; fi; }
+
+# what a finished secondary cutover must look like, on the client and on the scratch server
+check_sec_done() {
+  local NC=$C/home/.kuma/vaults/$STORE old_merges
+  [ "$(jq -r .values.c9Ready "$C/c8work/state.json")" = true ]
+  # the runtime was never stopped; the project was frozen and released in order
+  never 'control stop-core'; [ "$(cat "$C/sim/core")" = up ]
+  grep 'route \|routine ' "$C/sim/events" | cut -d' ' -f2- > "$C/project-events.txt"
+  diff "$C/project-events.txt" - <<EOF
+route disconnect chat-1
+routine pause second-backup
+route connect chat-1 --project $STORE
+EOF
+  # the freeze named the old store only and is gone; the old path is a link to the new clone
+  [ "$(jq -r .values.freezeStore "$C/c8work/state.json")" = "$OLDID" ]
+  [ ! -e "$C/home/.kuma/vault-freeze.json" ]
+  [ -L "$CREPO" ]; [ "$(readlink "$CREPO")" = "$NC" ]; [ -d "$CREPO.pre-cutover/.git" ]
+  # the tree is the root, the merges are there, the derived cache is out of history, the print file is a pointer
+  [ "$(jq -r .id "$NC/vault.config.json")" = "$STORE" ]
+  old_merges=$(git -C "$CREPO.pre-cutover" rev-list --merges --count HEAD)
+  [ "$old_merges" = 2 ]; [ "$(git -C "$NC" rev-list --merges --count HEAD)" = 2 ]
+  [ -n "$(git -C "$CREPO.pre-cutover" log --all --format=%H -- .graph)" ]
+  [ -z "$(git -C "$NC" log --all --format=%H -- .graph)" ]
+  git -C "$NC" lfs ls-files | grep -q 'models/part.stl'
+  [ -f "$NC/_meta/commit-map.tsv" ]
+  # step 6: the reference to the first commit is rewritten (same-id case), or nothing is (rename case)
+  if [ "$OLDID" = "$STORE" ]; then
+    grep -q "see $(git -C "$NC" rev-list --max-parents=0 HEAD) for the start" "$NC/notes/a.md"
+  else
+    ! grep -q 'for the start' "$NC/notes/a.md"; [ "$(jq -r .values.refmap.candidates "$C/c8work/state.json")" = 0 ]
+  fi
+  # the cloned-source place: declared (generated block), probed at 6, 8 and by a real file in 12
+  sed -n '/>>> kuma-vault generated: binaries.reject/,/<<< kuma-vault generated: binaries.reject/p' "$NC/.gitignore" | grep -qxF 'intake/**/source/'
+  jq -e '.values.mustIgnore["6"].missing == [] and .values.mustIgnore["8"].missing == [] and
+         (.values.smoke.mustIgnore | .ok and .ignored and (.committed | not) and (.onServer | not))' "$C/c8work/state.json" >/dev/null
+  # the alarms were judged after the release; the daemon install argument was expanded
+  jq -e '.values.alarms.ok == true and .values.smoke.plan.skipped != null and (.values.smoke | has("alarms") | not)' "$C/c8work/state.json" >/dev/null
+  grep -q "daemon install $HOME/.kuma/vaults/$STORE" "$C/sim/events"
+  # the server: the store joined backup.stores next to the one already there, its first backup and drill are ok
+  [ "$(sudo jq -c '.backup.stores' "$CFG")" = "$(jq -nc --arg a "$EXISTING" --arg b "$STORE" '[$a, $b]')" ]
+  [ "$(sudo jq -c '.stores | keys' "$CFG")" = "$(jq -nc --arg a "$EXISTING" --arg b "$STORE" '[$a, $b] | sort')" ]
+  $VS server backup status --store "$STORE" | jq -e --arg s "$STORE" '.[$s].lastResult == "ok" and .[$s].lastDrill.result == "ok"' >/dev/null
+  # the machine's main store entry is as it was
+  [ "$(jq -r '.stores["main-live"] | if type == "object" then .root else . end' "$C/home/.kuma/vault-stores.json")" = "$C/home/.kuma/main-live" ]
+}
+
+s_sec_success() {
+  fresh_sec sec_success same            # the store keeps its id: the freeze reaches the new clone too
+  $RUN --stop-after 11
+  local NC=$C/home/.kuma/vaults/$STORE
+  # A file the daemon is due to save while the store is frozen (old enough to be past the quiet
+  # time; a data file, not a page — a new page would make the folder index drift): the commit gate
+  # refuses the autosave, and the status says so. Judged in step 12, that is a failed smoke.
+  echo 'written during the freeze' > "$NC/notes/during-freeze.txt"; touch -d '10 minutes ago' "$NC/notes/during-freeze.txt"
+  local t=0       # the daemon step 11 started is up before anything nudges it
+  until { HOME=$C/home "$E/bin/vault" sync status --json --repo "$NC" || true; } | jq -e '.daemon.running == true' >/dev/null; do
+    t=$((t + 1)); [ "$t" -lt 30 ]; sleep 1
+  done
+  HOME=$C/home "$E/bin/vault" sync now --repo "$NC" > /dev/null || true
+  HOME=$C/home "$E/bin/vault" sync status --json --repo "$NC" > "$C/status-frozen.json" || true
+  jq -e '.problems | map(select(test("동결"))) | length > 0' "$C/status-frozen.json" >/dev/null
+  jq -c '{problems}' "$C/status-frozen.json" > "$REC/sec_success-status-while-frozen.json"
+  # the alarms are judged in 13, after the release: the daemon saves the file and the server has it
+  local rc=0; $RUN || rc=$?
+  receipt sec_success "$rc"; [ "$rc" = 0 ]
+  check_sec_done
+  t=0
+  until git -C "$NC" fetch -q origin && git -C "$NC" cat-file -e origin/main:notes/during-freeze.txt 2>/dev/null; do
+    t=$((t + 1)); [ "$t" -lt 30 ]; sleep 2
+  done
+}
+s_sec_rename() {
+  fresh_sec sec_rename rename           # the store is renamed on the way (<STORE>-old -> STORE)
+  # lock and temporary files that come and go while steps 0-4 copy (ignored names)
+  ( n=0; while [ ! -e "$C/churn-stop" ]; do
+      mkdir -p "$CREPO/.fts"; head -c 2048 /dev/urandom > "$CREPO/.fts/tmp-$n"; head -c 512 /dev/urandom > "$CREPO/notes/w$n.tmp"
+      rm -f "$CREPO/.fts/tmp-$n" "$CREPO/notes/w$n.tmp"; n=$((n + 1)); echo "$n" > "$C/churn-count"
+    done ) > /dev/null 2>&1 &
+  local churn=$! rc=0
+  $RUN --stop-after 4 || rc=$?
+  touch "$C/churn-stop"; wait "$churn" || true
+  [ "$rc" = 0 ]; [ "$(cat "$C/churn-count")" -gt 10 ]
+  echo "junk files created and removed during steps pre-4: $(cat "$C/churn-count")" > "$REC/sec_rename-churn.txt"
+  $RUN || rc=$?
+  receipt sec_rename "$rc"; [ "$rc" = 0 ]
+  check_sec_done
+  jq -e --arg o "$OLDID" '.stores | has($o) | not' "$C/home/.kuma/vault-stores.json" >/dev/null
+}
+s_sec_busy() {
+  fresh_sec sec_busy same
+  printf 'second\tworker-b\tworking\nother-project\tbusy\tworking\n' > "$C/sim/working"   # a member of the project at work
+  local rc=0; $RUN || rc=$?
+  receipt sec_busy "$rc"; [ "$rc" = 3 ]
+  jq -r .reason "$C/c8work/state.json" | grep -q "project second: 1 working session"
+  never 'control stop-core'
+  grep -q 'route connect chat-1 --project second' "$C/sim/events"     # the undo of the freeze commands
+  expect_restored sec_busy
+}
+s_sec_refs() {
+  fresh_sec sec_refs same
+  # a tree ref (an agent's turn checkpoint): pre says no
+  git -C "$CREPO" update-ref refs/agent/checkpoints/1 "$(git -C "$CREPO" rev-parse 'HEAD^{tree}')"
+  local rc=0; $RUN || rc=$?
+  receipt sec_refs-pre "$rc"; [ "$rc" = 3 ]
+  jq -r .reason "$C/c8work/state.json" | grep -q 'ref: refs/agent/checkpoints/1 (tree)'
+  git -C "$CREPO" update-ref -d refs/agent/checkpoints/1
+  expect_restored sec_refs-pre
+  # the ref comes back after pre (between the freeze and the last copy): step 4 reads it on the server copy
+  $RUN --stop-after 3
+  git -C "$CREPO" update-ref refs/agent/checkpoints/2 "$(git -C "$CREPO" rev-parse 'HEAD^{tree}')"
+  rc=0; $RUN || rc=$?
+  receipt sec_refs "$rc"; [ "$rc" = 4 ]
+  jq -r .reason "$C/c8work/state.json" | grep -q 'refs on the server copy'
+  git -C "$CREPO" update-ref -d refs/agent/checkpoints/2
+  expect_restored sec_refs
+}
+s_sec_mustignore() {
+  fresh_sec sec_mustignore same
+  # the reject list loses the cloned-source place; the hand-written .gitignore line is still there
+  printf '{\n  "reject": [\n    "scratch/"\n  ]\n}\n' > "$CREPO/binaries-reject.json"
+  git -C "$CREPO" check-ignore -q --no-index intake/r1/a/source/app.py       # the old safety net does ignore it
+  local rc=0; $RUN || rc=$?
+  receipt sec_mustignore "$rc"; [ "$rc" = 3 ]
+  jq -r .reason "$C/c8work/state.json" | grep -q 'mustIgnore place not in the generated reject block: intake/r1/a/source/app.py'
+  never 'route disconnect'
+  git -C "$CREPO" checkout -q -- binaries-reject.json
+  expect_restored sec_mustignore
+}
+s_sec_fail10() {
+  fresh_sec sec_fail10 rename
+  $RUN --stop-after 9
+  setcfg 'c["mac"]["storeCommands"].append(["store", "show", "no-such-store"])'   # step 10 fails after the old path became a link
+  local rc=0; $RUN || rc=$?
+  receipt sec_fail10 "$rc"; [ "$rc" = 4 ]
+  grep -q 'route connect chat-1 --project second' "$C/sim/events"
+  expect_restored sec_fail10
+}
+
+final_cleanup() {
+  say teardown
+  stop_syncd
+  for m in $(findmnt -rn -o TARGET | grep "^$RT/" || true); do sudo umount "$m"; done
+  sudo pkill -u "$SERVE_USER" -f "serve --config $CFG" || true
+  for _ in $(seq 1 25); do serve_up || break; sleep 0.2; done
+  production > "$REC/production-after.txt"
+  sudo rm -rf "$RT"/case-* "$VAULTS" "$RT/etc" "$RT/runtime" "$RT/studio" "$RT/other"
+  rm -f "$RT/token" "$RT"/studio-*
+  {
+    echo "live server before = after: $(cmp -s "$REC/production-before.txt" "$REC/production-after.txt" && echo same || echo DIFFERENT)"
+    sed 's/^/  /' "$REC/production-after.txt"
+    echo "scratch serve on $URL: $(serve_up && echo STILL-UP || echo stopped)"
+    echo "mounts under $RT: $(findmnt -rn -o TARGET | grep -c "^$RT/" || true)"
+    echo "client daemons under $RT: $(pgrep -fc "syncd --repo $RT/" || true)"
+    echo "left in $RT: $(ls "$RT" | tr '\n' ' ')"
+  } | tee "$REC/cleanup.txt"
+  cmp -s "$REC/production-before.txt" "$REC/production-after.txt"
+}
+
+# a scenario that fails leaves its evidence: the driver logs and state, the server work reports
+# and the archived attempt, copied into the receipts (teardown removes the case directories)
+CUR=
+keep_failure() {
+  local rc=$? d
+  if [ "$rc" != 0 ] && [ -n "$CUR" ] && [ -d "$RT/case-$CUR" ]; then
+    d=$REC/failed-$CUR-$(date +%H%M%S); mkdir -p "$d"
+    cp -a "$RT/case-$CUR/c8work/logs" "$RT/case-$CUR/c8work/state.json" "$d/" 2>/dev/null || true
+    sudo cp -a "$RT/case-$CUR/srv/receipts" "$RT/case-$CUR/srv/work/c8/reports" "$d/" 2>/dev/null || true
+    sudo chown -R "$(id -un)" "$d"; echo "kept the failed case's logs in $d" >&2
+  fi
+}
+trap keep_failure EXIT
+
 for s in "$@"; do
+  CUR=$s
   case "$s" in
     setup) setup ;;
     teardown) final_cleanup ;;
-    nogo|success|drift|fail7|fail8|fail10|idem|wait|unknown|rbinc|corestop|warmwrite|freeze_gc|slowversion) say "scenario $s"; "s_$s"; echo "SCENARIO $s PASS" ;;
+    nogo|success|drift|fail7|fail8|fail10|idem|wait|unknown|rbinc|corestop|warmwrite|freeze_gc|slowversion|sec_success|sec_rename|sec_busy|sec_refs|sec_mustignore|sec_fail10)
+      say "scenario $s"; "s_$s"; echo "SCENARIO $s PASS" ;;
     *) echo "unknown $s" >&2; exit 2 ;;
   esac
 done

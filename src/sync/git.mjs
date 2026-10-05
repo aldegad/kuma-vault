@@ -100,14 +100,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /**
  * git with lock-contention retry: a failure whose stderr names an index/ref lock is retried
  * after 200-1500 ms of jitter until `deadlineMs` (default 60 s), then returned or thrown.
+ * `onLocked` runs before each wait: the caller judges the lock it met (stale-locks.mjs removes
+ * one a killed git left) instead of waiting the deadline out on a lock nobody holds.
  */
 export async function gitRetry(args, options = {}) {
-  const { deadlineMs = 60_000, allowFail = false, ...rest } = options;
+  const { deadlineMs = 60_000, allowFail = false, onLocked = null, ...rest } = options;
   const until = Date.now() + deadlineMs;
   for (;;) {
     const result = await git(args, { ...rest, allowFail: true });
     if (result.code === 0) return result;
     if (LOCK_ERROR.test(result.stderr) && Date.now() < until) {
+      onLocked?.();
       await sleep(200 + Math.floor(Math.random() * 1300));
       continue;
     }

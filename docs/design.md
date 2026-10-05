@@ -21,14 +21,13 @@ implements is in [architecture](architecture.md).
 | Part | Path | Notes |
 |---|---|---|
 | CLI | `bin/vault` | one bash entry, exposed as `kuma-vault` and `vault`; engine verbs go to `src/cli/cli.mjs` |
-| Compiler | `src/engine/` | frontmatter, sync, lint, search, FTS, sidecars, enrich, profiles, `vault.config.json` |
+| Compiler | `src/engine/` | frontmatter, sync, lint, get, sidecars, enrich, profiles, `vault.config.json` |
 | Enrich adapter | `src/enrich-adapters/` | spawns the `claude` or `codex` CLI; the only place that runs a model |
 | Remote mode, client | `src/sync/` | `vault clone`, the sync daemon, `vault blob` |
 | Remote mode, server | `src/server/` | `vault serve`, `vault server`; imports nothing from the compiler |
 | Public API | `src/index.mjs` | the barrel below; subpaths `kuma-vault/engine` and `kuma-vault/enrich-adapters` |
 
-Runtime: Node 22.5 or newer, because the search index uses the built-in `node:sqlite`
-(`DatabaseSync`, FTS5) — no native build step. The provider CLIs are needed only for
+Runtime: Node 22.5 or newer — no native build step. The provider CLIs are needed only for
 `--enrich`; `kordoc` only for PDF sidecars, and it is loaded lazily.
 
 ## Public API
@@ -41,8 +40,7 @@ Everything a host needs is exported from `kuma-vault` (`src/index.mjs`):
 | Sync and ingest | `syncVaultIndex`, `rewriteIndex`, `runVaultSync`, `formatVaultSyncReport`, `vaultSyncExitCode`, `ingestGenericSource`, `ingestInbox`, `ingestResultFile`, `ingestResultFileWithGuards`, `resolveResultPathForTaskId`, `inspectExistingPageBodyShape`, `analyzeDocumentRouting` |
 | Self-heal and hooks | `selfHealStaleIndex`, `triggerVaultSyncIndex`, `runVaultLifecycleHook`, `parseTaskFileMetadata` |
 | Lint | `lintVaultFiles`, `formatVaultLintReport` |
-| Search | `searchVault`, `searchVaultStores`, `searchVaultTree`, `searchOneStore`, `getVaultDocuments`, `formatVaultSearchText`, `formatVaultGetText`, `isSearchCorpusPath`, `crossesSecretDir` |
-| FTS | `buildFtsIndex`, `checkFtsIndex`, `healFtsIndex`, `searchFtsIndex`, `resolveFtsDbPath`, `ftsIndexAvailable` |
+| Get | `getVaultDocuments`, `formatVaultGetText`, `crossesSecretDir` (no search: a scoped `rg` over the tree finds pages) |
 | Sidecars | `syncVaultSidecars`, `SIDECAR_EXTRACTORS` |
 | Enrich | `enrichVaultDescriptions` and its field constants; `createCliDescriptionGenerator`, `buildEnrichPrompt`, `parseEnrichResponse`, `SUPPORTED_ENRICH_PROVIDERS` |
 | Contracts | `VAULT_PROFILE`, `DOCS_PROFILE`, `resolveProfile`, `listProfileIds`, `loadVaultDeclaration`, `discoverVaultDeclaration`, `resolveDeclaredProfile`, `resolveVaultContract` |
@@ -62,7 +60,7 @@ host does, so one missing from the barrel or the `exports` map fails there.
 | Which model writes summaries | the host builds a `generateDescription` (usually by calling `createCliDescriptionGenerator({ provider, model })` with its own policy) and passes it to enrich | the CLI reads `{ provider, model }` from `~/.kuma-vault/config.json`, written by [`kuma-vault setup`](setup.md#enrich-provider) |
 | A tree's contract | a profile object, or the tree's own `vault.config.json` | the declaration at the tree's root; no built-in default |
 
-The core compiler — sync, lint, search, FTS, sidecars, enrich, profiles, frontmatter — takes
+The core compiler — sync, lint, get, sidecars, enrich, profiles, frontmatter — takes
 none of these: `syncVaultIndex({ vaultDir, check, maxPasses, profile, trackedDirs })` has no
 host parameter at all. Only result ingest and project attribution are host-shaped, and both
 take their host data as arguments.
@@ -76,12 +74,17 @@ createCliDescriptionGenerator({ provider, model, effort, serviceTier }) => gener
 - `provider` is `"claude"` or `"codex"`; the adapter owns that list.
 - `codex` runs `codex exec --ephemeral --skip-git-repo-check --sandbox read-only --cd <tmp>
   --model <model> --output-last-message <file>` and reads the answer only from that file.
-- `claude` runs `claude --print --output-format text --bare --no-session-persistence
-  --dangerously-skip-permissions --model <model> <prompt>`.
+- `claude` runs `claude --print --output-format text --safe-mode --tools "" --no-session-persistence
+  --model <model> <prompt>`. `--safe-mode` loads none of the user's CLAUDE.md, hooks, MCP servers,
+  skills or plugins and keeps the user's sign-in; `--tools ""` leaves the model no tools. `--bare`
+  is not used: it reads only `ANTHROPIC_API_KEY` or an `apiKeyHelper`, so a subscription sign-in
+  gets "Not logged in".
 - Both run in a fresh empty temporary directory per call, so the model sees only the page it
   summarises.
 - The default model per provider is kept in the adapter (`.model` on the returned
-  generator) and nowhere else; an explicit `model` wins.
+  generator) and nowhere else; an explicit `model` wins. claude's is the `sonnet` alias, which
+  the CLI maps to the latest model of that family; codex's is a catalog id (`gpt-6-luna`), and
+  `vault setup` makes one real call with the chosen model before saving it.
 
 | Layer | Owner | Responsibility |
 |---|---|---|

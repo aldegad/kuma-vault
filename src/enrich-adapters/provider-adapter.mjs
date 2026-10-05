@@ -8,6 +8,11 @@
 // It lives outside the engine core so the core stays process-free and unit-testable with a mock.
 // The provider CLI runs in a per-call EMPTY temp dir — never the caller's repo — so it can't load
 // project instructions, see uncommitted work, or answer the repo instead of summarizing the page.
+// It also loads nothing of the user's own setup that could steer or slow a one-shot summary: no
+// global instructions, hooks, MCP servers or tools (claude: `--safe-mode --tools ""`), yet it
+// signs in the way the user signed in. Claude's `--bare` is not used: it reads only
+// ANTHROPIC_API_KEY or an apiKeyHelper, never the OAuth/keychain login of a subscription, so a
+// subscribed user would get "Not logged in" on every page (`claude --help`, Claude Code 2.1.289).
 //
 // The wire contract is a labeled three-line response (DESCRIPTION/TAGS/ALIASES). `buildEnrichPrompt`
 // owns the prompt (and seeds the existing tag pool for bounded-vocab reuse); `parseEnrichResponse`
@@ -32,9 +37,14 @@ export function isSupportedEnrichProvider(provider) {
   return SUPPORTED_ENRICH_PROVIDERS.has(provider);
 }
 
+// The model when the config names none. claude takes an alias for the latest model of a family
+// (`claude --help`, --model), so its default does not go stale. codex takes a concrete id from
+// its catalog (`codex debug models`); this is the catalog's fast and affordable one as of
+// codex-cli 0.160.0 — `vault setup` makes one real call with the chosen model and fails when the
+// CLI refuses it, so a retired id is found at setup, not on the first page.
 const DEFAULT_MODEL_BY_PROVIDER = {
-  claude: "claude-sonnet-5",
-  codex: "gpt-5.4-mini",
+  claude: "sonnet",
+  codex: "gpt-6-luna",
 };
 
 // Keep a page's body from blowing past a sane prompt budget; a synopsis only needs the opening of
@@ -156,9 +166,10 @@ async function runClaudePrompt({ prompt, model }) {
     "--print",
     "--output-format",
     "text",
-    "--bare",
+    "--safe-mode",
+    "--tools",
+    "",
     "--no-session-persistence",
-    "--dangerously-skip-permissions",
     "--model",
     model,
     prompt,

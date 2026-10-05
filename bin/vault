@@ -1,7 +1,7 @@
 #!/bin/bash
 # kuma-vault CLI — repo-agnostic knowledge-base compiler.
 #
-# Human surface: search/timeline/get/ingest/sync/lint/hook/index/<domain>. Engine-backed verbs are
+# Human surface: get/ingest/sync/lint/hook/index/<domain>. Engine-backed verbs are
 # dispatched to src/cli/cli.mjs as `vault-<verb>`; the git pre-commit drift gate and the
 # read-only domain/index shortcuts are handled here in pure bash (fs/git only, no engine).
 set -euo pipefail
@@ -68,14 +68,10 @@ bootstrap_server_node() {
 usage() {
   cat <<'EOF'
 Usage:
-  kuma-vault search <query> [--store <id>] [--local]   (or: vault search <query>)
-                                   Searches every registered store by default. A store
-                                   registered with search "remote" is searched on its
-                                   server; --local searches this clone's copy instead.
-  kuma-vault timeline <query> [--store <id>]
-  kuma-vault get <id|path> [more ids...]
+  kuma-vault get <id|path|store:path> [more ids...]
+                                   Read pages (finding them is a scoped rg over the tree)
   kuma-vault ingest [source] [--section <s>] [--page <p>] [--project <slug>] [--bypass] [--dry-run] [--vault-dir <path>]
-  kuma-vault sync [--check] [--no-fts] [--enrich] [--enrich-limit <n>] [--root <path>] [--profile <id>]
+  kuma-vault sync [--check] [--enrich] [--enrich-limit <n>] [--enrich-paths-from <file|->] [--root <path>] [--profile <id>]
   kuma-vault sync status|now|pause|resume|conflicts|resolve|install|uninstall [--repo <dir>]
                                    Sync daemon of a remote store clone (see: vault sync --help-daemon)
   kuma-vault clone <url> [<dir>] [--store <id>] [--token-file <path>]   Partial clone of a remote store
@@ -87,7 +83,6 @@ Usage:
                                    Where the vault lives (main store kuma-main-vault, ~/.kuma/vault)
   kuma-vault setup --add-store <id> --storage local|oracle|remote [--server <url>] [--token-file <path>]
   kuma-vault setup [--provider claude|codex] [--model <id>] [--star] [--repo <owner/repo>] [--yes]
-  kuma-vault graph [--out <path>] [--open]   Render the vault topology as an interactive HTML graph
   kuma-vault index
   kuma-vault store list|show|add|set|rename|rm ...   Store registry (~/.kuma/vault-stores.json)
   kuma-vault commit-map <sha-prefix> [--map <tsv>] [--root <tree>]
@@ -101,24 +96,18 @@ Usage:
 Options:
   --vault-dir <path>   Override the vault root (default for get/index: ~/.kuma/vault
                        or KUMA_VAULT_DIR. sync/lint have NO default — they resolve the
-                       tree's root vault.config.json declaration, walking up from the cwd.
-                       For search/timeline, passing it NARROWS to that one tree —
-                       omit it to span every store in vault-stores.json)
-  --store <id>         search/timeline: search only this registered store
+                       tree's root vault.config.json declaration, walking up from the cwd)
   --root <path>        Repo-agnostic alias for --vault-dir (the tree to sync/lint)
   --profile <id>       Contract override for an UNDECLARED tree only (kuma-vault | docs).
                        A tree with a vault.config.json owns its contract; a disagreeing
                        --profile is an error
-  --limit <n>          Max hits for search/timeline (default: 20)
-  --engine <e>         search/timeline engine: auto (default) | fts | scan
-  --format <f>         search/timeline output: text (default) | json
+  --format <f>         vault get output: text (default) | json
   --mode <m>           vault lint: fast | full (default: full)
-  --no-fts             vault sync: skip the .fts/ search cache (remote stores index on the server)
   --check              vault sync: gate the tracked tree — report index/sidecar drift and
-                       would-enrich targets without writing tracked files. The out-of-tree
-                       `.fts/` search cache is NOT gated: a stale cache self-heals (rebuild)
+                       would-enrich targets without writing
   --enrich             vault sync: fill missing/stale leaf frontmatter `description` via the configured provider
   --enrich-limit <n>   vault sync: cap how many pages one enrich run may (re)generate
+  --enrich-paths-from <file|->  vault sync: enrich only these tree-relative pages (NUL-separated; - = stdin)
   --json               Print results as JSON
 EOF
 }
@@ -135,91 +124,10 @@ resolve_domain_path() {
   fi
 }
 
-run_search_command() {
-  local mode="${1:?search mode required}"
-  shift
-  local search_engine=""
-  local -a query_parts=()
-
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --limit)
-        [ $# -ge 2 ] || die "vault $mode: --limit requires a value"
-        SEARCH_LIMIT="$2"
-        shift 2
-        ;;
-      --engine)
-        [ $# -ge 2 ] || die "vault $mode: --engine requires a value"
-        search_engine="$2"
-        shift 2
-        ;;
-      --json)
-        SEARCH_FORMAT="json"
-        shift
-        ;;
-      --format)
-        [ $# -ge 2 ] || die "vault $mode: --format requires a value"
-        SEARCH_FORMAT="$2"
-        shift 2
-        ;;
-      --vault-dir|--root)
-        [ $# -ge 2 ] || die "vault $mode: $1 requires a value"
-        VAULT_DIR="$2"
-        VAULT_DIR_EXPLICIT="1"
-        shift 2
-        ;;
-      --store)
-        [ $# -ge 2 ] || die "vault $mode: --store requires a value"
-        SEARCH_STORE="$2"
-        shift 2
-        ;;
-      --local)
-        SEARCH_LOCAL="1"
-        shift
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      --)
-        shift
-        query_parts+=("$@")
-        break
-        ;;
-      --*)
-        die "vault $mode: unknown option '$1' (use -- before a query term that starts with --)"
-        ;;
-      *)
-        query_parts+=("$1")
-        shift
-        ;;
-    esac
-  done
-
-  [ ${#query_parts[@]} -gt 0 ] || die "$mode query required"
-  local -a engine_args=()
-  [ -n "$search_engine" ] && engine_args=(--engine "$search_engine")
-  # Forward --vault-dir ONLY when the caller gave one (same idiom as sync/lint below).
-  # Passing it unconditionally pins the search to a single tree, which would make the
-  # cross-store default unreachable from the CLI — the JS layer reads "no --vault-dir"
-  # as "span every registered store".
-  local -a root_args=()
-  [ -n "$VAULT_DIR_EXPLICIT" ] && root_args=(--vault-dir "$VAULT_DIR")
-  local -a store_args=()
-  [ -n "$SEARCH_STORE" ] && store_args=(--store "$SEARCH_STORE")
-  [ -n "$SEARCH_LOCAL" ] && store_args+=(--local)
-  node "$CLI_MJS" vault-search ${root_args[@]+"${root_args[@]}"} --format "$SEARCH_FORMAT" --mode "$mode" \
-    --limit "$SEARCH_LIMIT" ${engine_args[@]+"${engine_args[@]}"} ${store_args[@]+"${store_args[@]}"} \
-    "--query=${query_parts[*]}"
-}
-
 VAULT_DIR="${KUMA_VAULT_DIR:-$HOME/.kuma/vault}"
 VAULT_DIR_EXPLICIT=""
 PROFILE=""
-SEARCH_FORMAT="text"
-SEARCH_LIMIT="20"
-SEARCH_STORE=""
-SEARCH_LOCAL=""
+GET_FORMAT="text"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -232,12 +140,8 @@ while [ $# -gt 0 ]; do
       PROFILE="${2:?profile id required}"
       shift 2
       ;;
-    --limit)
-      SEARCH_LIMIT="${2:?limit required}"
-      shift 2
-      ;;
     --json)
-      SEARCH_FORMAT="json"
+      GET_FORMAT="json"
       shift
       ;;
     -h|--help)
@@ -259,15 +163,12 @@ COMMAND="$1"
 shift || true
 
 case "$COMMAND" in
-  search)
-    run_search_command search "$@"
-    ;;
-  timeline)
-    run_search_command timeline "$@"
+  search|timeline)
+    die "vault $COMMAND was removed: search the tree on disk with a scoped rg (rg -n '<term>' <tree>/<folder>), then read the page (vault get <path> or <store>:<path>)"
     ;;
   get)
     [ $# -ge 1 ] || die "get requires at least one id or path"
-    node "$CLI_MJS" vault-get --vault-dir "$VAULT_DIR" --format "$SEARCH_FORMAT" "$@"
+    node "$CLI_MJS" vault-get --vault-dir "$VAULT_DIR" --format "$GET_FORMAT" "$@"
     ;;
   ingest)
     # The compiler implementation lives in the node CLI as `vault-ingest`; the shell
@@ -283,10 +184,12 @@ case "$COMMAND" in
         ;;
     esac
     SYNC_CHECK=""
+    # retired with the FTS index; passed on so the node side says it has no effect
     SYNC_NO_FTS=""
     SYNC_JSON=""
     SYNC_ENRICH=""
     SYNC_ENRICH_LIMIT=""
+    SYNC_ENRICH_PATHS=()
     # Honor --root/--vault-dir/--profile after the subcommand (the natural position for
     # `vault sync --check --root <path> --profile <id>`). Unrecognized args are fail-loud
     # rather than silently dropped (No Silent Fallback).
@@ -310,6 +213,10 @@ case "$COMMAND" in
           ;;
         --enrich-limit)
           SYNC_ENRICH_LIMIT="--enrich-limit ${2:?enrich-limit required}"
+          shift 2
+          ;;
+        --enrich-paths-from)
+          SYNC_ENRICH_PATHS=(--enrich-paths-from "${2:?enrich-paths-from requires a file or -}")
           shift 2
           ;;
         --vault-dir|--root)
@@ -339,7 +246,7 @@ case "$COMMAND" in
     # the cwd) and fails loud when there is none (No Silent Fallback).
     SYNC_ROOT=()
     [ -n "$VAULT_DIR_EXPLICIT" ] && SYNC_ROOT=(--vault-dir "$VAULT_DIR")
-    node "$CLI_MJS" vault-sync ${SYNC_ROOT[@]+"${SYNC_ROOT[@]}"} $SYNC_CHECK $SYNC_NO_FTS $SYNC_JSON $SYNC_ENRICH $SYNC_ENRICH_LIMIT $SYNC_PROFILE
+    node "$CLI_MJS" vault-sync ${SYNC_ROOT[@]+"${SYNC_ROOT[@]}"} $SYNC_CHECK $SYNC_NO_FTS $SYNC_JSON $SYNC_ENRICH $SYNC_ENRICH_LIMIT ${SYNC_ENRICH_PATHS[@]+"${SYNC_ENRICH_PATHS[@]}"} $SYNC_PROFILE
     ;;
   lint)
     LINT_JSON=""
@@ -471,7 +378,6 @@ $HOOK_MARKER — regenerate via: vault hook install --root <tree>
 # stages an intermediate binary in a binaries.reject place or a non-LFS file over 32MiB, or when
 # a TRACKED derivation would change — a folder README vault-index region or a binary sidecar
 # (\`vault sync --check\`). Run \`vault sync --root <tree>\` to regenerate them, then re-commit.
-# The out-of-tree \`.fts/\` search cache is not gated (a remote-search store has none).
 ROOT="\$(git rev-parse --show-toplevel)$TREE_REL"
 $HOOK_RESOLVE_BIN
 exec "\$VAULT_BIN" sync --check --root "\$ROOT"
@@ -497,13 +403,6 @@ fi
 HOOK
           chmod +x "$PUSH_HOOK_PATH"
           printf 'Installed pre-push remote allowlist: %s\n' "$PUSH_HOOK_PATH"
-        fi
-        # The gate heals the `.fts/` search cache in place, so it writes there on every commit
-        # attempt. A tree that does not ignore that path would see the cache turn up as untracked
-        # repo noise — say so at install time rather than let it be discovered mid-commit.
-        if ! git -C "$VAULT_DIR" check-ignore -q ".fts/" 2>/dev/null; then
-          printf 'note: %s/.fts/ is not git-ignored. The gate rebuilds that derived search cache in place — add `%s.fts/` to .gitignore so it stays out of the repo.\n' \
-            "$VAULT_DIR" "${TREE_REL#/}${TREE_REL:+/}" >&2
         fi
         ;;
       uninstall)
@@ -541,11 +440,6 @@ HOOK
     # write. (The hook-install step takes no profile — the contract comes from the target
     # repo's vault.config.json declaration.)
     node "$CLI_MJS" vault-setup "$@"
-    ;;
-  graph)
-    # Render the vault topology as an interactive node-link graph (self-contained HTML).
-    # Forwards --out/--open verbatim; defaults to <vault>/.graph/topology.html.
-    node "$CLI_MJS" vault-graph --vault-dir "$VAULT_DIR" "$@"
     ;;
   serve)
     exec node "$SERVER_MJS" serve "$@"

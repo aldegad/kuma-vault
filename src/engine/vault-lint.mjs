@@ -758,6 +758,14 @@ function extractMarkerRegion(contents, startMarker, endMarker) {
   return match ? match[1].trim() : null;
 }
 
+// The contents with a marker region (markers included) cut out; unchanged when absent.
+function stripMarkerRegion(contents, startMarker, endMarker) {
+  const text = String(contents ?? "").replace(/\r\n/gu, "\n").replace(/\r/gu, "\n");
+  const start = text.indexOf(startMarker);
+  const end = start < 0 ? -1 : text.indexOf(endMarker, start + startMarker.length);
+  return end < 0 ? text : `${text.slice(0, start)}${text.slice(end + endMarker.length)}`;
+}
+
 function extractRegionLinkTargets(regionMarkdown) {
   // Labels may legally contain `]` (e.g. a mail-subject title like "[미머디] …"), so a
   // naive [^\]]+ label class silently drops those lines and mis-reports the region as
@@ -2235,9 +2243,9 @@ function isCrossStorePointerTarget(targetPath) {
   return CROSS_STORE_DOC_TARGET.test(targetPath);
 }
 
-// Exported: `vault graph` draws its external-store layer from the same parse,
-// so the pointer grammar and its false-positive boundary stay single-owner here.
-export function extractCrossStorePointers(contents) {
+// The pointer grammar and its false-positive boundary stay single-owner here: the
+// resolution check below and the connection counts both read pointers through it.
+function extractCrossStorePointers(contents) {
   const pointers = [];
   let inFence = false;
   const lines = String(contents ?? "").replace(/\r/gu, "").split("\n");
@@ -2374,6 +2382,87 @@ function scanCrossStorePointers({ vaultDir, targetFiles, registry }) {
   return issues;
 }
 
+// --- Connection counts (information, never a failure) ------------------------
+//
+// How well the knowledge pages point at each other, as three numbers:
+//
+//   orphans          knowledge pages no other knowledge page links to. The links a
+//                    README's generated vault-index region carries do not count:
+//                    every page gets one, so they say nothing about whether anyone
+//                    refers to it. A README's hand-written text does count.
+//   unresolvedRefs   relative markdown links from a knowledge page (or a README's
+//                    hand-written text) that name nothing in the tree.
+//   unknownStore     cross-store pointers naming a store the registry does not
+//                    list; null when there is no valid registry to ask.
+//
+// Scope is the pages reachability walks (plans slot, archives, owner-local buckets,
+// the profile's root non-nav files — `rootNonNavFiles` — and generated sidecars are
+// out; other root pages such as decisions.md and schema.md are in, as they are for
+// reachability). Links resolve through resolveVaultLinkTarget, the resolver lint
+// checks them with: a link leaving the tree is not counted; one that lands on an
+// existing path that is not a page (an asset, a folder with no README, a plan)
+// resolves; a link naming nothing, or whose case does not match the file, is
+// unresolved, on every filesystem.
+// These are numbers, not issues: a text search (rg) finds pages by their text, so an orphan is
+// still found, and dead links and unknown stores on checked pages already fail
+// through their own issues. The counts say whether the vault is getting more or
+// less connected over time.
+function countConnections(vaultDir, ctx, registry) {
+  const { profile } = ctx;
+  const files = walkReachableMarkdownFiles(vaultDir, vaultDir, ctx).filter((rel) => !isSidecarPath(rel, profile));
+  const known = new Set(files);
+  const linkedTo = new Set();
+  let unresolvedRefs = 0;
+  let crossStorePointers = 0;
+  let unknownStore = 0;
+  const storesKnown = registry.present && !registry.invalid;
+
+  const vaultRealDir = realpathSync(vaultDir);
+  for (const fileName of files) {
+    const absolutePath = join(vaultRealDir, fileName);
+    let contents = readFileSync(absolutePath, "utf8");
+    if (basename(fileName) === "README.md") {
+      contents = stripMarkerRegion(contents, VAULT_INDEX_START_MARKER, VAULT_INDEX_END_MARKER);
+    }
+    for (const rawTarget of collectMarkdownLinks(contents)) {
+      if (isExternalLink(rawTarget)) {
+        continue;
+      }
+      // The one link resolver lint checks links with, so a count never picks another target.
+      const resolved = resolveVaultLinkTarget(vaultRealDir, absolutePath, rawTarget);
+      if (resolved.skip || resolved.error === "out-of-root") {
+        continue;
+      }
+      if (resolved.error === "broken-link" && existsSync(resolved.path)) {
+        continue; // an existing folder with no README, as an existing asset: not a page, not dead
+      }
+      if (resolved.error) {
+        unresolvedRefs += 1; // broken-link, case-mismatch
+        continue;
+      }
+      const page = normalizeRelativePath(relative(vaultRealDir, resolved.path));
+      if (known.has(page) && page !== fileName) {
+        linkedTo.add(page);
+      }
+    }
+    for (const pointer of extractCrossStorePointers(contents)) {
+      crossStorePointers += 1;
+      if (storesKnown && !registry.stores.has(pointer.storeId)) {
+        unknownStore += 1;
+      }
+    }
+  }
+
+  const pages = files.filter((fileName) => basename(fileName) !== "README.md");
+  return {
+    pages: pages.length,
+    orphans: pages.filter((fileName) => !linkedTo.has(fileName)).length,
+    unresolvedRefs,
+    crossStorePointers,
+    unknownStore: storesKnown ? unknownStore : null,
+  };
+}
+
 export function lintVaultFiles({
   vaultDir,
   mode = "full",
@@ -2392,6 +2481,7 @@ export function lintVaultFiles({
   let schemaResolvedPath = null;
   const filesResult = [];
   const globalIssues = [];
+  let connections = null;
 
   if (lintMode === "full") {
     // The schema special-file contract (schema.md `## Special Files` + per-file
@@ -2436,11 +2526,15 @@ export function lintVaultFiles({
     // Cross-store pointer resolution runs on whatever files were requested
     // (whole-tree walk or an explicit --files subset), independent of the
     // whole-tree-only scans above.
+    const registry = loadStoreRegistry();
     globalIssues.push(...scanCrossStorePointers({
       vaultDir: resolvedVaultDir,
       targetFiles,
-      registry: loadStoreRegistry(),
+      registry,
     }));
+    if (!hasExplicitFiles) {
+      connections = countConnections(resolvedVaultDir, ctx, registry);
+    }
   }
 
   for (const fileName of targetFiles) {
@@ -2476,6 +2570,7 @@ export function lintVaultFiles({
     errorCount,
     warningCount: issues.filter((issue) => issue.severity === "warn").length,
     fileCount: filesResult.length,
+    connections,
     durationMs,
   };
 }
@@ -2498,6 +2593,17 @@ export function formatVaultLintReport(result) {
   for (const issue of result.globalIssues ?? []) {
     const marker = issue.severity === "warn" ? "- [warn] " : "- ";
     lines.push(`${marker}${issue.message}`);
+  }
+
+  // Information, never a failure: see countConnections for what each number counts.
+  const connections = result.connections;
+  if (connections) {
+    const unknownStore = connections.unknownStore ?? "unchecked (no valid store registry)";
+    lines.push(
+      `INFO connections pages=${connections.pages} orphans=${connections.orphans} ` +
+        `unresolved_refs=${connections.unresolvedRefs} cross_store_pointers=${connections.crossStorePointers} ` +
+        `unknown_store=${unknownStore}`,
+    );
   }
 
   return `${lines.join("\n")}\n`;

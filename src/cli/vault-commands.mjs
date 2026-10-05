@@ -1,4 +1,4 @@
-// Vault CLI commands (vault-ingest/search/get/lint/sync) — generic distribution build.
+// Vault CLI commands (vault-ingest/get/lint/sync) — generic distribution build.
 //
 // This is the standalone CLI adapter for the kuma-vault distribution. It parses arguments
 // and calls the extracted engine (imported from the package barrel). Host-specific concerns
@@ -6,19 +6,18 @@
 // config), the profile set is the engine's generic built-ins (`kuma-vault` | `docs`), and
 // the known-project registry is empty (a generic tree has no dispatch/project attribution).
 
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { readNumber, readOptionalString } from "./cli-options.mjs";
 import { resolveDefaultEnrichGenerator } from "./enrich-config.mjs";
 import { checkCommitPolicy } from "../engine/commit-policy.mjs";
 import { loadVaultDeclaration, resolveTreeContract } from "../engine/vault-config.mjs";
-import { findStoreByRoot, loadStoreRegistry } from "../engine/vault-stores.mjs";
 // Compiler vault engine — this package's own public API.
 import {
   ENRICH_FIELDS_ALL,
   formatVaultGetText,
   formatVaultLintReport,
-  formatVaultSearchText,
   formatVaultSyncReport,
   getVaultDocuments,
   ingestGenericSource,
@@ -30,8 +29,6 @@ import {
   resolveVaultContract,
   resolveVaultDir,
   runVaultSync,
-  searchVaultStores,
-  searchVaultTree,
   vaultSyncExitCode,
 } from "../index.mjs";
 
@@ -50,10 +47,9 @@ function printVaultUsage() {
   process.stdout.write(
     [
       "Usage:",
-      "  vault-search --query <q> [--mode search|timeline] [--engine auto|fts|scan] [--limit <n>] [--vault-dir <path>] [--format text|json]",
       "  vault-get <id|path> [more ids...] [--vault-dir <path>] [--format text|json]",
       "  vault-ingest [source] [--section <s>] [--page <p>] [--project <slug>] [--bypass] [--dry-run] [--vault-dir <path>]",
-      "  vault-sync [--check] [--no-fts] [--enrich] [--enrich-limit <n>] [--root <path>] [--profile <id>] [--json]",
+      "  vault-sync [--check] [--enrich] [--enrich-limit <n>] [--enrich-paths-from <file|->] [--root <path>] [--profile <id>] [--json]",
       "  vault-lint [--mode fast|full] [--root <path>] [--profile <id>] [--json] [files...]",
       "",
       "Options:",
@@ -67,6 +63,7 @@ function printVaultUsage() {
       "  --check              vault-sync: report drift/would-enrich without writing",
       "  --enrich             vault-sync: fill missing/stale leaf frontmatter description via the configured provider",
       "  --enrich-limit <n>   vault-sync: cap how many pages one enrich run may (re)generate",
+      "  --enrich-paths-from <file|->  vault-sync: enrich only these tree-relative pages (NUL-separated; - = stdin)",
       "  --mode <m>           vault-lint: fast | full (default: full)",
       "  --json               Print results as JSON",
       "  --help               Print this usage and exit (no writes)",
@@ -468,45 +465,6 @@ export async function commandVaultIngest(options, args = []) {
   process.stdout.write(`${JSON.stringify(response, null, 2)}\n`);
 }
 
-export async function commandVaultSearch(options) {
-  if (options.help === true) {
-    printVaultUsage();
-    return;
-  }
-
-  const query = readOptionalString(options, "query") ?? options._.join(" ").trim();
-  if (!query) {
-    throw new Error("vault-search requires a query.");
-  }
-
-  const mode = readOptionalString(options, "mode") ?? "search";
-  const limit = readNumber(options, "limit", 20);
-  const engine = readOptionalString(options, "engine") ?? "auto";
-  // Cross-store search is the default. `--vault-dir` keeps its existing meaning —
-  // "this tree only" — so an explicit root still narrows, and `--store <id>` narrows
-  // to one registered store.
-  const explicitVaultDir = readOptionalString(options, "vault-dir") ?? undefined;
-  const storeId = readOptionalString(options, "store") ?? undefined;
-  // `--local`: a remote-search store is searched on this clone's copy (no index) instead of its
-  // server. Never automatic — a server failure is an error that names this flag.
-  const local = options.local === true;
-  const result = explicitVaultDir
-    ? await searchVaultTree({ query, mode, limit, engine, vaultDir: explicitVaultDir, local })
-    : await searchVaultStores({ query, mode, limit, engine, storeId, local });
-
-  const format = readOptionalString(options, "format") ?? "text";
-  if (format === "json") {
-    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    return;
-  }
-
-  if (format !== "text") {
-    throw new Error(`Unsupported vault-search format: ${format}`);
-  }
-
-  process.stdout.write(formatVaultSearchText(result));
-}
-
 export async function commandVaultGet(options) {
   if (options.help === true) {
     printVaultUsage();
@@ -538,6 +496,27 @@ export async function commandVaultGet(options) {
   process.stdout.write(formatVaultGetText(result));
 }
 
+// `--enrich-paths-from <file|->`: NUL-separated tree-relative paths (the sync daemon pipes the
+// pages its clone committed). Only meaningful with --enrich; alone it is a usage error. A path
+// with a line break is refused, not passed on: it is almost always a newline-separated list, whose
+// one "path" would otherwise leave the run as `not-a-target` without a word.
+export function readEnrichPaths(options) {
+  if (options["enrich-paths-from"] === undefined) return undefined;
+  const source = readOptionalString(options, "enrich-paths-from");
+  if (!source) throw new Error("--enrich-paths-from needs a file, or - for stdin.");
+  if (options.enrich !== true) throw new Error("--enrich-paths-from needs --enrich.");
+  const text = readFileSync(source === "-" ? 0 : source, "utf8");
+  const paths = text.split("\0").filter((path) => path.length > 0);
+  const broken = paths.find((path) => /[\r\n]/u.test(path));
+  if (broken !== undefined) {
+    throw new Error(
+      `--enrich-paths-from takes NUL-separated paths; ${JSON.stringify(broken.slice(0, 200))} has a line break ` +
+        "(a newline-separated list? separate the paths with NUL, e.g. printf '%s\\0' or git ... -z).",
+    );
+  }
+  return paths;
+}
+
 export async function commandVaultSync(options) {
   if (options.help === true) {
     printVaultUsage();
@@ -548,7 +527,7 @@ export async function commandVaultSync(options) {
     options,
     // `generateDescription` is an internal injectable seam (E2E driver), never a CLI arg,
     // but programmatic callers pass it, so it is a known key.
-    ["check", "no-fts", "enrich", "enrich-limit", "root", "vault-dir", "wiki-dir", "profile", "json", "generateDescription"],
+    ["check", "no-fts", "enrich", "enrich-limit", "enrich-paths-from", "root", "vault-dir", "wiki-dir", "profile", "json", "generateDescription"],
     "vault sync",
   );
 
@@ -579,13 +558,11 @@ export async function commandVaultSync(options) {
     if (policy.freezeException) process.stderr.write("vault gate: 동결 중 — KUMA_VAULT_FREEZE_ID 예외 커밋\n");
   }
 
-  // A store registered with remote search keeps its index on the server: the gate does not
-  // build a local `.fts/` for it. Said in the report, never silent.
-  let ftsSkipped = options["no-fts"] === true ? "--no-fts" : null;
-  if (!ftsSkipped) {
-    const registry = loadStoreRegistry();
-    const found = registry.present && !registry.invalid ? findStoreByRoot(registry, vaultDir) : null;
-    if (found?.entry.search === "remote") ftsSkipped = `remote store ${found.id} — the index is on its server`;
+  // `--no-fts` is retired with the FTS index. A sync daemon started before the upgrade still
+  // passes it, so it is accepted for one release — and said, so the daemon log shows when the
+  // caller stopped passing it.
+  if (options["no-fts"] === true) {
+    process.stderr.write("--no-fts has no effect: the FTS index was removed (accepted until the next release)\n");
   }
 
   // The composition, the report shape and the exit gate are the engine's (vault-sync-pipeline).
@@ -595,9 +572,9 @@ export async function commandVaultSync(options) {
     vaultDir,
     profile,
     check: options.check === true,
-    fts: ftsSkipped === null,
     enrich: options.enrich === true,
     enrichLimit: readNumber(options, "enrich-limit"),
+    enrichPaths: readEnrichPaths(options),
     // This package's provider adapter returns { description, tags, aliases }, so the CLI opts
     // into the full leaf-metadata field set. Check mode uses the same set so it predicts
     // exactly what a write run would fill.
@@ -607,10 +584,9 @@ export async function commandVaultSync(options) {
   });
 
   if (options.json === true) {
-    process.stdout.write(`${JSON.stringify({ ...report, ...(ftsSkipped ? { ftsSkipped } : {}) }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } else {
     process.stdout.write(formatVaultSyncReport(report));
-    if (ftsSkipped) process.stdout.write(`fts: skipped (${ftsSkipped})\n`);
   }
 
   if (vaultSyncExitCode(report) === 1) {

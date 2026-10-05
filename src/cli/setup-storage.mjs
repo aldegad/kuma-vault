@@ -2,9 +2,10 @@
 // lives (docs/setup.md "Storage", skills/kuma-vault/docs/storage-policy.md).
 //
 //   local            ~/.kuma/vaults/<id>/ = a new git repository: generated .gitattributes (large
-//                    files as LFS pointers) and .gitignore, vault/vault.config.json (visibility
-//                    private, no allowed remote), the pre-commit gate and the pre-push allowlist,
-//                    a first commit, the store registration, and ~/.kuma/vault -> its tree.
+//                    files as LFS pointers) and .gitignore, vault/.rgignore (secret directories rg
+//                    skips), vault/vault.config.json (visibility private, no allowed remote), the
+//                    pre-commit gate and the pre-push allowlist, a first commit, the store
+//                    registration, and ~/.kuma/vault -> its tree.
 //   oracle | remote  the same layout, cloned from a `vault serve` store (`vault clone`). An empty
 //                    server store gets the first commit pushed; the server URL is the only allowed
 //                    remote. Then the registration, the link and (macOS) the sync daemon.
@@ -41,7 +42,7 @@ import { cloneStore } from "../sync/clone.mjs";
 import { VAULT_BIN, loadContext } from "../sync/context.mjs";
 import { checkGitVersion, git, gitText, revParse } from "../sync/git.mjs";
 import { launchdInstall } from "../sync/launchd.mjs";
-import { normalizeRemoteUrl, renderRootGitignore } from "./policy-commands.mjs";
+import { RGIGNORE_FILENAME, normalizeRemoteUrl, renderRootGitignore, renderTreeRgignore } from "./policy-commands.mjs";
 
 export const MAIN_STORE_ID = "kuma-main-vault";
 export const TREE_DIR = "vault";
@@ -301,6 +302,8 @@ function writeStoreFiles({ repo, tree, id, allowed }) {
   writeFileSync(join(repo, ".gitattributes"), renderStoreGitattributes(), "utf8");
   writeFileSync(join(repo, ".gitignore"), renderRootGitignore("", { junk: [...DEFAULT_JUNK_PATTERNS], reject: [] }), "utf8");
   mkdirSync(tree, { recursive: true });
+  const rgignorePath = join(tree, RGIGNORE_FILENAME);
+  writeFileSync(rgignorePath, renderTreeRgignore(existsSync(rgignorePath) ? readFileSync(rgignorePath, "utf8") : ""), "utf8");
   const configPath = join(tree, VAULT_CONFIG_FILENAME);
   const existing = existsSync(configPath) ? loadVaultDeclaration(tree) : null;
   if (existing?.id && existing.id !== id) {
@@ -313,7 +316,7 @@ function writeStoreFiles({ repo, tree, id, allowed }) {
 
 async function commitAll(repo, tree, message) {
   // derive README indexes and sidecars first: the pre-commit gate refuses drift
-  vaultCli(["sync", "--no-fts", "--root", tree]);
+  vaultCli(["sync", "--root", tree]);
   await git(["add", "-A"], { cwd: repo });
   await git(["commit", "-q", "-m", message], { cwd: repo });
   return gitText(["rev-parse", "HEAD"], { cwd: repo });
@@ -524,9 +527,9 @@ async function createRemote(plan, paths, state, url, undo, log) {
     id: plan.id,
     tree: paths.tree,
     main: plan.main,
-    entry: { mode: "remote", remote: { server: plan.server, store: plan.id, ...(tokenCopy ? { tokenFile: tokenCopy } : {}) }, search: "remote" },
+    entry: { mode: "remote", remote: { server: plan.server, store: plan.id, ...(tokenCopy ? { tokenFile: tokenCopy } : {}) } },
   }, undo);
-  log(`registered ${plan.id} (remote, search on the server) in ${registryPath}`);
+  log(`registered ${plan.id} (remote) in ${registryPath}`);
   finishMain(plan, paths, state, undo, log);
   // Last: nothing reaches the server unless every local step above held.
   if (push) {

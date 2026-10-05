@@ -110,9 +110,14 @@ export async function resolveConflict(ctx, id, take, { cwd = process.cwd(), now 
   appendFileSync(ledger, `${prior.endsWith("\n") || prior === "" ? "" : "\n"}${line}\n`);
   touched.push(ledgerPath(ctx));
 
-  // the merge that made this conflict never passed the gate: regenerate indexes into this commit
-  const derived = await regenerateDerived(ctx, await scanWorktree(ctx.repo));
-  for (const e of derived?.ready ?? []) if (!touched.includes(e.path)) touched.push(e.path);
+  // The merge that made this conflict never passed the gate, and the version taken may read
+  // differently in its folder index or sidecar: what the regeneration reports writing, and git
+  // sees as changed, goes into this commit (as in autosave).
+  const derived = await regenerateDerived(ctx);
+  if (derived?.written.length) {
+    const owned = new Set(derived.written);
+    for (const e of await scanWorktree(ctx.repo)) if (owned.has(e.path) && !touched.includes(e.path)) touched.push(e.path);
+  }
   const existing = touched.filter((p) => existsSync(join(ctx.repo, p)));
   if (existing.length) {
     await gitRetry(["--literal-pathspecs", "add", "--pathspec-from-file=-", "--pathspec-file-nul"], { cwd: ctx.repo, input: `${existing.join("\0")}\0` });

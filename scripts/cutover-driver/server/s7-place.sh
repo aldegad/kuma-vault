@@ -2,7 +2,7 @@
 # already in the store and goes on with the idempotent engine commands.
 D=$VAULTS/$STORE
 if [ -d "$SRC" ]; then
-  git -C "$SRC" show "main:$TREE/vault.config.json" > "$T/vault.config.6.json"
+  git -C "$SRC" show "main:$(tp vault.config.json)" > "$T/vault.config.6.json"
   cp "$SRC/filter-repo/commit-map" "$T/commit-map.tsv"
   git -C "$SRC" config --unset core.ignorecase || true; git -C "$SRC" config --unset core.precomposeunicode || true
   # a client hooksPath copied with the config would switch the receive hooks off
@@ -21,13 +21,7 @@ fi
 sudo test -d "$D/origin.git" && sudo test -d "$D/lfs/objects"
 $VS server init-store "$STORE" --owner "$OWNER"
 sudo install -o "$SERVE_USER" -g "$SERVE_USER" -m 0640 "$T/commit-map.tsv" "$D/state/commit-map.tsv"
-$VS server set-reject --store "$STORE" --from "$T/vault.config.6.json" --tree-prefix "$TREE"
-for i in $(seq 1 30); do
-  rc=0; $VK server reindex --store "$STORE" --full || rc=$?
-  [ "$rc" -eq 75 ] || break
-  sleep 10
-done
-[ "$rc" -eq 0 ]
+$VS server set-reject --store "$STORE" --from "$T/vault.config.6.json" ${TREE:+--tree-prefix "$TREE"}
 store_registered
 [ -z "$(sudo git --git-dir "$D/origin.git" config --get core.hooksPath || true)" ]
 sudo test -x "$D/origin.git/hooks/pre-receive"

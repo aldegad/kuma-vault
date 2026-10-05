@@ -1,7 +1,7 @@
 // The composed `vault sync` pipeline — ONE implementation, every consumer.
 //
-// `vault sync` is not a single derivation; it is a fixed composition of four of them
-// (sidecar → enrich → index → fts) plus a lint pass, a report shape, and an exit gate that
+// `vault sync` is not a single derivation; it is a fixed composition of three of them
+// (sidecar → enrich → index) plus a lint pass, a report shape, and an exit gate that
 // decides which of those failures may refuse a commit. That composition IS the command's
 // judgement, and it lived twice: once in this package's CLI adapter, once in the kuma-studio
 // host's own `vault-commands.mjs`. Two copies of a judgement drift the moment one side is
@@ -27,7 +27,6 @@
 // Everything else — order, gate, report — is not a consumer's to vary.
 
 import { enrichVaultDescriptions } from "./vault-enrich.mjs";
-import { healFtsIndex } from "./vault-fts.mjs";
 import { syncVaultIndex } from "./vault-ingest.mjs";
 import { lintVaultFiles } from "./vault-lint.mjs";
 import { resolveTreeContract } from "./vault-config.mjs";
@@ -35,11 +34,7 @@ import { syncVaultSidecars } from "./vault-sidecar.mjs";
 
 export function formatVaultSyncReport(report) {
   const lines = [];
-  // "no writes" was a half-truth: check mode writes nothing to the TRACKED tree, but the
-  // out-of-tree `.fts/` search cache is healed on the same path (see the fts pass below —
-  // the cache self-heals rather than gating a commit). A header that claims zero writes and
-  // then touches a directory is the kind of small dishonesty that costs a debugging hour.
-  const mode = report.check ? "check (no tree writes — .fts cache self-heals)" : "write";
+  const mode = report.check ? "check (no writes)" : "write";
   lines.push(`vault sync — ${mode}`);
   lines.push(`vault-dir: ${report.vaultDir}`);
   lines.push(
@@ -87,22 +82,12 @@ export function formatVaultSyncReport(report) {
     for (const entry of enrich.failed) {
       lines.push(`  - [fail] ${entry.path}: ${entry.error}`);
     }
+    for (const entry of enrich.raced ?? []) {
+      lines.push(`  - [raced] ${entry.path}: edited while the model ran — left as written`);
+    }
     if (enrich.capped) {
       lines.push(`  - [capped] ${enrich.remaining} more page(s) not enriched this run (--enrich-limit)`);
     }
-  }
-
-  const fts = report.fts;
-  if (fts) {
-    // The FTS cache reports the same way in both modes because it behaves the same way in both:
-    // it is healed, never gated. A heal is announced (원칙 6 — the self-heal is observable, not
-    // a silent repair), including when a concurrent builder won the publish race.
-    const healSuffix = fts.raced ? ", concurrent builder published first" : "";
-    lines.push(
-      fts.healed
-        ? `fts: healed — rebuilt from the live tree (${fts.docCount} doc(s)${healSuffix})`
-        : `fts: in sync (${fts.docCount} doc(s))`,
-    );
   }
 
   const lint = report.lint;
@@ -118,6 +103,35 @@ export function formatVaultSyncReport(report) {
   }
 
   return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Read a refused `vault sync --check` (the pre-commit gate) back from its text: was it refused
+ * for TRACKED drift alone, and which files drifted. A caller that regenerates the derivations
+ * itself (the sync daemon's autosave) may regenerate and commit again on drift; any other
+ * refusal — a commit-policy violation (`vault gate [rule]`), a sidecar that failed to extract —
+ * is not drift, and neither is output this formatter did not write. The reader sits next to
+ * the formatter so the two change together.
+ *
+ * @param {string} text The gate's output (stdout and stderr).
+ * @returns {{ driftOnly: boolean, drifted: string[], summary: string, reasons: string[] }}
+ *   `drifted` is tree-relative; `summary` is the report's drift count line(s), empty without
+ *   drift; `reasons` are the lines of a refusal that is not drift (a commit-policy violation, a
+ *   sidecar that failed, stale index regions), trimmed, empty when there is none.
+ */
+export function parseVaultSyncCheckDrift(text) {
+  const output = String(text ?? "");
+  const index = /^index: (\d+) drifted \/.*$/m.exec(output);
+  const sidecars = /^sidecars: (\d+) would \(re\)generate \/.*$/m.exec(output);
+  const counted = [index, sidecars].filter((match) => match && Number(match[1]) > 0);
+  const drifted = [...output.matchAll(/^ {2}- \[(?:drift|create)\] (.+)$/gm)].map((match) => match[1].trim());
+  // Stale index regions come with drift; alone they are the two index builders disagreeing.
+  const reasons = output
+    .split("\n")
+    .filter((line) => /^vault gate \[/.test(line) || /^ {2}- \[fail\] /.test(line) || (counted.length === 0 && /^ {2}stale vault-index regions: [1-9]/.test(line)))
+    .map((line) => line.trim());
+  const otherRefusal = reasons.length > 0;
+  return { driftOnly: counted.length > 0 && !otherRefusal, drifted, summary: counted.map((match) => match[0]).join("; "), reasons };
 }
 
 function summarizeVaultSyncLint(lintResult) {
@@ -150,11 +164,11 @@ function summarizeVaultSyncLint(lintResult) {
  *   declared tree's contract is its declaration (`resolveTreeContract`): omit it, or pass the
  *   declared one; an undeclared tree needs it.
  * @param {boolean} [options.check] Report drift without writing.
- * @param {boolean} [options.fts] Heal the `.fts/` search cache (default true). `--no-fts` turns
- *   it off for a tree whose search index lives elsewhere (a remote store indexes on its server;
- *   the sync daemon's autosave runs `vault sync --no-fts` before it commits).
  * @param {boolean} [options.enrich] Run the opt-in LLM leaf-metadata pass.
  * @param {number} [options.enrichLimit] Cap pages one enrich write run may (re)generate.
+ * @param {string[]} [options.enrichPaths] Tree-relative pages the enrich pass is narrowed to (the
+ *   pages the sync daemon's clone committed) and writes together after its last model call;
+ *   omitted, it walks the tree and writes each page as it is described.
  * @param {string[]} [options.enrichFields] Leaf fields the enrich pass may fill; must match
  *   what the injected generator actually returns (see the module header). Defaults to
  *   `enrichVaultDescriptions`'s own default (description only).
@@ -169,10 +183,10 @@ export async function runVaultSync({
   vaultDir,
   profile,
   check = false,
-  fts: ftsEnabled = true,
   enrich = false,
   enrichLimit,
   enrichFields,
+  enrichPaths,
   generateDescription,
   createGenerateDescription,
 } = {}) {
@@ -207,24 +221,11 @@ export async function runVaultSync({
       profile: resolvedProfile,
       maxFiles: enrichLimit ?? Infinity,
       fields: enrichFields,
+      paths: enrichPaths ?? null,
     });
   }
 
   const sync = await syncVaultIndex({ vaultDir: activeVaultDir, check, profile: resolvedProfile });
-
-  // FTS index is the last derivation (search feature): it indexes the fully-derived tree.
-  // Full rebuild, idempotent by corpus signature.
-  //
-  // Both modes take the SAME path — the cache is healed, not gated. Check mode is a gate on the
-  // *committed tree*, and the `.fts/` database is not in it: a stale cache says nothing about
-  // whether the commit is consistent, so refusing the commit over it blocked one session's work
-  // for another session's edit (2026-07-31, 3 measured occurrences). 원칙 1's self-heal clause
-  // owns this case — the derived cache recovers from the live truth instead of stopping and
-  // calling a human. Tracked derivations in the gate below keep the loud refusal.
-  let fts = null;
-  if (resolvedProfile.fts && ftsEnabled) {
-    fts = await healFtsIndex({ vaultDir: sync.vaultDir, profile: resolvedProfile });
-  }
 
   // Lint runs against the resolved vault after the (conditional) index write so
   // the stale-region count reflects post-sync state. No writes in check mode.
@@ -237,7 +238,6 @@ export async function runVaultSync({
     ...sync,
     sidecars,
     enrich: enrichResult,
-    fts,
     lint,
     lintReport,
   };
@@ -246,16 +246,11 @@ export async function runVaultSync({
 /**
  * The exit gate, as a pure function of the report.
  *
- * ── What the gate refuses, and what it heals ────────────────────────────────
- * The gate splits derivations by RESIDENCE, which is a structural property, not a heuristic:
- *
- *  - TRACKED derivations (README vault-index regions, binary sidecars) live inside the
- *    committed tree. Drift there means the snapshot the commit would capture disagrees with
- *    its own generator, and regenerating it mid-commit would rewrite unstaged files without
- *    fixing the staged snapshot. Refuse, loud — the human re-runs `vault sync` and re-commits.
- *  - CACHE derivations (the `.fts/` index) live outside the committed tree. Nothing about
- *    them can make a commit inconsistent, and rebuilding one changes nothing a commit sees,
- *    so they are healed during the run rather than gated here.
+ * ── What the gate refuses ──────────────────────────────────────────────────
+ * Every derivation (README vault-index regions, binary sidecars) lives inside the committed
+ * tree. Drift there means the snapshot the commit would capture disagrees with its own
+ * generator, and regenerating it mid-commit would rewrite unstaged files without fixing the
+ * staged snapshot. Refuse, loud — the human re-runs `vault sync` and re-commits.
  *
  * check mode: tracked drift is a failing gate.
  * write mode: success once index + sidecars are regenerated; residual non-index lint

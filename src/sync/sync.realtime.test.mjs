@@ -1,7 +1,7 @@
 // Autosave on the real clock, with writers that keep writing while the tick runs.
 //
 // The injected-clock suite (sync.integration.test.mjs) sets every mtime before a tick, so nothing
-// is written while `vault sync --no-fts` regenerates the derivations. Here a recording is appended
+// is written while `vault sync` regenerates the derivations. Here a recording is appended
 // every 100 ms through whole ticks, with a 3 s quiet window: a quiet image elsewhere triggers the
 // autosave and its derivation pass, and an incoming fast-forward triggers the post-merge pass.
 // Neither may take the recording while it grows — not even when a slow fetch has left the tick's
@@ -116,7 +116,7 @@ beforeAll(async () => {
   writeAt(seed, "vault/vault.config.json", `${JSON.stringify({ profile: "kuma-vault", binaries: { reject: [] } }, null, 2)}\n`);
   writeAt(seed, "vault/README.md", "# Vault\n");
   writeAt(seed, "vault/domains/notes/seed.md", "---\ntitle: Seed\ndescription: seed note\n---\n\n# Seed\n");
-  world.sh(VAULT_BIN, ["sync", "--no-fts", "--root", join(seed, "vault")]);
+  world.sh(VAULT_BIN, ["sync", "--root", join(seed, "vault")]);
   world.git(seed, ["add", "-A"]);
   world.git(seed, ["commit", "--quiet", "-m", "fixture"]);
   world.git(seed, ["push", "--quiet", "origin", "HEAD:main"]);

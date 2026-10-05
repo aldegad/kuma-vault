@@ -81,6 +81,35 @@ How reachability is judged:
 Lint finds; `vault sync` regenerates. Both use the same rules, so the checker and the
 generator cannot disagree (the engine's `docs/architecture.md`, "The commit gate").
 
+### Connection counts (information, not failures)
+
+A whole-tree `vault lint --mode full` ends with one information line, also in `--json` as
+`connections`:
+
+```
+INFO connections pages=812 orphans=140 unresolved_refs=3 cross_store_pointers=12 unknown_store=0
+```
+
+| Number | Counts | How to read it |
+|---|---|---|
+| `pages` | knowledge pages: the pages reachability walks, minus folder READMEs and generated sidecars | the denominator |
+| `orphans` | pages no other page links to | Every page has a link in its folder README's generated index, so those links do not count; a README's hand-written text does. An orphan is still found by a text search (`rg`). A rising share means new pages are filed without a `## Related` link to or from their neighbours: look at the newest ones first. |
+| `unresolved_refs` | relative markdown links that name nothing in the tree | On a page lint link-checks, the same link is also a dead-link failure. Above zero, run curate. |
+| `cross_store_pointers`, `unknown_store` | pointers in total, and those naming a store the machine registry does not list | `unknown_store` is `unchecked` without a valid registry. The pointer check above fails each one by name. |
+
+Links resolve the way lint checks them (one resolver: `x` is the folder README `x/README.md`
+when that folder has one, else `x.md`). A link that leaves the tree, or lands on an existing
+file or folder that is not a knowledge page (an asset, an evidence folder, a plan), is not
+counted; one whose letter case does not match the file is unresolved on every filesystem. The plans slot, archives,
+owner-local buckets, generated sidecars and the root files the profile names as non-navigation
+(`rootNonNavFiles`: `log.md` and `dispatch-log.md` in the vault profile) are outside every
+count. Other root pages, such as `decisions.md` and `schema.md`, are pages here as they are
+for reachability: a page that cites one counts as a reference to it. A fast lint, or a lint
+given a file list, prints no counts: they describe the whole tree.
+
+These numbers never fail the lint. They show whether the vault is becoming more or less
+connected from one run to the next; the curate pass decides what to link.
+
 ### What only a model can judge
 
 Stale evidence, contradictions and missing cross-references are not deterministic checks yet;

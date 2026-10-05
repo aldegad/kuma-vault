@@ -16,6 +16,12 @@ slate. Failure of steps 3-10 runs the undo of every step that ran, newest first 
 before 10"); 0-2 only drop the freeze file and start the runtime again (5.7 first row). After 10
 the driver does not roll back: it starts the runtime, keeps the freeze file and stops ("halted").
 
+Two modes (config "mode"). "main" moves the machine's main vault: step 2 stops the agent runtime
+and step 10 swaps the links that point into the vault. "secondary" moves one more vault while
+the main vault stays served: the freeze names the old store only, step 2 freezes one project
+(its configured commands, then no working session of it) and never stops the runtime, step 10
+leaves a link at the old path, and 13b adds the store to the server's backup.stores list.
+
 Python 3.9 standard library only (the system python3 of macOS).
 """
 
@@ -32,26 +38,49 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STEPS = ["pre", "0", "1", "2", "3", "3b", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "13b"]
 SERVER_STEPS = {"5", "6", "7", "8"}             # steps whose server work 5.7 row 2 undoes
 EXIT = {None: 0, "success": 0, "no-go": 3, "rolled-back": 4, "halted": 5, "rollback-incomplete": 6}
+MODES = ("main", "secondary")
 # first words of the `kuma status` STATUS column that are not a session at work
 NOT_WORKING = {"idle", "completed", "needs-you", "error", "offline"}
 NEW_ATTEMPT_AFTER = {"no-go", "rolled-back", "missed-window"}
 FREEZE_MESSAGE = "vault-migrate: freeze snapshot (text only)"
 VERSION_TIMEOUT_SECONDS = 300
+HOOK_MARKER = "kuma-vault-sync-hook"            # first lines of the pre-commit gate `vault hook install` writes
+GENERATED_BLOCK = re.compile(r"(?ms)^# >>> kuma-vault generated: .*?^# <<< kuma-vault generated: [^\n]*$")
+LAUNCHD_LEAD_SECONDS = 60
+# git's own short-lived files: a writer makes and removes them while a copy lists and reads (rsync
+# exit 24), and a copied lock would be a stale lock. A ref name cannot end in .lock, so nothing
+# real is left out. Patterns for a copy rooted at the repository and for one rooted at .git/objects.
+GIT_TRANSIENT_REPO = ["--exclude=/.git/**.lock", "--exclude=/.git/objects/**tmp_obj_*",
+                      "--exclude=/.git/objects/pack/tmp_pack_*", "--exclude=/.git/objects/pack/tmp_idx_*"]
+GIT_TRANSIENT_OBJECTS = ["--exclude=*.lock", "--exclude=tmp_obj_*", "--exclude=tmp_pack_*", "--exclude=tmp_idx_*"]
 
 
 def rsync_changes(items):
-    """Only a permission-only symlink item is platform noise (short or GNU format)."""
-    changed, noise = [], []
+    """Noise, not drift (short or GNU format): a symlink whose only change is permissions
+    (platform), and a directory whose only change is its time — a file made and removed in it
+    (an excluded lock or temporary file) moves it; an added or removed entry is its own line."""
+    changed, noise, dirtime = [], [], []
     for line in items.splitlines():
-        if line.strip():
-            (noise if re.match(r"^\.L\.\.\.p\.+ ", line) else changed).append(line)
-    return changed, {"count": len(noise), "samples": noise[:5]}
+        if not line.strip():
+            continue
+        if re.match(r"^\.L\.\.\.p\.+ ", line):
+            noise.append(line)
+        elif re.match(r"^\.d\.\.t\.+ ", line):
+            dirtime.append(line)
+        else:
+            changed.append(line)
+    rec = {"count": len(noise), "samples": noise[:5]}
+    if dirtime:
+        rec["dirTimes"] = {"count": len(dirtime), "samples": dirtime[:5]}
+    return changed, rec
 
 
 class StepFailed(Exception):
@@ -70,6 +99,102 @@ def now_iso():
 
 def expand(p):
     return os.path.expanduser(p) if isinstance(p, str) else p
+
+
+def expand_cmd(cmd):
+    """A configured command: argv items get `~` expanded (a shell string expands its own)."""
+    return [expand(a) for a in cmd] if isinstance(cmd, list) else cmd
+
+
+def ref_violations(lines, branch):
+    """D5: the refs a cutover takes (`<refname> <objecttype>` lines and `HEAD <symref|detached>`).
+
+    filter-repo rewrites every ref, and a ref to a tree or a side ref carries objects nobody reads
+    into the copy; the cutover takes the source branch alone, as a commit, checked out."""
+    want, bad, seen = "refs/heads/%s" % branch, [], False
+    for line in lines:
+        name, _, kind = line.strip().partition(" ")
+        if not name:
+            continue
+        if name == "HEAD":
+            if kind != want:
+                bad.append("HEAD is %s, not %s" % (kind or "?", want))
+        elif name == want and kind == "commit":
+            seen = True
+        else:
+            bad.append("%s (%s)" % (name, kind or "?"))
+    if not seen:
+        bad.append("%s missing or not a commit" % want)
+    return bad
+
+
+def generated_ignore_misses(gitignore_text, probes, git="git"):
+    """Probes (repo-relative paths) the generated blocks of a root .gitignore do not ignore.
+
+    Only the `# >>> kuma-vault generated` blocks count — the place a declaration (binaries.reject)
+    writes; a hand-written line elsewhere in the file is not enough, because nothing regenerates
+    it. Judged by git itself: the blocks as the only exclude file of an empty repository."""
+    if not probes:
+        return []
+    blocks = "\n".join(m.group(0) for m in GENERATED_BLOCK.finditer(gitignore_text or "")) + "\n"
+    with tempfile.TemporaryDirectory(prefix="c8-ignore-") as d:
+        excl = os.path.join(d, "generated")
+        with open(excl, "w", encoding="utf-8") as f:
+            f.write(blocks)
+        repo = os.path.join(d, "r")
+        subprocess.run([git, "init", "-q", repo], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       env=dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null"))
+        p = subprocess.run([git, "-C", repo, "-c", "core.excludesFile=" + excl, "check-ignore", "--no-index", "-z", "--stdin"],
+                           input=("\0".join(probes) + "\0").encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           env=dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null"))
+        if p.returncode not in (0, 1):
+            raise StepFailed("check-ignore failed: %s" % p.stderr.decode("utf-8", "replace")[:300])
+        hit = set(x.decode() for x in p.stdout.split(b"\0") if x)
+    return [x for x in probes if x not in hit]
+
+
+def retired_config(cfg):
+    """Configuration an engine without the search index refuses: written for the old engine, it
+    would fail after the freeze (step 10 store commands, step 12 smoke)."""
+    why = []
+    if "searchQuery" in (cfg.get("smoke") or {}):
+        why.append("smoke.searchQuery: vault search was removed (step 12 reads the log page back instead); delete the key")
+    for args in (cfg.get("mac") or {}).get("storeCommands", []):
+        if "--search" in args:
+            why.append("mac.storeCommands: vault store no longer takes --search; drop it from %s" % " ".join(map(str, args[:3])))
+    return why
+
+
+def rsync_pattern(path):
+    """An rsync filter pattern matching exactly this path (wildcard characters escaped)."""
+    if any(c in path for c in "*?["):
+        path = re.sub(r"([\\*?\[])", r"\\\1", path)
+    return path
+
+
+def junk_filter_args(patterns, regexes, tracked):
+    """rsync filter arguments that leave the engine's junk names out of a copy (vanishing lock and
+    temporary files end a copy with exit 23/24), except tracked files: those the freeze commit
+    and the comparisons read, so they are included first, with their folders."""
+    inc, dirs, protect_dirs = [], set(), set()
+    rx = [re.compile(r) for r in regexes]
+    for path in tracked:
+        if not any(r.search(path) for r in rx):
+            continue
+        # the index holds NFC names; a macOS disk may hold the decomposed ones — include both
+        for form in sorted({unicodedata.normalize("NFC", path), unicodedata.normalize("NFD", path)}):
+            parts = form.split("/")
+            for i in range(1, len(parts)):
+                d = "/".join(parts[:i])
+                if d not in dirs:
+                    dirs.add(d)
+                    inc.append("--include=/%s/" % rsync_pattern(d))
+                if any(r.search(d + "/") for r in rx):
+                    protect_dirs.add(d)
+            inc.append("--include=/%s" % rsync_pattern(form))
+    # inside a junk folder kept for a tracked file, everything else stays out
+    inc += ["--exclude=/%s/**" % rsync_pattern(d) for d in sorted(protect_dirs)]
+    return inc + ["--exclude=%s" % p for p in patterns]
 
 
 def write_json_atomic(path, data):
@@ -114,6 +239,13 @@ class Driver:
         self.mac = c["mac"]
         self.srv = c["server"]
         self.core = c.get("core", {})
+        self.mode = c.get("mode", "main")
+        if self.mode not in MODES:
+            raise SystemExit("config mode %r: one of %s" % (self.mode, ", ".join(MODES)))
+        self.secondary = self.mode == "secondary"
+        self.project = c.get("project") or {}
+        self.tree = self.srv.get("tree", "vault")
+        self.branch = self.srv.get("sourceBranch", "master")
         os.makedirs(os.path.join(self.work, "logs"), exist_ok=True)
         os.makedirs(os.path.join(self.work, "reports"), exist_ok=True)
         self.state_path = os.path.join(self.work, "state.json")
@@ -186,8 +318,10 @@ class Driver:
         env = {
             "T": s["work"], "O": s["snapshot"], "ENGINE_LINK": s.get("engineLink", "/opt/kuma-vault/current"),
             "VAULTS": s.get("vaultsDir", "/data/vaults"), "STORE": s["store"], "OWNER": s["owner"],
-            "ALLOWED_REMOTE": s["allowedRemote"], "TREE": s.get("tree", "vault"), "MAPREL": s["commitMapRel"],
-            "REJECTREL": s["rejectRel"], "XRREL": s["extraDeletePathsRel"],
+            "ALLOWED_REMOTE": s["allowedRemote"], "TREE": self.tree, "MAPREL": s["commitMapRel"],
+            "REJECTREL": s["rejectRel"], "XRREL": s.get("extraDeletePathsRel") or "",
+            "SOURCE_BRANCH": self.branch, "MODE": self.mode,
+            "INSTALL_UNITS": "0" if s.get("installUnits") is False else "1",
             "SERVER_CONFIG": s.get("serverConfig", "/etc/kuma-vault/server.json"),
             "SERVE_USER": s.get("serveUser", "kuma-vault"), "ADMIN_USER": s.get("adminUser", "ubuntu"),
             "NODE_BIN": s.get("nodeBin", "/opt/node/current/bin"),
@@ -262,7 +396,7 @@ class Driver:
         rc, _ = self.run(cmd, check=False, timeout=60, quiet=True)
         return rc == 0
 
-    def working_sessions(self):
+    def working_sessions(self, cmd=None, project=None):
         """The `kuma status` table read for step 2: (readable, rows that count as working, unknown).
 
         The STATUS column is a state word with decorations after it: ` (<source>)` when the verdict
@@ -272,8 +406,9 @@ class Driver:
         in `unknown`: step 2 stops the runtime after the wait either way, so counting it only makes
         the wait longer and puts the session in sessionsCutAtStop, where a person sees it. A table
         that does not start with the header is not readable, and an unreadable table never ends
-        the wait early."""
-        rc, out = self.run(self.core.get("statusCmd", ["kuma", "status"]), check=False, timeout=120, quiet=True)
+        the wait early. With `project`, only that project's rows count (secondary mode)."""
+        rc, out = self.run(expand_cmd(cmd or self.core.get("statusCmd", ["kuma", "status"])), check=False, timeout=120,
+                           quiet=True)
         lines = out.splitlines()
         if rc != 0 or not lines or lines[0].split("\t")[:3] != ["PROJECT", "MEMBER", "STATUS"]:
             return False, [], []
@@ -285,6 +420,8 @@ class Driver:
             status = cols[2].strip() if len(cols) >= 3 else ""
             word = status.split()[0] if status else ""
             if word in NOT_WORKING:
+                continue
+            if project is not None and cols[0].strip() != project:
                 continue
             row = {"project": cols[0], "member": cols[1] if len(cols) > 1 else "", "status": status}
             if word != "working":
@@ -306,7 +443,7 @@ class Driver:
 
     def core_start(self):
         cmd = self.core.get("startCmd")
-        if cmd:
+        if cmd and not self.secondary:             # secondary mode never stops the runtime
             self.run(cmd, timeout=900)
             self.values()["coreStarted"] = now_iso()
             self.save()
@@ -321,6 +458,18 @@ class Driver:
                            "print('\\n'.join(brainrw.freeze_pathspec()))" % self.tools()], quiet=True,
                           env={"PYTHONDONTWRITEBYTECODE": "1"})
         return [s for s in out.splitlines() if s]
+
+    def junk_filters(self):
+        """rsync filters for steps 0 and 4: the engine junk names (brainrw.JUNK_PATTERNS, the server's
+        receive rule 6 — the rewrite drops the same names from history) stay out of the copy;
+        tracked files among them are copied."""
+        _, out = self.run(["python3", "-c", "import sys, json; sys.path.insert(0, %r); import brainrw; "
+                           "print(json.dumps([list(brainrw.JUNK_PATTERNS), [brainrw.gitignore_regex(p) for p in "
+                           "brainrw.JUNK_PATTERNS]]))" % self.tools()], quiet=True, env={"PYTHONDONTWRITEBYTECODE": "1"})
+        patterns, regexes = json.loads(out)
+        _, ls = self.git(expand(self.mac["repo"]), "ls-files", "-z", quiet=True)
+        tracked = [p for p in ls.split("\0") if p]
+        return junk_filter_args(patterns, regexes, tracked)
 
     def rsync_dest(self):
         ssh = self.srv.get("ssh")
@@ -370,9 +519,11 @@ class Driver:
         # then enumerate objects, so every copied ref's objects are included even with writers.
         src, dst = expand(self.mac["repo"]).rstrip("/") + "/", self.rsync_dest()
         self.check_gc_pid()
-        self.run(self.rsync_base() + ["--exclude=/.git/objects/", src, dst], timeout=6 * 3600)
+        junk = self.junk_filters()
+        self.run(self.rsync_base() + ["--exclude=/.git/objects/"] + GIT_TRANSIENT_REPO + junk + [src, dst], timeout=6 * 3600)
         self.check_gc_pid()
-        self.run(self.rsync_base() + [src + ".git/objects/", dst + ".git/objects/"], timeout=6 * 3600)
+        self.run(self.rsync_base() + GIT_TRANSIENT_OBJECTS + junk + [src + ".git/objects/", dst + ".git/objects/"],
+                 timeout=6 * 3600)
 
     # --- the steps ------------------------------------------------------------------------
 
@@ -386,6 +537,7 @@ class Driver:
             todo = sorted(set(re.findall(r"TODO[^\"]*", f.read())))
         if todo:
             why.append("config has unfilled values: %s" % todo[:5])
+        why.extend(retired_config(self.cfg))
         repo = expand(m["repo"])
         # the driver must not run from a place steps 9-10 move
         for p in [repo, expand(m["newClone"])] + [expand(l["path"]) for l in m.get("links", [])]:
@@ -402,6 +554,12 @@ class Driver:
             why.append("old repo is not a git work tree: %s" % m["repo"])
         else:
             why.extend(self.maintenance_reasons(repo))
+            # D5: the source branch alone, checked out (again on the server copy in step 4)
+            bad = ref_violations(self.client_refs(repo), self.branch)
+            v["refsPre"] = bad
+            why.extend("ref: %s" % b for b in bad)
+            if self.secondary:
+                why.extend(self.secondary_pre(repo))
         for l in m.get("links", []):
             if not os.path.islink(expand(l["path"])):
                 why.append("not a symlink: %s" % l["path"])
@@ -415,10 +573,12 @@ class Driver:
             rc, _ = self.git(studio, "merge-base", "--is-ancestor", pre["studioBackupCommit"], pre.get("studioMainRef", "main"), check=False)
             if rc != 0:
                 why.append("kuma-studio %s does not contain %s" % (pre.get("studioMainRef", "main"), pre["studioBackupCommit"]))
-        # 7: the installed app carries the landed runtime commit and is what runs
+        # 7: the installed app carries the landed runtime commit and is what runs (main mode: the
+        # runtime stops and starts again; secondary mode checks it only when the config names one)
         c4c = pre.get("c4cLandedSha")
         if not c4c:
-            why.append("prereq.c4cLandedSha not set")
+            if not self.secondary:
+                why.append("prereq.c4cLandedSha not set")
         else:
             rc, out = self.run(pre.get("launcherVersionCmd", ["kuma", "control", "launcher-version", "--json"]), check=False, timeout=VERSION_TIMEOUT_SECONDS)
             if rc == 124:
@@ -446,15 +606,19 @@ class Driver:
                 why.append("core-version is not CURRENT")
         # what later steps need from this machine at this hour (e.g. a keychain read under launchd)
         for cmd in pre.get("checks", []):
-            rc, _ = self.run(cmd, check=False, timeout=pre.get("checkTimeoutSeconds", 60), quiet=True)
+            rc, _ = self.run(expand_cmd(cmd), check=False, timeout=pre.get("checkTimeoutSeconds", 60), quiet=True)
             if rc != 0:
                 why.append("check failed (exit %d): %s" % (rc, (cmd if isinstance(cmd, str) else " ".join(cmd))[:120]))
         # 3 and 4, server half (creates the work directory with the tool copy)
         _, o, _ = self.server("pre-server", {"TOOLS_SHA256_B64": b64file(expand(m["toolsSha256"]))}, check=False)
         v["serverPre"] = o
         self.save()
-        expect = {"vaultsEntries": "0", "configClean": "true", "workMounts": "0", "leftovers": "0",
-                  "workDirForeign": "false", "toolsMatch": "true", "filterRepo": "true", "engineLists": "true"}
+        expect = {"workMounts": "0", "leftovers": "0", "workDirForeign": "false", "toolsMatch": "true",
+                  "filterRepo": "true", "engineLists": "true"}
+        if self.secondary:
+            expect.update(storeAbsent="true", configValid="true", backupConfigured="true")
+        else:
+            expect.update(vaultsEntries="0", configClean="true")
         for k, want in expect.items():
             if o.get(k) != want:
                 why.append("server %s = %s (want %s)" % (k, o.get(k), want))
@@ -465,10 +629,15 @@ class Driver:
                 why.append("server engine %s is not on %s" % (inst_sha, pre.get("engineMasterRef", "master")))
         if why:
             raise NoGo(why)
-        # intermediates gate (c14d): the procedure (if configured), then the green test on its summary
-        c14 = self.cfg.get("c14d", {})
+        # intermediates gate (c14d): the procedure (if configured), then the green test on its summary.
+        # A secondary vault without a configured gate has none (its intermediates are out by plan).
+        c14 = self.cfg.get("c14d") or {}
+        if self.secondary and not c14:
+            v["c14d"] = "not configured (secondary)"
+            self.save()
+            return
         for cmd in c14.get("commands", []):
-            self.run(cmd, timeout=c14.get("timeoutSeconds", 7200))
+            self.run(expand_cmd(cmd), timeout=c14.get("timeoutSeconds", 7200))
         summ = expand(c14.get("summary", ""))
         test = c14.get("jq", ".restore_total == [0,0] and (.gates | .G1_keep_missing == 0 and .G2_delete_on_mac_unguarded == 0 "
                        "and .G3_keep_x_reject == 0 and .G4_head_tracked_x_reject == 0 and .G5_clipless_raw_missing == 0 "
@@ -481,6 +650,61 @@ class Driver:
         rc, _ = self.run(["jq", "-e", test, summ], check=False)
         if rc != 0:
             raise NoGo(["intermediates gate not green (%s)" % summ])
+
+    def client_refs(self, repo):
+        _, refs = self.git(repo, "for-each-ref", "--format=%(refname) %(objecttype)", quiet=True)
+        rc, head = self.git(repo, "symbolic-ref", "-q", "HEAD", check=False, quiet=True)
+        return refs.splitlines() + ["HEAD %s" % (head.strip() if rc == 0 else "detached")]
+
+    def secondary_pre(self, repo):
+        """Secondary mode, client half: the freeze must reach the old store and only it, and the
+        must-ignore places must be ignored by the generated block the cutover writes."""
+        why, v, pj = [], self.values(), self.project
+        tree_dir = os.path.join(repo, self.tree) if self.tree else repo
+        # the freeze file names the old store; its commit gate is what enforces it
+        try:
+            store = read_json(os.path.join(tree_dir, "vault.config.json"), {}).get("id")
+        except ValueError:
+            store = None
+        if not store:
+            why.append("no declared id in %s/vault.config.json (the freeze names it)" % (self.tree or "."))
+        v["freezeStore"] = store
+        rc, hook = self.git(repo, "rev-parse", "--git-path", "hooks/pre-commit", check=False, quiet=True)
+        hook = os.path.join(repo, hook.strip()) if rc == 0 else ""
+        try:
+            with open(hook, encoding="utf-8", errors="replace") as f:
+                gated = os.access(hook, os.X_OK) and HOOK_MARKER in f.read(4096)
+        except OSError:
+            gated = False
+        if not gated:
+            why.append("old repo has no vault commit gate at %s (vault hook install): the freeze would not hold" % (hook or "?"))
+        if not pj.get("id"):
+            why.append("project.id not set (the project step 2 freezes)")
+        # must-ignore places: the reject list the cutover applies (s6a) covers them
+        probes = self.srv.get("mustIgnore") or []
+        if probes:
+            why.extend(self.must_ignore_pre(tree_dir, probes))
+        return why
+
+    def must_ignore_pre(self, tree_dir, probes):
+        """`vault binaries apply` of the old tree's reject file on a scratch repository, then the
+        generated-block test of every probe — the same judgement step 6 makes on the rewrite."""
+        reject = os.path.join(tree_dir, self.srv["rejectRel"])
+        if not os.path.isfile(reject):
+            return ["reject file missing: %s (mustIgnore needs it)" % reject]
+        with tempfile.TemporaryDirectory(prefix="c8-must-ignore-") as d:
+            top = os.path.join(d, "repo")
+            t = os.path.join(top, self.tree) if self.tree else top
+            os.makedirs(t)
+            self.run([self.mac.get("git", "git"), "init", "-q", top], quiet=True)
+            shutil.copy(os.path.join(tree_dir, "vault.config.json"), os.path.join(t, "vault.config.json"))
+            rc, _ = self.vault("binaries", "apply", "--from", reject, "--root", t, check=False, quiet=True)
+            if rc != 0:
+                return ["vault binaries apply on %s failed (exit %d)" % (reject, rc)]
+            with open(os.path.join(top, ".gitignore"), encoding="utf-8") as f:
+                misses = generated_ignore_misses(f.read(), probes, self.mac.get("git", "git"))
+        self.values()["mustIgnorePre"] = {"probes": len(probes), "missing": misses}
+        return ["mustIgnore place not in the generated reject block: %s" % p for p in misses]
 
     def gate(self, stage):
         out = os.path.join(self.work, "reports", "decision-%s.json" % stage)
@@ -510,10 +734,50 @@ class Driver:
         if cur:
             raise StepFailed("a foreign freeze file exists: %s" % fz)
         os.makedirs(os.path.dirname(fz), exist_ok=True)
-        write_json_atomic(fz, {"id": v["freezeId"], "since": now_iso(), "reason": self.cfg.get("freezeReason", "vault cutover"),
-                               "plan": self.cfg.get("plan", "")})
+        freeze = {"id": v["freezeId"], "since": now_iso(), "reason": self.cfg.get("freezeReason", "vault cutover"),
+                  "plan": self.cfg.get("plan", "")}
+        if self.secondary:
+            freeze["store"] = v["freezeStore"]    # the commit gate freezes this store only; the main vault writes on
+        write_json_atomic(fz, freeze)
 
     def step_2(self):
+        if self.secondary:
+            return self.step_2_project()
+        return self.step_2_core()
+
+    def step_2_project(self):
+        """Secondary mode: freeze one project, never the runtime. The configured freeze commands
+        (route disconnect, routine pause, ...) run once each, in order (a re-run skips the ones
+        done); then up to waitMinutes for no working session of that project. A session still at
+        work after the wait fails the step (no-go: the undo commands run, the freeze file goes)."""
+        v, pj = self.values(), self.project
+        done = v.get("projectFreezeDone", 0)
+        for i, cmd in enumerate(pj.get("freezeCommands", [])):
+            if i < done:
+                continue
+            self.run(expand_cmd(cmd), timeout=600)
+            v["projectFreezeDone"] = i + 1
+            self.save()
+        deadline = time.time() + 60 * pj.get("waitMinutes", 30)
+        seen, ok = None, False
+        while True:
+            ok, rows, unknown = self.working_sessions(pj.get("statusCmd"), project=pj["id"])
+            if ok:
+                seen = rows
+            self.log("working sessions of %s: %s" % (pj["id"], len(rows) if ok else "status table not readable"))
+            if (ok and not rows) or time.time() >= deadline:
+                break
+            time.sleep(pj.get("pollSeconds", 30))
+        v["projectSessionsAtFreeze"] = seen
+        self.save()
+        if not ok or rows:
+            raise StepFailed("project %s: %s after %s min" % (
+                pj["id"], "%d working session(s) %s" % (len(rows), [r["member"] for r in rows]) if ok
+                else "status table not readable", pj.get("waitMinutes", 30)))
+        v["projectFrozen"] = now_iso()
+        self.save()
+
+    def step_2_core(self):
         """Wait up to waitMinutes for no working session, then stop the runtime anyway
         (its restart brings the sessions back: capture + resume). The cut sessions are reported.
         A runtime already stopped (a re-run after the stop, or stopped by someone) has no session
@@ -568,7 +832,7 @@ class Driver:
                 return
             raise StepFailed("HEAD moved from %s to %s during the freeze" % (v["HEAD_pre"], head))
         for cmd in self.mac.get("beforeFreeze", []):     # derived text in step (the commit gate's drift check)
-            self.run([expand(x) for x in cmd] if isinstance(cmd, list) else cmd, timeout=3600)
+            self.run(expand_cmd(cmd), timeout=3600)
         no_auto = ["-c", "gc.auto=0", "-c", "maintenance.auto=false"]
         self.git(repo, *no_auto, "add", "-A", "--", *self.freeze_pathspec(), timeout=3600)
         self.git(repo, *no_auto, "commit", "-q", "--allow-empty", "-m", FREEZE_MESSAGE, env={"KUMA_VAULT_FREEZE_ID": v["freezeId"]},
@@ -579,8 +843,12 @@ class Driver:
 
     def step_3b(self):
         """R2 pre-cutover snapshot, in the background next to step 4; step 4 waits for it."""
-        b = self.cfg.get("backup3b", {})
+        b = self.cfg.get("backup3b") or {}
         v = self.values()
+        if self.secondary and not b:
+            v["3b"] = {"skipped": "backup3b not configured (secondary)"}
+            self.save()
+            return
         d = os.path.join(self.work, "3b")
         os.makedirs(d, exist_ok=True)
         rcf = os.path.join(d, "rc")
@@ -600,7 +868,9 @@ class Driver:
         self.save()
 
     def wait_3b(self):
-        b = self.cfg.get("backup3b", {})
+        b = self.cfg.get("backup3b") or {}
+        if self.secondary and not b:
+            return
         d = os.path.join(self.work, "3b")
         rcf = os.path.join(d, "rc")
         deadline = time.time() + b.get("timeoutSeconds", 4 * 3600)
@@ -634,7 +904,9 @@ class Driver:
         _, head = self.git(repo, "rev-parse", "HEAD")
         if head.strip() != v["HEAD_final"]:                                   # (a)
             drift.append("HEAD %s != HEAD_final %s" % (head.strip(), v["HEAD_final"]))
-        _, items = self.run(self.rsync_base()[1:] + ["-n", "--itemize-changes", src, self.rsync_dest()], timeout=6 * 3600)
+        _, items = self.run(self.rsync_base()[1:] + ["-n", "--itemize-changes"] + GIT_TRANSIENT_REPO + self.junk_filters() +
+                            [src, self.rsync_dest()],
+                            timeout=6 * 3600)
         changed, v["platformNoise"] = rsync_changes(items)
         self.save()
         if changed:                                                            # (b)
@@ -644,10 +916,14 @@ class Driver:
         text = [t for t in st.split("\0") if t]
         if text:                                                               # (d) text written after 3
             drift.append("%d text paths changed after the freeze commit: %s" % (len(text), text[:5]))
-        _, o, _ = self.server("s4-inventory")                                  # (c)
+        _, o, sec = self.server("s4-inventory")                                # (c)
         v["serverInventory4"] = o
         if o.get("serverHead") != v["HEAD_final"]:
             drift.append("server HEAD %s != HEAD_final" % o.get("serverHead"))
+        bad = ref_violations(sec.get("refs", []), self.branch)                # D5 again, on what step 5 rewrites
+        v["refs4"] = bad
+        if bad:
+            drift.append("refs on the server copy: %s" % bad)
         if drift:
             v["drift"] = drift
             self.save()
@@ -686,6 +962,7 @@ class Driver:
     def step_6(self):
         v = self.values()
         _, o, sec = self.server("s6a-config", {"P6BASE": v["pointerCommit"]})
+        self.check_must_ignore("6", "\n".join(sec.get("gitignore", [])))
         cand = sec.get("refmap-candidates", [])
         d = os.path.join(self.work, "6")
         os.makedirs(d, exist_ok=True)
@@ -701,6 +978,17 @@ class Driver:
         _, o, _ = self.server("s6c-refmap", {"OTHER_PREFIXES_B64": b64file(os.path.join(d, "other-prefixes.tsv"))})
         v["cutoverTip"] = o.get("cutoverTip")
         self.save()
+
+    def check_must_ignore(self, where, gitignore_text):
+        """The configured must-ignore places are ignored by the generated blocks of this .gitignore."""
+        probes = self.srv.get("mustIgnore") or []
+        if not probes:
+            return
+        misses = generated_ignore_misses(gitignore_text, probes, self.mac.get("git", "git"))
+        self.values().setdefault("mustIgnore", {})[where] = {"probes": len(probes), "missing": misses}
+        self.save()
+        if misses:
+            raise StepFailed("step %s: .gitignore generated blocks do not ignore %s" % (where, misses))
 
     def step_7(self):
         self.values()["serverStore"] = "placing"
@@ -741,6 +1029,12 @@ class Driver:
             bad.append("mac LFS files %d != server %s" % (n, o.get("lfsCount")))
         if bad:
             raise StepFailed("; ".join(bad))
+        gi = os.path.join(nc, ".gitignore")
+        text = ""
+        if os.path.exists(gi):
+            with open(gi, encoding="utf-8") as f:
+                text = f.read()
+        self.check_must_ignore("8", text)
 
     def step_9(self):
         repo = expand(self.mac["repo"])
@@ -762,26 +1056,40 @@ class Driver:
             self.undo_10()
         for l in m.get("links", []):
             swap_symlink(expand(l["path"]), expand(l["target"]))
+        if self.secondary:
+            # the old path (renamed in step 9) becomes a link to the new clone: absolute paths in
+            # files and in other tools keep working until the old path is retired
+            repo = expand(m["repo"])
+            if not os.path.lexists(repo):
+                os.symlink(expand(m["newClone"]), repo)
+                v["oldPathLinked"] = True
+                self.save()
+            elif not (os.path.islink(repo) and os.readlink(repo) == expand(m["newClone"])):
+                raise StepFailed("%s exists and is not the link to the new clone" % m["repo"])
         for args in m.get("storeCommands", []):
             self.vault(*[expand(a) for a in args])
 
     def step_11(self):
         m = self.mac
         for cmd in m.get("daemonInstall", []):
-            self.run(cmd, timeout=600)
+            self.run(expand_cmd(cmd), timeout=600)
         for cmd in m.get("backupRetarget", []):
-            self.run(cmd, timeout=600)
+            self.run(expand_cmd(cmd), timeout=600)
         self.core_start()
 
     def step_12(self):
-        """The machine part of the smoke test (orchestrator part: Studio memo image + recording)."""
+        """The machine part of the smoke test (orchestrator part: Studio memo image + recording).
+        The status alarms are judged in step 13, after the freeze is released: a frozen store's
+        autosave is held back by the freeze itself (the new clone of a store that keeps its id)."""
         sm, v = self.cfg.get("smoke", {}), self.values()
         nc = expand(self.mac["newClone"])
         res = v.setdefault("smoke", {})
         fz = {"KUMA_VAULT_FREEZE_ID": v["freezeId"]}
         blocking = []
+        locked = [0]                     # times a smoke commit met the daemon on the index lock
 
-        def record(name, ok, **detail):
+        def record(name, ok, detail=None, **more):
+            detail = dict(detail or {}, **more)
             res[name] = dict(ok=bool(ok), **detail)
             self.save()
             if not ok:
@@ -796,8 +1104,8 @@ class Driver:
             os.makedirs(os.path.dirname(p), exist_ok=True)
             with open(p, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
-            self.git(nc, "add", "--", rel)
-            self.git(nc, "commit", "-q", "-m", msg, env=fz)
+            locked[0] += self.git_index(nc, "add", "--", rel)
+            locked[0] += self.git_index(nc, "commit", "-q", "-m", msg, env=fz)
 
         def skipped(name, key):
             # a check the configuration switches off on purpose (null): recorded as skipped
@@ -806,16 +1114,21 @@ class Driver:
                 return True
             return False
 
-        # plan read / check / write
-        try:
-            plan = os.path.join(nc, sm["planFile"])
-            text = open(plan, encoding="utf-8").read()
-            fm = re.match(r"---\n(.*?)\n---\n", text, re.S)
-            ok = bool(fm and re.search(r"(?m)^status:", fm.group(1)))
-            commit_line(sm["planFile"], "- c8 driver smoke %s: plan read/check/write" % now_iso(), "c8 smoke: plan write")
-            record("plan", ok)
-        except (OSError, StepFailed, KeyError) as e:
-            record("plan", False, error=str(e))
+        # The daemon step 11 started holds its lock before anything nudges it: a `sync now` that
+        # finds no daemon runs the tick itself under that lock, and the daemon starting meanwhile
+        # finds the lock taken and exits.
+        record("daemon", *self.wait_daemon(nc, sm.get("daemonWaitSeconds", 60)))
+        # plan read / check / write (a vault without plans: planFile null)
+        if not skipped("plan", "planFile"):
+            try:
+                plan = os.path.join(nc, sm["planFile"])
+                text = open(plan, encoding="utf-8").read()
+                fm = re.match(r"---\n(.*?)\n---\n", text, re.S)
+                ok = bool(fm and re.search(r"(?m)^status:", fm.group(1)))
+                commit_line(sm["planFile"], "- c8 driver smoke %s: plan read/check/write" % now_iso(), "c8 smoke: plan write")
+                record("plan", ok)
+            except (OSError, StepFailed, KeyError) as e:
+                record("plan", False, error=str(e))
         # commit -> server accepts, 10 times
         lat = []
         try:
@@ -837,12 +1150,22 @@ class Driver:
                         nudge.terminate()
                     nudge.wait()
                 lat.append(round(time.time() - t0, 2))
-            record("commits", True, latencies=lat)
+            record("commits", True, latencies=lat, indexLockRetries=locked[0])
         except (StepFailed, KeyError) as e:
-            record("commits", False, latencies=lat, error=str(e))
-        # remote search
-        rc, out = self.vault("search", sm.get("searchQuery", "vault"), check=False, cwd=os.path.join(nc, self.srv.get("tree", "vault")))
-        record("search", rc == 0 and bool(out.strip()), rc=rc, lines=len(out.splitlines()))
+            record("commits", False, latencies=lat, indexLockRetries=locked[0], error=str(e))
+        # read the smoke log back through the engine reader (no search index: agents find a page
+        # with a scoped rg over the tree and read it with vault get)
+        tree_dir = os.path.join(nc, self.tree) if self.tree else nc
+        rel = os.path.relpath(os.path.join(nc, sm.get("logFile", "")), tree_dir)
+        try:
+            if rel.startswith(".."):
+                raise StepFailed("logFile %s is outside the tree" % sm.get("logFile"))
+            with open(os.path.join(tree_dir, rel), encoding="utf-8") as f:
+                lines = [l for l in f.read().splitlines() if l.strip()]
+            rc, out = self.vault("--vault-dir", tree_dir, "get", rel, check=False)
+            record("read", rc == 0 and bool(lines) and lines[-1] in out, rc=rc, path=rel)
+        except (OSError, StepFailed) as e:
+            record("read", False, path=rel, error=str(e))
         # one large file
         if not skipped("blobGet", "blobPath"):
             try:
@@ -866,17 +1189,14 @@ class Driver:
                 record(name, ok, **detail)
             except (StepFailed, OSError, TypeError) as e:
                 record(name, False, error=str(e))
-        # status alarms
-        rc, out = self.vault("sync", "status", "--json", "--repo", nc, check=False)
-        try:
-            js = json.loads(out)
-        except ValueError:
-            js = {}
-        alerts = js.get("alerts") or {}
-        active = [k for k, a in alerts.items() if isinstance(a, dict) and a.get("active")]
-        record("alarms", rc == 0 and not active and not js.get("problems"), rc=rc, active=active,
-               alerts=sorted(alerts), problems=js.get("problems"))
-        for name in ("plan", "commits", "search", "blobGet", "rejectBig", "rejectPlace", "alarms"):
+        # a file in a must-ignore place (a folder of cloned outside source...) is neither committed nor pushed
+        probes = self.srv.get("mustIgnore") or []
+        if probes:
+            try:
+                record("mustIgnore", *self.must_ignore_smoke(nc, probes[0]))
+            except (StepFailed, OSError) as e:
+                record("mustIgnore", False, error=str(e))
+        for name in ["daemon", "plan", "commits", "read", "blobGet", "rejectBig", "rejectPlace"] + (["mustIgnore"] if probes else []):
             if not res.get(name, {}).get("ok"):
                 blocking.append(name)
         # launchd restart receipt: recorded, never a rollback (design 5.6 12)
@@ -885,6 +1205,72 @@ class Driver:
             self.save()
         if blocking:
             raise StepFailed("smoke failed: %s" % ", ".join(blocking))
+
+    def git_index(self, repo, *args, env=None, tries=40, pause=0.5):
+        """A git command that writes the index, next to a daemon that writes it too (its autosave
+        stages and unstages under the same lock). A held index.lock is waited out; any other
+        failure is the step's. Returns how many times the lock was met."""
+        for n in range(tries):
+            start = os.path.getsize(self.step_log) if os.path.exists(self.step_log) else 0
+            rc, _ = self.git(repo, *args, env=env, check=False)
+            if rc == 0:
+                return n
+            with open(self.step_log, encoding="utf-8", errors="replace") as f:
+                f.seek(start)
+                if "index.lock" not in f.read():
+                    break
+            time.sleep(pause)
+        raise StepFailed("exit %d: git %s" % (rc, " ".join(args)[:200]))
+
+    def wait_daemon(self, nc, seconds):
+        deadline, pid = time.time() + seconds, None
+        while True:
+            _, out = self.vault("sync", "status", "--json", "--repo", nc, check=False, quiet=True)
+            try:
+                d = json.loads(out).get("daemon") or {}
+            except ValueError:
+                d = {}
+            if d.get("running") and d.get("pid"):
+                pid = d["pid"]
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(1)
+        return bool(pid), {"pid": pid}
+
+    def must_ignore_smoke(self, nc, rel):
+        """Write a text file at a must-ignore place of the new clone, let the daemon run a tick,
+        then: git sees it ignored, no commit ever had it, the server main does not have it."""
+        full = os.path.join(nc, rel)
+        made = []
+        d = os.path.dirname(full)
+        while not os.path.exists(d):
+            made.append(d)
+            d = os.path.dirname(d)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write("print('cloned source must stay out of the vault')\n")
+        try:
+            rc_now, _ = self.vault("sync", "now", "--repo", nc, "--timeout", "120", check=False, timeout=300)
+            _, st = self.git(nc, "status", "--porcelain=v1", "--ignored", "--untracked-files=all", "--", rel, quiet=True)
+            _, hist = self.git(nc, "log", "--all", "--format=%H", "--", rel, quiet=True)
+            ref = "refs/kuma-vault-smoke/must-ignore"
+            try:
+                self.git(nc, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "origin", "refs/heads/main:" + ref, quiet=True)
+                _, on_server = self.git(nc, "ls-tree", "-r", "--name-only", ref, "--", rel, quiet=True)
+            finally:
+                self.git(nc, "update-ref", "-d", ref, check=False, quiet=True)
+        finally:
+            # the folders this probe created go whole (a daemon tick may have derived an index page
+            # into them); a folder that was there before keeps everything but the probe file
+            if made:
+                shutil.rmtree(made[-1])
+            else:
+                os.unlink(full)
+        ignored = st.startswith("!! ")
+        ok = ignored and not hist.strip() and not on_server.strip()
+        return ok, {"path": rel, "syncNowExit": rc_now, "status": st.strip(), "ignored": ignored,
+                    "committed": bool(hist.strip()), "onServer": bool(on_server.strip())}
 
     def push_refused(self, nc, path, data, pattern):
         idx = os.path.join(self.work, "12-index")
@@ -974,19 +1360,68 @@ class Driver:
         return rec
 
     def step_13(self):
-        try:
+        """Freeze released (secondary: the project's release commands after it), then the status
+        alarms of the new clone, then the server cleanup. The alarms are judged here and not in 12:
+        while frozen, a store that keeps its id has its autosave held back by the freeze itself. An
+        alarm still on after `smoke.alarmsWaitSeconds` halts before the old server copy goes."""
+        v = self.values()
+        cur = read_json(expand(self.mac["freezeFile"]))
+        if cur and cur.get("id") == v.get("freezeId"):
             os.unlink(expand(self.mac["freezeFile"]))
-        except FileNotFoundError:
-            pass
-        self.values()["freezeReleased"] = now_iso()
-        self.save()
+        if "freezeReleased" not in v:
+            v["freezeReleased"] = now_iso()
+            self.save()
+        if self.secondary:
+            done = v.get("projectReleaseDone", 0)
+            for i, cmd in enumerate(self.project.get("releaseCommands", [])):
+                if i < done:
+                    continue
+                self.run(expand_cmd(cmd), timeout=600)
+                v["projectReleaseDone"] = i + 1
+                self.save()
+        self.alarms_after_release()
         _, o, _ = self.server("s13-cleanup")
-        self.values()["server13"] = o
+        v["server13"] = o
         self.save()
 
+    def alarms_after_release(self):
+        sm, v = self.cfg.get("smoke", {}), self.values()
+        nc = expand(self.mac["newClone"])
+        deadline = time.time() + sm.get("alarmsWaitSeconds", 300)
+        tries = []
+        while True:
+            self.vault("sync", "now", "--repo", nc, "--timeout", "120", check=False, timeout=300)
+            rc, out = self.vault("sync", "status", "--json", "--repo", nc, check=False)
+            try:
+                js = json.loads(out)
+            except ValueError:
+                js = {}
+            alerts = js.get("alerts") or {}
+            active = [k for k, a in alerts.items() if isinstance(a, dict) and a.get("active")]
+            tries.append({"at": now_iso(), "rc": rc, "active": active, "problems": js.get("problems")})
+            ok = rc == 0 and not active and not js.get("problems")
+            if ok or time.time() >= deadline:
+                break
+            time.sleep(sm.get("alarmsPollSeconds", 15))
+        v["alarms"] = {"ok": ok, "tries": len(tries), "last": tries[-1], "alerts": sorted(alerts)}
+        self.save()
+        if not ok:
+            raise StepFailed("alarms after the freeze release: %s" % json.dumps(tries[-1], ensure_ascii=False))
+
     def step_13b(self):
-        rc, o, _ = self.server("s13b-backup", check=False)
         v = self.values()
+        if self.secondary:
+            # the store joins backup.stores; a failed first backup keeps it there, so the nightly
+            # unit tries again and its status says so (dropping it would end its backups silently)
+            rc, o, _ = self.server("s13b-backup-add", check=False)
+            v["backup13b"] = o
+            v["c9Ready"] = rc == 0
+            self.save()
+            if rc != 0:
+                raise StepFailed("13b first backup of %s failed (it stays in backup.stores): the old repository "
+                                 "must not be retired" % self.srv["store"])
+            return
+        rc, o, _ = self.server("s13b-backup", check=False)
         v["backup13b"] = o
         if rc != 0:
             v["c9Ready"] = False
@@ -1000,6 +1435,11 @@ class Driver:
 
     def undo_10(self):
         v, m = self.values(), self.mac
+        repo = expand(m["repo"])
+        if v.get("oldPathLinked") and os.path.islink(repo) and os.readlink(repo) == expand(m["newClone"]):
+            os.unlink(repo)
+            v["oldPathLinked"] = False
+            self.save()
         for path, target in (v.get("linksBefore") or {}).items():
             swap_symlink(expand(path), target)
         sf = expand(m["storesFile"])
@@ -1072,6 +1512,11 @@ class Driver:
             undo("1", u1)
         if "2" in ran and v.get("coreStopped") and not v.get("coreStarted"):
             undo("2", self.core_start)
+        if "2" in ran and self.secondary and v.get("projectFreezeDone"):
+            def u2():
+                for cmd in self.project.get("undoCommands", []):
+                    self.run(expand_cmd(cmd), timeout=600)
+            undo("2", u2)
         rb["endedAt"] = now_iso()
         rb["failed"] = [n for n, s in rb["steps"].items() if s != "done"]
         self.save()
@@ -1099,7 +1544,7 @@ class Driver:
             lines.append("- rollback: %s" % json.dumps(st["rollback"]["steps"], ensure_ascii=False))
         v = st.get("values", {})
         for k in ("HEAD_final", "pointerCommit", "cutoverTip", "coreAlreadyStopped", "sessionsCutAtStop", "statusUnknown",
-                  "c9Ready", "smoke"):
+                  "projectSessionsAtFreeze", "refsPre", "refs4", "mustIgnore", "alarms", "backup13b", "c9Ready", "smoke"):
             if k in v:
                 lines.append("- %s: %s" % (k, json.dumps(v[k], ensure_ascii=False)))
         md = os.path.join(self.work, "REPORT.md")
@@ -1174,7 +1619,7 @@ class Driver:
                     if s == "13b":
                         return self.finish("success", "cut over; " + st["reason"])
                     if not self.values().get("coreStarted"):
-                        self.core_start()
+                        self.core_start()        # main mode only (secondary never stops it)
                     return self.finish("halted", st["reason"])
                 self.end_step(s, "done", 0)
                 if stop_after and s == stop_after:
@@ -1276,6 +1721,10 @@ def cmd_launchd(drv, a):
         print("removed %s" % label)
         return 0
     at = dt.datetime.strptime(a.at, "%Y-%m-%dT%H:%M")
+    if a.action == "install":
+        # StartCalendarInterval has no year: a minute already gone (or gone while installing) would
+        # fire a year later, and the window check would call that run missed
+        refuse_start(at, dt.datetime.now())
     me = os.path.abspath(__file__)
     if not me.startswith(drv.work.rstrip("/") + "/"):
         raise SystemExit("run `stage` first: launchd must start the copy in workDir, not %s" % me)
@@ -1296,6 +1745,13 @@ def cmd_launchd(drv, a):
     subprocess.run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), plist], check=True)
     print("installed %s at %s → %s" % (label, a.at, plist))
     return 0
+
+
+def refuse_start(at, now):
+    lead = (at - now).total_seconds()
+    if lead < LAUNCHD_LEAD_SECONDS:
+        raise SystemExit("--at %s is %s: give a start at least %d seconds ahead" % (
+            at.strftime("%Y-%m-%dT%H:%M"), "past" if lead <= 0 else "only %d seconds ahead" % lead, LAUNCHD_LEAD_SECONDS))
 
 
 def cmd_launch(drv, a):

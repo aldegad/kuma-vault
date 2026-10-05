@@ -87,10 +87,15 @@ function resolveStoreEntry(storeId, rawPath) {
 //
 //   { "root": "/abs/…/vault", "mode": "local" | "remote",
 //     "remote": { "server": "http://host:7741", "store": "<server store id>", "tokenFile"?: "/abs" },
-//     "search": "remote" | "local", "lfsCacheMaxGB"?: <number>, "sparse"?: [<path>, …] }
+//     "lfsCacheMaxGB"?: <number>, "sparse"?: [<path>, …] }
 //
 // plus an optional top-level `"default": "<store-id>"`. A v1 string value reads as
 // `{ root, mode: "local" }`. Writes are always v2 (`vault store …`), never hand edits.
+//
+// `"search": "local" | "remote"` is a retired key (vault search was removed): a registry that
+// still carries it is read, the value is kept so a write round-trips it, and nothing acts on it.
+// `vault store list|show` names every entry that has it; `vault store set <id> --clear-search`
+// removes it.
 export const STORE_REGISTRY_VERSION = 2;
 const ENTRY_KEYS = new Set(["root", "mode", "remote", "search", "lfsCacheMaxGB", "sparse"]);
 const REMOTE_KEYS = new Set(["server", "store", "tokenFile"]);
@@ -101,7 +106,7 @@ export function normalizeStoreEntry(storeId, raw) {
   if (typeof raw === "string") {
     if (!raw.trim()) throw new Error(`store "${storeId}" must map to a non-empty path string.`);
     if (!isAbsolute(resolveHomeRelative(raw))) throw new Error(`store "${storeId}" path must be absolute (or ~-anchored): ${raw}`);
-    return { root: raw, mode: "local", search: "local" };
+    return { root: raw, mode: "local" };
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(`store "${storeId}" must be a path string (v1) or an entry object (v2).`);
@@ -137,10 +142,10 @@ export function normalizeStoreEntry(storeId, raw) {
   } else if (raw.remote !== undefined) {
     throw new Error(`store "${storeId}" has a "remote" block but mode is "local".`);
   }
-  const search = raw.search ?? (mode === "remote" ? "remote" : "local");
-  if (search !== "local" && search !== "remote") throw new Error(`store "${storeId}" search must be "local" or "remote".`);
-  if (search === "remote" && mode !== "remote") throw new Error(`store "${storeId}" search "remote" needs mode "remote".`);
-  entry.search = search;
+  if (raw.search !== undefined) {
+    if (raw.search !== "local" && raw.search !== "remote") throw new Error(`store "${storeId}" search must be "local" or "remote".`);
+    entry.search = raw.search;
+  }
   if (raw.lfsCacheMaxGB !== undefined) {
     if (typeof raw.lfsCacheMaxGB !== "number" || !Number.isFinite(raw.lfsCacheMaxGB) || raw.lfsCacheMaxGB <= 0) {
       throw new Error(`store "${storeId}" lfsCacheMaxGB must be a positive number.`);
@@ -188,8 +193,8 @@ export function parseStoreRegistry(parsed) {
  * - `invalid` — null, or a human message when the file is present but
  *   unparseable / the wrong shape (a loud error the caller surfaces; pointers
  *   are then not resolvable).
- * - `stores` — Map<store-id, { status, rootDir, declaredId?, detail?, mode, search,
- *   remote?, lfsCacheMaxGB?, sparse? }>. Empty when the file is absent or invalid.
+ * - `stores` — Map<store-id, { status, rootDir, declaredId?, detail?, mode,
+ *   remote?, search? (retired, ignored), lfsCacheMaxGB?, sparse? }>. Empty when the file is absent or invalid.
  */
 export function loadStoreRegistry(env = process.env) {
   const path = resolveStoreRegistryPath(env);

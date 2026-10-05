@@ -9,8 +9,7 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { credentialModes, credentialRoots, isLooseMode } from "./credential-modes.mjs";
-import { credentialRootOf, crossesSecretDir, isCredentialDirName } from "./secret-dirs.mjs";
-import { SEARCH_EXCLUDED_DIR_NAMES, crossesSecretDir as searchCrossesSecretDir } from "../engine/vault-search.mjs";
+import { SECRET_DIR_NAMES, credentialRootOf, crossesSecretDir, isCredentialDirName } from "./secret-dirs.mjs";
 
 let root;
 
@@ -33,9 +32,8 @@ afterEach(() => {
 });
 
 describe("secret-dirs resolver", () => {
-  it("is the one the search surfaces use", () => {
-    expect(SEARCH_EXCLUDED_DIR_NAMES).toEqual(["_credentials", "_sync-conflicts"]);
-    expect(searchCrossesSecretDir).toBe(crossesSecretDir);
+  it("names the two secret directories and matches them as whole components in any case", () => {
+    expect(SECRET_DIR_NAMES).toEqual(["_credentials", "_sync-conflicts"]);
     expect(crossesSecretDir("x/_credentials")).toBe(true);
     expect(crossesSecretDir("a/_Sync-Conflicts/b.md")).toBe(true);
     expect(crossesSecretDir("a/credentials/b.md")).toBe(false);

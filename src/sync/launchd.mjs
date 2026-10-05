@@ -2,7 +2,8 @@
 //
 // KeepAlive restarts it after a crash or a kill; RunAtLoad starts it at login. launchd hands a
 // job a bare PATH, so the plist carries one built from where node, git and git-lfs are now, and
-// pins git by absolute path (KUMA_VAULT_GIT) so no agent shim sits in front of it.
+// pins git by absolute path (KUMA_VAULT_GIT) so no agent shim sits in front of it. A clone with
+// enrich on autosave also gets the directories of the provider CLIs found at install time.
 
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -86,13 +87,30 @@ function waitUnloaded(label, timeoutMs) {
   }
 }
 
-export function launchdInstall(ctx, { node = process.execPath } = {}) {
+/**
+ * The job's PATH: where node, git and git-lfs are, the system directories, and where each of
+ * `tools` (command names the daemon spawns besides git: the enrich provider CLIs) is found now.
+ * Returns `{ path, found, missing }`.
+ */
+export function launchdPath({ node, git, lfs, tools = [], find = findOnPath }) {
+  const found = [];
+  const missing = [];
+  for (const name of tools) {
+    const at = find(name);
+    if (at) found.push({ name, dir: dirname(at) });
+    else missing.push(name);
+  }
+  const dirs = [...new Set([dirname(node), dirname(git), dirname(lfs), ...found.map((t) => t.dir), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])];
+  return { path: dirs.join(":"), found, missing };
+}
+
+export function launchdInstall(ctx, { node = process.execPath, tools = [] } = {}) {
   if (process.platform !== "darwin") throw new Error("vault sync install uses launchd (macOS only)");
   const git = gitBin();
   const lfs = findOnPath("git-lfs");
   if (!lfs) throw new Error("git-lfs not found on PATH");
-  const dirs = [...new Set([dirname(node), dirname(git), dirname(lfs), "/usr/bin", "/bin", "/usr/sbin", "/sbin"])];
-  const env = { PATH: dirs.join(":"), KUMA_VAULT_GIT: git };
+  const jobPath = launchdPath({ node, git, lfs, tools });
+  const env = { PATH: jobPath.path, KUMA_VAULT_GIT: git };
   if (process.env.KUMA_VAULT_SYNC_DIR) env.KUMA_VAULT_SYNC_DIR = process.env.KUMA_VAULT_SYNC_DIR;
   const label = launchdLabel(ctx.store);
   const path = plistPath(ctx.store);
@@ -107,7 +125,7 @@ export function launchdInstall(ctx, { node = process.execPath } = {}) {
   // "speculative" spawn that never starts; kickstart starts it now. KeepAlive does the rest.
   const kick = launchctl(["kickstart", `${domain()}/${label}`]);
   if (kick.status !== 0) throw new Error(`launchctl kickstart failed: ${kick.stderr.trim() || kick.stdout.trim()}`);
-  return { label, plist: path, env };
+  return { label, plist: path, env, tools: { found: jobPath.found, missing: jobPath.missing } };
 }
 
 export function launchdUninstall(ctx) {

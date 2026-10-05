@@ -8,21 +8,25 @@
 
 export const LFS_EXTENSIONS = Object.freeze([
   // images
-  "png", "jpg", "jpeg", "gif", "webp", "heic", "psd", "aseprite", "sai",
+  "png", "jpg", "jpeg", "gif", "webp", "heic", "psd", "aseprite", "sai", "bmp", "tif", "tiff", "exr",
   // 3D
-  "blend", "blend1", "glb",
+  "blend", "blend1", "glb", "ply", "stl", "3mf", "model", "fbx", "vdb",
+  // 3D geometry and print jobs that are text (obj, gltf, step, stp, gcode) but reach hundreds of MB
+  "obj", "gltf", "step", "stp", "gcode", "bgcode",
   // video
   "mp4", "mov", "webm", "mkv", "avi",
   // audio
-  "mp3", "wav", "m4a", "ogg",
+  "mp3", "wav", "m4a", "ogg", "flac", "aif", "aiff",
   // documents
-  "pdf", "hwp", "docx", "xlsx", "pptx", "xls",
+  "pdf", "hwp", "docx", "xlsx", "pptx", "xls", "doc", "hwpx", "odp",
   // archives
   "zip", "zst", "gz", "tgz", "7z", "tar", "aar",
   // fonts
   "ttf", "otf", "woff2",
   // arrays / databases
   "npy", "npz", "sqlite",
+  // compiled modules
+  "wasm",
   // notebooks (text, but they embed images and grow large)
   "ipynb",
 ]);
@@ -89,6 +93,7 @@ export function renderLfsPointer(oid, size) {
 // write-then-rename temps `<file>.<pid>.<uuid|ms>.tmp`, `<file>.tmp.<pid>[.<ts>]`,
 // `<file>.tmp-<suffix>`, `<file>.tmp-journal`.
 export const DEFAULT_JUNK_PATTERNS = Object.freeze([
+  // the search cache engines before the search removal kept in a clone; a clone may still hold one
   ".fts/",
   "*.commit-lock",
   ".*.commit-lock",

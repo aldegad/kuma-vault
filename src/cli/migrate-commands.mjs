@@ -637,7 +637,7 @@ export function runToRemote(options) {
   if (!existing) git(["remote", "add", remoteName, url], { cwd: top, env });
   git(["config", `lfs.${url}/info/lfs.locksverify`, "false"], { cwd: top, env });
   if (tokenFile) {
-    // the sync daemon, git-lfs and remote search use the same credential `vault clone` sets up
+    // the sync daemon and git-lfs use the same credential `vault clone` sets up
     const raw = readFileSync(resolve(tokenFile), "utf8").trim();
     const token = raw.startsWith("{") ? JSON.parse(raw).token : raw;
     const privateDir = join(gitDir, "kuma-vault");

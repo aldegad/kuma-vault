@@ -1,7 +1,7 @@
 {
   "name": "kuma-vault",
   "version": "0.1.0",
-  "description": "Compiler vault engine: a repo-agnostic knowledge-base compiler (frontmatter parser, sync, lint, search, FTS, sidecar, enrich) with a git pre-commit drift gate.",
+  "description": "Compiler vault engine: a repo-agnostic knowledge-base compiler (frontmatter parser, sync, lint, get, sidecar, enrich) with a git pre-commit drift gate.",
   "type": "module",
   "license": "Apache-2.0",
   "author": "Soohong Kim <aldegad@gmail.com> (https://github.com/aldegad)",
@@ -32,7 +32,6 @@
   ],
   "scripts": {
     "test": "vitest run --passWithNoTests",
-    "repro:drift-gate": "node scripts/repro-precommit-drift-race.mjs",
     "package:plugin": "node scripts/package-plugin.mjs",
     "test:packaging": "node --test scripts/package-plugin.test.mjs"
   },

@@ -6,3 +6,5 @@ g count-objects -v
 g fsck --connectivity-only --no-progress
 out serverFiles "$(find "$O" -type f | wc -l)"
 out serverBytes "$(du -sB1 --apparent-size "$O" | cut -f1)"
+# every ref of the copy with its object type (D5: only the source branch, a commit)
+echo "C8BEGIN refs"; g for-each-ref --format='%(refname) %(objecttype)'; echo "HEAD $(g symbolic-ref -q HEAD || echo detached)"; echo "C8END refs"

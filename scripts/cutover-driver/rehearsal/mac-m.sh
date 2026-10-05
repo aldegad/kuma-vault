@@ -100,7 +100,7 @@ cfg = {
    "storesFile": C + "/home/.kuma/vault-stores.json",
    "beforeFreeze": [[V, "sync", "--root", C + "/mac/kuma-brain/vault"]],
    "storeCommands": [["store", "rename", "kuma-brain", STORE, "--root", NC + "/vault"],
-                     ["store", "set", STORE, "--mode", "remote", "--server", URL, "--remote-store", STORE, "--search", "remote",
+                     ["store", "set", STORE, "--mode", "remote", "--server", URL, "--remote-store", STORE,
                       "--lfs-cache-max-gb", "10", "--token-file", RT + "/serve/token", "--default"]],
    "cloneUrl": URL + "/v1/stores/" + STORE + ".git", "cloneTokenFile": RT + "/serve/token",
    "projectsJson": C + "/home/.kuma/projects.json", "kumaStudio": RT + "/studio",
@@ -123,7 +123,7 @@ cfg = {
             "rejectRel": "projects/kuma-vault/remote-brain/binaries-reject.json",
             "extraDeletePathsRel": "vault/projects/kuma-vault/remote-brain/rewrite-extra-delete-paths.txt",
             "filterRepo": "-", "receipts": C + "/srv/receipts", "ignoreTokenIds": ["c8a-rehearsal"]},
- "smoke": {"planFile": "vault/plans/kuma-vault/c8-smoke.md", "logFile": "vault/_c8-smoke/log.md", "searchQuery": "note",
+ "smoke": {"planFile": "vault/plans/kuma-vault/c8-smoke.md", "logFile": "vault/_c8-smoke/log.md",
            "blobPath": None, "rejectPath": None, "bigPath": None, "launchdRestart": True},
  "notify": {"command": sim("notify")},
 }

@@ -3,8 +3,11 @@
 //
 // Everything is read from the clone itself (`remote.origin.url`, `kuma-vault.*` git config set
 // by `vault clone`) so the daemon needs no other registry. Tunables have the design's values
-// and may be overridden per clone with `git config kuma-vault.<key> <value>` (tests do).
+// and may be overridden per clone with `git config kuma-vault.<key> <value>` (tests do), read
+// when the daemon starts; the switches likewise (`git config kuma-vault.enrich.onAutosave true`),
+// read again every tick.
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -27,6 +30,7 @@ export const TUNABLES = [
   ["textforceseconds", "textForceMs", 600, SECOND], // text still changing after this is saved anyway
   ["futuremtimeseconds", "futureMtimeMs", 5 * 60, SECOND], // an mtime this far ahead is a wrong clock, not a write
   ["gateretryseconds", "gateRetryMs", 600, SECOND], // a blocked autosave is retried after this
+  ["gatedriftretries", "gateDriftRetries", 2, 1], // regenerate-and-commit again this often when the gate refused for drift alone
   ["maxnonlfsbytes", "maxNonLfsBytes", 32 * 1024 * 1024, 1], // receive rule 4
   ["uncollectedageseconds", "uncollectedAgeMs", 30 * 60, SECOND],
   ["uncollectedalarmseconds", "uncollectedAlarmMs", 60 * 60, SECOND],
@@ -44,7 +48,23 @@ export const TUNABLES = [
   ["lfscachemaxgb", "lfsCacheMaxBytes", 10, 1e9 * 1.073741824], // GiB, as the design's 10737418240
   ["unpushedwarnseconds", "unpushedWarnMs", 24 * 60 * 60, SECOND],
   ["stalelockseconds", "staleLockMs", 10 * 60, SECOND], // a git lock this old with no git running is removed
+  ["enrich.pertick", "enrichPerTick", 2, 1], // enrich on autosave: model calls one tick may make
+  ["enrich.perhour", "enrichPerHour", 10, 1], // ... and the last hour may have made
+  ["enrich.retryseconds", "enrichRetryMs", 30 * 60, SECOND], // a failed enrich run waits this long
 ];
+
+// [git config key, settings name, default]: on/off switches (`true`/`false`, as git reads them).
+export const SWITCHES = [
+  ["enrich.onautosave", "enrichOnAutosave", false], // describe the knowledge pages this clone committed
+];
+
+const SWITCH_VALUES = new Map([
+  ["", true], ["true", true], ["yes", true], ["on", true], ["1", true], // a bare key is true to git
+  ["false", false], ["no", false], ["off", false], ["0", false],
+]);
+
+/** Every commit the daemon makes starts with this (autosave, merge). */
+export const DAEMON_SUBJECT = "vault-sync: ";
 
 export const BACKOFF_MS = Object.freeze([2 * SECOND, 5 * SECOND, 15 * SECOND, MINUTE, 5 * MINUTE]);
 export { SECOND, MINUTE, HOUR, DAY };
@@ -76,6 +96,26 @@ async function readClonedConfig(repo) {
   return map;
 }
 
+function readSwitches(cfg) {
+  const switches = {};
+  for (const [key, name, fallback] of SWITCHES) {
+    const raw = cfg.get(key);
+    const value = raw === undefined ? fallback : SWITCH_VALUES.get(raw.trim().toLowerCase());
+    if (value === undefined) throw new Error(`git config kuma-vault.${key} must be true or false (got "${raw}")`);
+    switches[name] = value;
+  }
+  return switches;
+}
+
+/**
+ * Read the switches again from the clone's git config into `ctx.settings` (every tick does, so
+ * `git config kuma-vault.enrich.onAutosave false` holds from the next tick, with no restart). A
+ * value git cannot read as true or false throws, as at start. The tunables are read at start.
+ */
+export async function refreshSwitches(ctx) {
+  Object.assign(ctx.settings, readSwitches(await readClonedConfig(ctx.repo)));
+}
+
 /** Read `binaries.reject` from the tree's vault.config.json (tree-relative gitignore globs). */
 export function readRejectPatterns(treeAbs) {
   const path = join(treeAbs, "vault.config.json");
@@ -91,6 +131,17 @@ export function readRejectPatterns(treeAbs) {
     throw new Error(`vault.config.json binaries.reject at ${treeAbs} must be a list of strings`);
   }
   return list;
+}
+
+/**
+ * The tree's declaration as it stands on disk, as a digest of its bytes (null: the tree declares
+ * none). Read again by every autosave pass: a block the gate made while one declaration stood is
+ * asked again as soon as the declaration changes, not after `gateRetryMs` or a restart.
+ */
+export function declarationDigest(treeAbs) {
+  const path = join(treeAbs, "vault.config.json");
+  if (!existsSync(path)) return null;
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
 /**
@@ -123,6 +174,7 @@ export async function loadContext(start, { env = process.env } = {}) {
     if (!Number.isFinite(value) || value < 0) throw new Error(`git config kuma-vault.${key} must be a number >= 0 (got "${raw}")`);
     settings[name] = value * unit;
   }
+  Object.assign(settings, readSwitches(cfg));
 
   const stateDir = syncStateDir(env);
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });

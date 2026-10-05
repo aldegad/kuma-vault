@@ -3,7 +3,8 @@
 # (rehearsal "M"). The real blocks need Linux (read-only bind mounts, findmnt, a serve user);
 # rehearsal "S" runs them. This stand-in produces what the driver reads from each block, with
 # a real `vault serve` (token mode, loopback) so the client steps (clone, store, sync daemon,
-# push, LFS, search) talk to a real server process.
+# push, LFS, search) talk to a real server process. Main mode only: the secondary-mode blocks
+# (a server that already serves stores, backup.stores) are rehearsed by "S".
 #
 #   standin-server.sh <block>      environment = the driver's server variables, plus
 #   STANDIN_DIR (serve state), STANDIN_PORT, STANDIN_INSTALLED_SHA, STANDIN_NODE, STANDIN_ENGINE
@@ -53,7 +54,9 @@ case "$block" in
     out snapshotConnected true; out mapRows 0 ;;
   s4-inventory)
     out serverHead "$(git --no-optional-locks -C "$O" rev-parse HEAD)"
-    out serverFiles "$(find "$O" -type f | wc -l | tr -d ' ')" ;;
+    out serverFiles "$(find "$O" -type f | wc -l | tr -d ' ')"
+    echo "C8BEGIN refs"; git --no-optional-locks -C "$O" for-each-ref --format='%(refname) %(objecttype)'
+    echo "HEAD $(git --no-optional-locks -C "$O" symbolic-ref -q HEAD || echo detached)"; echo "C8END refs" ;;
   s5-rewrite)        # no history rewrite: a mirror of the frozen repo, branch main, P = its tip
     rm -rf "$SRC"; git clone -q --mirror "$O" "$SRC"
     git -C "$SRC" branch -m master main; git -C "$SRC" symbolic-ref HEAD refs/heads/main
@@ -70,6 +73,7 @@ case "$block" in
     git -C "$W" ls-files -z '*/.gitattributes' | xargs -0 git -C "$W" rm -q --
     git -C "$W" add -- "$TREE/vault.config.json" .gitignore "$TREE/$MAPREL"
     git -C "$W" -c core.hooksPath=/dev/null commit -q -m "vault-migrate: $STORE 설정 (stand-in)"
+    echo "C8BEGIN gitignore"; cat "$W/.gitignore"; echo "C8END gitignore"
     git -C "$W" log --format=%h -n 3 > "$R/refmap-candidates.txt"; echo deadbeef1 >> "$R/refmap-candidates.txt"
     out candidates "$(wc -l < "$R/refmap-candidates.txt" | tr -d ' ')"
     echo "C8BEGIN refmap-candidates"; cat "$R/refmap-candidates.txt"; echo "C8END refmap-candidates" ;;
@@ -84,7 +88,6 @@ case "$block" in
     git --git-dir "$D/origin.git" config uploadpack.allowAnySHA1InWant true
     git --git-dir "$D/origin.git" config http.receivepack true
     registered || conf_edit add
-    "$V" server reindex --store "$STORE" --full --config "$CONF" >/dev/null
     serve_up
     curl -s "http://127.0.0.1:$STANDIN_PORT/v1/health" | jq -e '.configError == null' >/dev/null
     out storeRegistered true ;;

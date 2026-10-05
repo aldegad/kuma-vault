@@ -1,20 +1,15 @@
-// The pre-commit drift gate — what it refuses and what it heals.
+// The pre-commit drift gate — what it refuses.
 //
 // `vault sync --check` is what the installed git hook runs, so this file pins the gate's
 // contract at the exact seam the hook uses: `commandVaultSync({ check: true })` and the exit
 // code it leaves behind.
 //
-// The gate splits derivations by RESIDENCE, not by how they look:
-//   - TRACKED (README vault-index regions, binary sidecars) live inside the commit. Drift there
-//     means the snapshot the commit would capture disagrees with its own generator → refuse.
-//   - CACHE (the `.fts/` index) lives outside the commit. It cannot make a commit inconsistent
-//     → heal it from the live tree and let the commit through (원칙 1's self-heal clause).
-//
-// The regression this guards: on 2026-07-31 three commits were refused because ANOTHER session
-// had edited a page, moving the FTS corpus signature. Nothing about those commits was wrong.
-// The negative controls below are the other half of that contract — healing a cache must never
-// soften detection of drift that is actually in the commit.
+// The derivations (README vault-index regions, binary sidecars) live inside the commit. Drift
+// there means the snapshot the commit would capture disagrees with its own generator → refuse.
+// An edit that moves no derivation (a page body) passes: on 2026-07-31 three such commits were
+// refused over a search cache, which no longer exists.
 
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -22,7 +17,6 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { commandVaultSync } from "./vault-commands.mjs";
-import { checkFtsIndex } from "../engine/vault-fts.mjs";
 
 function leafPage(title, description, body) {
   return `---
@@ -46,7 +40,7 @@ afterEach(async () => {
 });
 
 // A declared tree (root vault.config.json) with two leaf pages, fully converged: every
-// derivation — index, sidecars, FTS cache — is at its fixed point before a scenario starts.
+// derivation — index, sidecars — is at its fixed point before a scenario starts.
 async function makeConvergedVault(prefix) {
   const tempRoot = await mkdtemp(join(tmpdir(), prefix));
   tempRoots.push(tempRoot);
@@ -65,56 +59,48 @@ async function makeConvergedVault(prefix) {
 
 // Drive the real composed command the way the hook does, capturing stdout and the exit code it
 // sets without letting either leak into the test runner's own process state.
-async function runSync(vaultDir, { check }) {
+async function runSync(vaultDir, { check, extra = {} }) {
   const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
   const priorExit = process.exitCode;
   let written = "";
+  let errors = "";
   stdout.mockImplementation((chunk) => {
     written += String(chunk);
     return true;
   });
+  stderr.mockImplementation((chunk) => {
+    errors += String(chunk);
+    return true;
+  });
   try {
     process.exitCode = 0;
-    await commandVaultSync({ "vault-dir": vaultDir, ...(check ? { check: true } : {}) });
-    return { exitCode: process.exitCode ?? 0, stdout: written };
+    await commandVaultSync({ "vault-dir": vaultDir, ...(check ? { check: true } : {}), ...extra });
+    return { exitCode: process.exitCode ?? 0, stdout: written, stderr: errors };
   } finally {
     stdout.mockRestore();
+    stderr.mockRestore();
     process.exitCode = priorExit;
   }
 }
 
 describe("pre-commit drift gate", () => {
-  describe("cache drift — heals, never blocks", () => {
-    it("lets a commit through when only another session's edit staled the FTS cache", async () => {
-      const vaultDir = await makeConvergedVault("kuma-gate-cache-stale-");
-      // Session A edits a page body. Title and description are untouched, so every TRACKED
-      // derivation stays correct — only the FTS corpus signature moved.
+  describe("no derivation moved — passes", () => {
+    it("lets a commit through when another session edited only a page body", async () => {
+      const vaultDir = await makeConvergedVault("kuma-gate-body-edit-");
+      // Title and description are untouched, so every derivation stays correct.
       await writeFile(
         join(vaultDir, "domains", "beta.md"),
         leafPage("Beta", "beta page", "beta, edited by another session"),
         "utf8",
       );
-      expect((await checkFtsIndex({ vaultDir })).wouldRebuild).toBe(true);
 
       const gate = await runSync(vaultDir, { check: true });
 
       expect(gate.exitCode).toBe(0);
       expect(gate.stdout).toContain("index: 0 drifted");
-      // The heal is announced, not silent (원칙 6).
-      expect(gate.stdout).toContain("fts: healed");
-      // And it actually healed: the cache now matches the live tree.
-      expect((await checkFtsIndex({ vaultDir })).wouldRebuild).toBe(false);
-    });
-
-    it("heals an absent cache at the gate instead of refusing the commit", async () => {
-      const vaultDir = await makeConvergedVault("kuma-gate-cache-absent-");
-      await rm(join(vaultDir, ".fts"), { recursive: true, force: true });
-
-      const gate = await runSync(vaultDir, { check: true });
-
-      expect(gate.exitCode).toBe(0);
-      expect(gate.stdout).toContain("fts: healed");
-      expect((await checkFtsIndex({ vaultDir })).wouldRebuild).toBe(false);
+      expect(gate.stdout).not.toMatch(/^fts:/mu);
+      expect(existsSync(join(vaultDir, ".fts"))).toBe(false);
     });
 
     it("stays a no-op on a converged tree (원칙 5 — the gate does not rewrite what is in sync)", async () => {
@@ -124,8 +110,17 @@ describe("pre-commit drift gate", () => {
       const gate = await runSync(vaultDir, { check: true });
 
       expect(gate.exitCode).toBe(0);
-      expect(gate.stdout).toContain("fts: in sync");
       expect(await readFile(join(vaultDir, "domains", "README.md"), "utf8")).toBe(before);
+    });
+
+    it("accepts the retired --no-fts and says it has no effect", async () => {
+      const vaultDir = await makeConvergedVault("kuma-gate-no-fts-");
+
+      const gate = await runSync(vaultDir, { check: true, extra: { "no-fts": true } });
+
+      expect(gate.exitCode).toBe(0);
+      expect(gate.stderr).toBe("--no-fts has no effect: the FTS index was removed (accepted until the next release)\n");
+      expect((await runSync(vaultDir, { check: true })).stderr).toBe("");
     });
   });
 
@@ -157,22 +152,6 @@ describe("pre-commit drift gate", () => {
 
       expect(gate.exitCode).toBe(1);
       expect(gate.stdout).toContain("- [drift] domains/README.md");
-    });
-
-    it("refuses tracked drift even while it heals the cache in the same run", async () => {
-      const vaultDir = await makeConvergedVault("kuma-gate-both-");
-      // Both at once: a new page (tracked drift) AND the cache behind the live tree.
-      await writeFile(
-        join(vaultDir, "domains", "delta.md"),
-        leafPage("Delta", "delta page", "delta"),
-        "utf8",
-      );
-
-      const gate = await runSync(vaultDir, { check: true });
-
-      // The cache healed and the gate still refused — the two classes are decided separately.
-      expect(gate.stdout).toContain("fts: healed");
-      expect(gate.exitCode).toBe(1);
     });
   });
 });

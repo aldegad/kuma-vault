@@ -2,7 +2,7 @@
 
 `vault serve` keeps the canonical copy of one or more vault stores on a server and lets
 clients push, fetch and move large files over the tailnet. The client half (clone, sync
-daemon) and remote search are separate.
+daemon) is separate.
 
 The server code lives in `src/server/` and imports nothing from the compiler engine, so a
 bare engine checkout with no `node_modules` can serve. This page is the reference; to build a
@@ -76,9 +76,7 @@ anything; without the `kuma-vault` user (no install yet) it stops too.
 | `POST /v1/stores/<id>.git/info/lfs/objects/verify` | writer |
 | `GET /v1/stores/<id>/events?after=<seq>` | reader (long-poll, 25 s) |
 | `GET /v1/stores/<id>/backup-status` | reader (`state/backup-status.json`, written by the backup job) |
-| `POST /v1/stores/<id>/search` `{q, limit, mode}` | reader — the store's search index (below) |
-| `POST /v1/stores/<id>/timeline` `{q, limit}` | reader — the same, with timeline snippets |
-| `GET /v1/stores/<id>/file?path=<tree path>&rev=<main\|sha>` | reader — one regular file, read from git objects |
+| `GET /v1/stores/<id>/file?path=<tree path>&rev=<main\|sha>` | reader — one regular file, read from git objects (below) |
 
 Clients use `http://<server>:7741/v1/stores/<id>.git` as the git remote. git-lfs derives the
 LFS endpoint from it, so no `lfs.url` is needed. LFS locking is not served (501); set
@@ -306,31 +304,19 @@ before the refs are sent); v1 does not reclaim them.
 `growthAlert.thresholdGB` (5 GB) over `growthAlert.windowDays` (7), measured from object
 mtimes and rescanned every 10 minutes.
 
-## Search index
+## The file API
 
-`vault serve` keeps one SQLite FTS5 index per `vault` store in `<store>/index/vault-fts.db`
-(outside `state/`, so the backup skips it; outside `tree/`, which a push shapes). It is built
-from git objects of `origin.git` — `ls-tree` and blobs — never from the `tree/` checkout: a
-pushed tree may hold symlinks, even ones pointing outside the store, and a filesystem read
-would follow them. A symlink or gitlink entry is simply not indexed; candidates are re-read at
-query time as `<indexed commit>:<path>` blobs.
+`GET /v1/stores/<id>/file` reads one regular file of the tree declared at the repo root or under
+`vault/`, from git objects of `origin.git` (`ls-tree` and blobs), never from the `tree/` checkout:
+a pushed tree may hold symlinks, even ones pointing outside the store, and a filesystem read would
+follow them. It refuses `_credentials/` and `_sync-conflicts/` at any depth in any case, `.git`
+components, `..`, symlinks, gitlinks and directories, and serves only `main` or its ancestors.
+The answer carries `X-Vault-Commit`, `X-Vault-Blob` and `X-Vault-Mode`.
 
-- **Increments.** Every 5 seconds the indexer looks at `state/events.jsonl`; when its last seq
-  moved past `state/index.json` `lastSeq`, it diffs the indexed commit to `main` and
-  re-indexes only those paths. A history that does not descend from the indexed commit, a
-  changed `vault.config.json`, or a schema change rebuilds the whole index aside and renames it
-  in. `vault server reindex --store <id> [--full]` does the same on demand (one indexer per
-  store, `state/index.lock`). `KUMA_VAULT_INDEX_INTERVAL_MS` changes the 5 s window.
-- **Corpus.** The engine's own search corpus (Markdown, no dot-directories, no plans slot, no
-  root ledgers) of the tree declared at the repo root or under `vault/`, minus
-  `_credentials/` and `_sync-conflicts/` at any depth in any case. Those two are refused
-  again on every hit and by `file`, which also refuses `.git` components, `..`, symlinks,
-  gitlinks and directories, and serves only `main` or its ancestors.
-- **Answers** carry `indexedCommit`; the client supplements what it changed since (see
-  `docs/remote-mode.md`). A query the trigram index cannot represent (terms under three
-  characters) falls back to scanning the indexed commit and says so in `engineReason`. Before
-  the first index exists, search answers 503.
-- The index needs no npm package: it uses the engine's search modules and Node's `node:sqlite`.
+There is no search index or search API: clients search their clone with `rg`. A store directory
+left by an older server may still hold `<store>/index/` (`vault-fts.db`) and
+`state/index.json` / `state/index.lock`; nothing reads them, and they can be deleted
+(`state/events.jsonl` stays — the clients' sync daemons long-poll it).
 
 ## `server.json`
 
@@ -373,7 +359,6 @@ sudo vault server token rm --id laptop-writer
 sudo vault server set-reject --store kuma-main-vault --from vault/vault.config.json --tree-prefix vault
 #   accepts ["glob", ...] | {"reject": [...]} | {"binaries": {"reject": [...]}}. A vault's list is
 #   relative to its declared tree; rule 7 matches repo paths, so pass --tree-prefix <tree dir>.
-sudo vault server reindex --store kuma-main-vault [--full]
 sudo vault server init-store <id> --owner you@example.com
 sudo vault server store list
 sudo vault server store rm <id>                          # keeps the directory (--keep-data, the default)
@@ -418,7 +403,7 @@ writes it once — `--host <name>`, or this machine's hostname — and later run
 
 Per store, one restic snapshot with `--host <backup.host>` and `--tag <store id>` holding only
 `origin.git`, `lfs/objects`, `state` and the config directory, minus the credential directory.
-`tree/` and its FTS index are rebuilt from `origin.git`; `lfs/incoming/` holds only unverified
+`tree/` is rebuilt from `origin.git`; `lfs/incoming/` holds only unverified
 uploads. Then:
 
 - **forget** keeps `backup.keep` (daily 14, weekly 8, monthly 12) and every snapshot tagged
@@ -509,9 +494,9 @@ the nightly job, the forget range, `forget-path` and the retention clock against
 repository on local disk. The integration test starts serve on a free
 loopback port with a scratch store and drives two clones through pushes, fetches, LFS
 transfers, every receive rule and the token rules. `serve-proxy.integration.test.mjs` pushes an LFS file
-through an HTTPS proxy on loopback and checks the forwarded-header boundary. `search-remote.integration.test.mjs` pushes
-secrets, sync-conflict copies and outward symlinks and checks that no search, timeline or file
-answer carries them, then drives the client's read-your-writes and failure paths. `scripts/server/serve-e2e.sh` checks an
+through an HTTPS proxy on loopback and checks the forwarded-header boundary. `remote-store.integration.test.mjs` pushes
+secrets, sync-conflict copies and outward symlinks and checks that no file answer carries them
+and that no search API or index exists, then moves a local store with `vault migrate to-remote`. `scripts/server/serve-e2e.sh` checks an
 installed instance from a second Linux user (run as root on the server).
 `scripts/server/lfs-reserve-race.mjs` races two LFS uploads against a running serve. Both
 tests use it. It declares large sizes but sends one byte per upload.

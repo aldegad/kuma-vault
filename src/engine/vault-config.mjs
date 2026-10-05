@@ -21,6 +21,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
+import { compileGitignore } from "../server/gitignore-match.mjs";
 import { resolveProfile } from "./vault-profile.mjs";
 
 export const VAULT_CONFIG_FILENAME = "vault.config.json";
@@ -30,7 +31,6 @@ export const VAULT_CONFIG_FILENAME = "vault.config.json";
 const BOOLEAN_KEYS = Object.freeze([
   "sidecar",
   "enrich",
-  "fts",
   "canonicalChecks",
   "enforcePageFrontmatter",
 ]);
@@ -43,6 +43,9 @@ const STRING_LIST_KEYS = Object.freeze([
   "genericPageSections",
   // Tree-relative `domains/<name>.md` paths of the tree's persona-memory pages.
   "personaMemoryPages",
+  // Pages the enrich pass never sends to a model (gitignore syntax, tree-relative,
+  // case-insensitive): the files a person alone writes. `isEnrichTargetPath` reads it.
+  "enrichExclude",
 ]);
 const OVERRIDABLE_KEYS = Object.freeze([
   ...BOOLEAN_KEYS,
@@ -100,6 +103,13 @@ function validateDeclaration(parsed, configPath) {
     const bad = parsed.personaMemoryPages.filter((entry) => !/^domains\/[^/]+\.md$/u.test(entry) || entry === "domains/README.md");
     if (bad.length > 0) {
       throw declarationError(configPath, `"personaMemoryPages" entries must be top-level domains/<name>.md pages other than domains/README.md (got ${bad.join(", ")}).`);
+    }
+  }
+  if ("enrichExclude" in parsed) {
+    try {
+      compileGitignore(parsed.enrichExclude);
+    } catch (error) {
+      throw declarationError(configPath, `"enrichExclude": ${error.message}`);
     }
   }
   if ("plansSlotRoot" in parsed && parsed.plansSlotRoot !== null && typeof parsed.plansSlotRoot !== "string") {

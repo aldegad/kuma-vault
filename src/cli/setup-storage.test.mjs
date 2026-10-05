@@ -13,6 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { VAULT_BIN, createWorld, removeWorld, startServe } from "../../scripts/test/sync-harness.mjs";
 import { parseLfsPointer } from "../server/lfs-paths.mjs";
+import { renderTreeRgignore } from "./policy-commands.mjs";
 import { parseStorageOptions, renderStoreDeclaration, renderStoreGitattributes } from "./setup-storage.mjs";
 
 let world;
@@ -71,10 +72,10 @@ describe("pure parts", () => {
 
   it("writes the policy into a declaration and keeps what was there", () => {
     expect(renderStoreDeclaration("v", [])).toEqual({ profile: "kuma-vault", id: "v", visibility: "private", remotes: { allowed: [] }, binaries: { reject: [] } });
-    const merged = renderStoreDeclaration("v", ["http://h:7741/v1/stores/v.git"], { profile: "kuma-vault", id: "v", remotes: { allowed: ["http://h:7741/v1/stores/v.git/"] }, binaries: { reject: ["a/**"] }, fts: false });
+    const merged = renderStoreDeclaration("v", ["http://h:7741/v1/stores/v.git"], { profile: "kuma-vault", id: "v", remotes: { allowed: ["http://h:7741/v1/stores/v.git/"] }, binaries: { reject: ["a/**"] }, enrich: false });
     expect(merged.remotes.allowed).toEqual(["http://h:7741/v1/stores/v.git/"]);
     expect(merged.binaries.reject).toEqual(["a/**"]);
-    expect(merged.fts).toBe(false);
+    expect(merged.enrich).toBe(false);
   });
 
   it("validates the flags", () => {
@@ -102,13 +103,14 @@ describe.sequential("local", { timeout: 120_000 }, () => {
     expect(decl).toMatchObject({ profile: "kuma-vault", id: "kuma-main-vault", visibility: "private", remotes: { allowed: [] } });
     expect(readFileSync(join(repo, ".gitattributes"), "utf8")).toContain("filter=lfs");
     expect(readFileSync(join(repo, ".gitignore"), "utf8")).toContain(".fts/");
+    expect(world.git(repo, ["show", "HEAD:vault/.rgignore"]).stdout).toBe(renderTreeRgignore(""));
     expect(world.git(repo, ["status", "--porcelain"]).stdout).toBe("");
     expect(world.git(repo, ["remote"]).stdout.trim()).toBe("");
     expect(readFileSync(join(repo, ".git/hooks/pre-commit"), "utf8")).toContain("kuma-vault-sync-hook");
     expect(readFileSync(join(repo, ".git/hooks/pre-push"), "utf8")).toContain("kuma-vault-push-hook");
     const reg = registry(h);
     expect(reg.default).toBe("kuma-main-vault");
-    expect(reg.stores["kuma-main-vault"]).toMatchObject({ root: tree, mode: "local", search: "local" });
+    expect(reg.stores["kuma-main-vault"]).toMatchObject({ root: tree, mode: "local" });
 
     // P2: a hand-added remote is refused by the pre-push allowlist
     const bare = join(world.root, "public.git");
@@ -270,10 +272,11 @@ describe.sequential("server store (token auth)", { timeout: 180_000 }, () => {
     expect(serve.head()).toBe(world.git(repo, ["rev-parse", "HEAD"]).stdout.trim());
     const decl = JSON.parse(serve.show("main", "vault/vault.config.json").stdout);
     expect(decl.remotes.allowed).toEqual([`${server}/v1/stores/kuma-main-vault.git`]);
+    expect(serve.show("main", "vault/.rgignore").stdout).toBe(renderTreeRgignore(""));
     const pointer = parseLfsPointer(Buffer.from(serve.show("main", "vault/domains/notes/pic.png").stdout));
     expect(serve.casHas(pointer.oid)).toBe(true);
     const entry = registry(h).stores["kuma-main-vault"];
-    expect(entry).toMatchObject({ mode: "remote", search: "remote", remote: { server, store: "kuma-main-vault", tokenFile: join(repo, ".git/kuma-vault/token") } });
+    expect(entry).toMatchObject({ mode: "remote", remote: { server, store: "kuma-main-vault", tokenFile: join(repo, ".git/kuma-vault/token") } });
     expect(lstatSync(entry.remote.tokenFile).mode & 0o777).toBe(0o600);
     expect(readlinkSync(join(h.kuma, "vault"))).toBe(join(repo, "vault"));
   });
@@ -327,7 +330,7 @@ describe.sequential("a local store moves to a token server (vault migrate to-rem
 
     // no extra header any more: git finds the token through the helper
     writeAt(tree, "notes/after.md", "# after\n");
-    world.sh(VAULT_BIN, ["sync", "--no-fts", "--root", tree], { extraEnv: h.env });
+    world.sh(VAULT_BIN, ["sync", "--root", tree], { extraEnv: h.env });
     world.git(repo, ["add", "-A"], { extraEnv: h.env });
     world.git(repo, ["commit", "-q", "-m", "after the move"], { extraEnv: h.env });
     const push = world.sh("git", ["push", "-q", "origin", "main"], { cwd: repo, extraEnv: h.env, allowFail: true });

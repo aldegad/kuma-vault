@@ -33,7 +33,10 @@ export const VAULT_PROFILE = Object.freeze({
   sidecarSourceExtensions: Object.freeze([".pdf"]),
   sidecar: true,
   enrich: true,
-  fts: true,
+  // Pages the model never describes although they are targets: gitignore syntax, tree-relative,
+  // case-insensitive (a tree's files a person alone writes, such as its decision ledgers). The
+  // engine names none; a tree declares its own in vault.config.json.
+  enrichExclude: Object.freeze([]),
   // Vault-specific canonical lint scans (projects/ canonical-drift invariants,
   // domain taxonomy tree drift). Off for generic docs-as-code trees that don't
   // carry the vault's projects/domains slot semantics.
@@ -95,7 +98,7 @@ export const DOCS_PROFILE = Object.freeze({
   sidecarSourceExtensions: Object.freeze([]),
   sidecar: false,
   enrich: false,
-  fts: false,
+  enrichExclude: Object.freeze([]),
   canonicalChecks: false,
   personaMemoryPages: Object.freeze([]),
   enforcePageFrontmatter: false,

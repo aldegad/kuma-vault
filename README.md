@@ -1,15 +1,15 @@
 # kuma-vault
 
 **A knowledge base your agents can rely on.** kuma-vault keeps a folder of Markdown notes
-honest the way a compiler keeps code honest: every index, summary and search cache is
-derived from the notes themselves, so they cannot drift apart. It ships as a CLI
+honest the way a compiler keeps code honest: every index and summary is derived from the
+notes themselves, so they cannot drift apart. It ships as a CLI
 (`kuma-vault`, short alias `vault`), a small library, and three agent skills for Claude Code
 and Codex.
 
 What you get:
 
-- **Search that agents can follow** — `search` → `timeline` → `get`, across every vault you
-  register, with a full-text index that handles CJK as well as English.
+- **Plain files agents can search** — a scoped `rg` over the tree finds pages (it skips the
+  secret folders by default), and `vault get` reads one, also across every vault you register.
 - **Folder indexes that maintain themselves** — each folder's `README.md` carries a generated
   index; `vault sync` regenerates it, `vault lint` and a git pre-commit gate catch drift.
 - **Optional one-line summaries** written by the Claude or Codex CLI (`vault sync --enrich`),
@@ -21,7 +21,7 @@ What you get:
 
 ## Requirements
 
-- **Node 22.5 or newer** (the search index uses the built-in `node:sqlite`).
+- **Node 22.5 or newer**.
 - **git 2.38 or newer** and **Git LFS** — large files are stored as LFS pointers.
 - Optional: `kordoc@^4` for PDF text extraction; a `claude` or `codex` CLI on your PATH for
   `--enrich`; `gh` if you want setup to star the project.
@@ -68,20 +68,20 @@ you choose. What the vault may commit and push to is fixed by the
 ### 3. Use it every day
 
 ```bash
-vault search "release checklist"     # L1: which pages match
-vault timeline "release checklist"   # L2: the lines around each match
-vault get domains/ops/release.md     # L3: one page in full
-vault sync                           # regenerate folder indexes, sidecars and the search cache
+rg -i -l -t md "release.?checklist" ~/.kuma/vault/domains   # which pages match
+rg -n -C2 "release.?checklist" ~/.kuma/vault/domains/ops    # the lines around each match
+vault get domains/ops/release.md     # one page in full (or <store>:<path> in another vault)
+vault sync                           # regenerate folder indexes and sidecars
 vault sync --enrich                  # also write one-line summaries for new or changed pages
 vault lint --mode full --root ~/.kuma/vault
-vault graph --open                   # see how the pages connect
 ```
 
-Agents get the same surface through the `kuma-vault` skill. How the compiler works:
-[architecture](docs/architecture.md).
+Agents get the same surface through the `kuma-vault` skill: a scoped `rg` over the tree, then
+`vault get`. There is no search index to build, keep in step or wait for. A plain `rg` skips `_credentials/` and `_sync-conflicts/` (the
+tree's generated `.rgignore`); git still tracks and syncs them. How the compiler works: [architecture](docs/architecture.md).
 
 On a server-backed vault the sync daemon commits and pushes for you (`vault sync status`
-shows it), search asks the server, and large files arrive as small pointers until you
+shows it), and large files arrive as small pointers until you
 open them with `vault blob get <path>`. Details: [remote mode](docs/remote-mode.md) and
 [sync](docs/sync.md).
 
@@ -98,7 +98,7 @@ A backup counts only once you have restored from it.
 
 | Skill | Use it when |
 |---|---|
-| [`kuma-vault`](skills/kuma-vault/SKILL.md) | searching, recalling earlier work, checking facts at their source, filing new knowledge (`ingest`), tidying the vault (`curate`), drawing the graph |
+| [`kuma-vault`](skills/kuma-vault/SKILL.md) | searching, recalling earlier work, checking facts at their source, filing new knowledge (`ingest`), tidying the vault (`curate`) |
 | [`kuma-vault-setup`](skills/kuma-vault-setup/SKILL.md) | installing, choosing or changing where the vault lives, adding a store, choosing the enrich provider |
 | [`kuma-vault-remote-backup`](skills/kuma-vault-remote-backup/SKILL.md) | backing up a local-only vault offsite with client-side encryption, verifying or restoring that backup |
 
@@ -110,7 +110,7 @@ A backup counts only once you have restored from it.
 | [setup](docs/setup.md) | `kuma-vault setup`: every flag and what each storage step does |
 | [remote mode](docs/remote-mode.md) | store registry, remote search, commit gate, git hooks, `binaries.reject`, migration |
 | [sync](docs/sync.md) | `vault clone`, the sync daemon, conflicts, alarms, large files |
-| [server](docs/server.md) | `vault serve`: install, identity, receive rules, search index, backup |
+| [server](docs/server.md) | `vault serve`: install, identity, receive rules, file API, backup |
 | [cross-store pointers](docs/cross-store-pointers.md) | linking one vault to another and how lint checks it |
 | [design](docs/design.md) | the library's public API and what a host application injects |
 | [plugin packaging](docs/plugin-packaging.md) | building a Claude Code / Codex plugin from this checkout |
@@ -120,9 +120,9 @@ A backup counts only once you have restored from it.
 
 ```
 bin/vault          the CLI, exposed as kuma-vault and vault
-src/engine/        the compiler: frontmatter, sync, lint, search, FTS, sidecars, enrich
+src/engine/        the compiler: frontmatter, sync, lint, get, sidecars, enrich
 src/enrich-adapters/  spawns the claude or codex CLI for --enrich
-src/cli/           command routing, setup, graph
+src/cli/           command routing, setup
 src/sync/          vault clone and the sync daemon (client half of remote mode)
 src/server/        vault serve and vault server (server half; imports nothing from the engine)
 src/backup/        client-side backup retirement checks

@@ -1,15 +1,17 @@
 # Information retrieval and freshness
 
 This is the search procedure entered by [kuma-vault](../SKILL.md). The skill
-routes research; `vault search` itself queries registered knowledge stores and
-does not search the internet. Browser mechanics belong to the host's browser
+routes research; `rg` over the tree on disk is the vault search — it does not
+search the internet. Browser mechanics belong to the host's browser
 skill — in Kuma Studio, `kuma-computer-use`; below, "the browser skill".
 
 ## 1. Resolve the question and search the vault
 
 Identify the fact needed, its scope (version, region, account, hardware), and
 whether the user wants a present fact or a historical answer. Follow the root
-skill's `search → timeline → get` order, expanding only useful hits.
+skill's retrieval order — a scoped `rg` over the tree on disk, files before lines
+before a whole page (`vault get`, which also reads `<store>:<path>`) — expanding
+only useful hits.
 
 For no hits, shorten a compound query to its distinctive public term or a known
 alias. Then continue to the appropriate source. An unrelated hit is still a miss;
@@ -27,16 +29,17 @@ product terms; resolve private facts locally or through the authorized service.
 
 ### Query shape and canonical priority
 
-**Query shape** — `search`/`timeline` are **not semantic search**: they are phrase-substring plus entity matching.
+**Query shape** — `rg` is not semantic: it matches the pattern you write.
 
-- Do not throw a whole fuzzy sentence. Start with the single most distinctive token (proper noun, coined term, file stem, handle, date); drop emoji and symbols.
-- **0 hits on a multi-word query is not "it does not exist."** Reduce one token at a time before concluding NOT FOUND — search brittleness is not absence (No Silent Fallback).
-- A specific artifact name may live only in a page body or its `## Related` line — `get` the page or `timeline` a distinctive token.
-- When ingesting, put the phrases a user would actually type into frontmatter `aliases`; a phrase-substring search only hits once an alias contains that phrase.
+- Do not throw a whole fuzzy sentence. Start with the most distinctive token (proper noun, coined term, file stem, handle, date); drop emoji and symbols.
+- With `rg`, put the alternatives into one case-insensitive pattern (`'deploy.?gate|배포 게이트|release gate'`), list files first (`-l`), then narrow by folder or a second token (`rg -l A | xargs rg -l B`).
+- **0 hits is not "it does not exist."** Rewrite the pattern (synonym, other language, shorter stem, wider folder) before concluding NOT FOUND — search brittleness is not absence (No Silent Fallback).
+- A specific artifact name may live only in a page body or its `## Related` line — read the page, or `rg -n -C2` a distinctive token.
+- When ingesting, put the phrases a user would actually type into frontmatter `aliases`; a pattern search only hits once the page carries that phrase.
 
 **Priority for canonical truth:** decision/principle docs → `calendar/` (time/place-bound) → `projects/<slug>.md` → `memos/` → `learnings/`·`domains/` → `results/` and owner-local `_assets`·`_sources`·`_evidence`. Result reports, the dispatch log, and classification reports are evidence layers, not the policy SSoT.
 
-**Anti-patterns:** skipping the vault because the word "vault" was not used · fetching chat history first · grepping the codebase before the vault · expecting a full-body dump from `search`.
+**Anti-patterns:** skipping the vault because the word "vault" was not used · fetching chat history first · grepping the codebase before the vault · an unscoped `rg` over the whole tree (binaries included) · `rg --no-ignore` in a vault (it reads the secret directories) · dumping whole pages before the matching lines.
 
 ## 2. Choose the authoritative source and freshness rule
 

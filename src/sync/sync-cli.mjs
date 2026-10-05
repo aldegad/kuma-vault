@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // Client CLI of remote stores: `vault clone`, `vault syncd`, `vault sync <verb>`, `vault blob <verb>`
-// (docs/sync.md). Like the server CLI it imports nothing from the compiler engine.
+// (docs/sync.md). Like the server CLI it does not run the compiler engine: it imports only the
+// store registry's path and the names of the enrich provider CLIs (for the launchd job's PATH).
 
 import { readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { parseFlags } from "../cli/cli-options.mjs";
+import { SUPPORTED_ENRICH_PROVIDERS } from "../enrich-adapters/provider-adapter.mjs";
 import { resolveStoreRegistryPath } from "../engine/vault-stores.mjs";
 import { blobEvict, blobStatus, fetchLfsPaths } from "./blob.mjs";
 import { cloneStore, ensureIndexChecksum, repairCredential } from "./clone.mjs";
@@ -27,6 +29,7 @@ const USAGE = `Usage:
   vault sync conflicts [--all] [--json] [--repo <dir>]
   vault sync resolve <id> --take local|remote|<merged-file> [--repo <dir>]
   vault sync install|uninstall [--repo <dir>]       launchd user agent (macOS); install also tightens credential modes
+                                                    and puts the enrich provider CLIs it finds on the job's PATH
   vault blob get <path...>        fetch these LFS files only (git lfs pull -I <path> -X "")
   vault blob evict <path...>      back to pointers, once the server holds them and a backup covers them
   vault blob status [<path...>]
@@ -63,13 +66,27 @@ export function statusProblems(status, daemon) {
   return problems;
 }
 
-function formatStatus(status, daemon, problems) {
+/**
+ * The enrich switch as the clone's git config sets it now (`configured`) and as the daemon's last
+ * tick ran it (`daemon`, null before a tick recorded it). The daemon reads the switch every tick,
+ * so the two differ until its next tick — longer only while it is stopped.
+ */
+export function enrichSwitch(settings, status) {
+  const recorded = status?.alerts?.enrich?.on;
+  return { configured: settings.enrichOnAutosave, daemon: typeof recorded === "boolean" ? recorded : null };
+}
+
+function formatStatus(status, daemon, problems, enrichSwitchNow = null) {
   if (!status) return `${problems.join("\n")}\n`;
   const a = status.alerts ?? {};
   const lines = [
     `store ${status.store}  state ${status.state}  ahead ${status.ahead}  behind ${status.behind}  daemon ${daemon.running ? `pid ${daemon.pid}` : "stopped"}`,
     `last sync ${status.lastSyncAt ?? "never"}  oldest unpushed ${status.oldestUnpushedAt ?? "-"}  tick ${status.tickSeq} @ ${status.tickAt}`,
   ];
+  if (enrichSwitchNow && enrichSwitchNow.daemon !== null && enrichSwitchNow.configured !== enrichSwitchNow.daemon) {
+    const word = (on) => (on ? "on" : "off");
+    lines.push(`enrich switch: git config ${word(enrichSwitchNow.configured)}, the daemon's last tick ran it ${word(enrichSwitchNow.daemon)} — it holds from the daemon's next tick`);
+  }
   if (status.lastError) lines.push(`error: ${status.lastError}`);
   if (status.autosaveBlocked) lines.push(status.autosaveBlocked);
   if (status.openConflicts) lines.push(`conflicts: ${status.openConflicts} open (vault sync conflicts)`);
@@ -80,6 +97,12 @@ function formatStatus(status, daemon, problems) {
   if (a.credentialModes?.active) {
     const loose = a.credentialModes.error ?? a.credentialModes.paths.slice(0, 5).map((p) => `${p.path} ${p.mode ?? "?"}`).join(", ");
     lines.push(`credentialModes ${a.credentialModes.count} [RED] not 0600/0700: ${loose}`);
+  }
+  if (a.enrich?.on) {
+    const e = a.enrich;
+    lines.push(`enrich on: ${e.pending} queued${e.held ? `, ${e.held} held while the declaration cannot be read` : ""}${e.dropped ? ` (${e.dropped} dropped — vault sync --enrich --enrich-limit)` : ""} · ${e.callsLastHour}/${e.perHour} calls this hour · ${e.totals?.enriched ?? 0} described in ${e.totals?.calls ?? 0} calls${e.active ? " [YELLOW]" : ""}`);
+    if (e.lastError) lines.push(`enrich: ${e.lastError}${e.nextRetryAt ? ` (retry ${e.nextRetryAt})` : ""}`);
+    if (e.gaveUp) lines.push(`enrich gave up on ${e.gaveUp} page(s): ${e.failed.filter((f) => f.gaveUp).slice(0, 5).map((f) => f.path).join(", ")}`);
   }
   const s = status.server ?? {};
   lines.push(`server head ${s.head?.slice(0, 9) ?? "-"}  disk free ${s.diskFreeGB ?? "-"} GB  last backup ${s.lastBackupAt ?? "-"}  lfs cache ${status.lfsCache?.bytes ?? 0} B`);
@@ -109,10 +132,11 @@ async function commandStatus(options) {
   const daemon = daemonState(ctx);
   const problems = statusProblems(status, daemon);
   if (!status && credentialModes.active) problems.push("경보 credentialModes");
+  const switchNow = enrichSwitch(ctx.settings, status);
   if (options.json === true) {
-    process.stdout.write(`${JSON.stringify({ ...(status ?? {}), daemon, launchd: launchdStatus(ctx.store), problems }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ ...(status ?? {}), enrichSwitch: switchNow, daemon, launchd: launchdStatus(ctx.store), problems }, null, 2)}\n`);
   } else {
-    process.stdout.write(formatStatus(status, daemon, problems));
+    process.stdout.write(formatStatus(status, daemon, problems, switchNow));
   }
   return problems.length ? 2 : 0;
 }
@@ -239,8 +263,16 @@ export async function main(argv = process.argv.slice(2)) {
         // a clone made before the daemon kept them has its credentials at the umask's modes
         const { report } = await keepCredentialModes(ctx.repo, { fix: true });
         process.stdout.write(`${formatCredentialModes(report)}\n`);
-        const result = launchdInstall(ctx, { node: typeof options.node === "string" ? options.node : process.execPath });
+        // enrich on autosave spawns the provider CLI: the job's PATH reaches it whether the switch is
+        // on now or not, since the daemon reads the switch every tick
+        const tools = [...SUPPORTED_ENRICH_PROVIDERS];
+        const result = launchdInstall(ctx, { node: typeof options.node === "string" ? options.node : process.execPath, tools });
         process.stdout.write(`installed ${result.label}: ${result.plist}\n`);
+        const found = result.tools?.found ?? [];
+        const switchWord = ctx.settings.enrichOnAutosave ? "on" : "off";
+        process.stdout.write(found.length
+          ? `enrich on autosave (${switchWord}): the daemon's PATH reaches ${found.map((t) => `${t.name} (${t.dir})`).join(", ")}\n`
+          : `enrich on autosave (${switchWord}): no provider CLI (${tools.join(", ")}) on PATH — with the switch on, the enrich alarm says so until one is installed and vault sync install is run again\n`);
         return report.looseCount ? 2 : 0;
       }
       case "uninstall": {

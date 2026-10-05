@@ -59,8 +59,12 @@ star and git-hook questions, never the storage one.
 
 1. **Enrich provider (required).** Ask which CLI should generate one-line document synopses for
    `kuma-vault sync --enrich`:
-   - `claude` — spawns the Claude CLI (default model `claude-sonnet-5`).
-   - `codex` — spawns the Codex CLI (default model `gpt-5.4-mini`).
+   - `claude` — spawns the Claude CLI (default model `sonnet`, the CLI's alias for its latest
+     Sonnet).
+   - `codex` — spawns the Codex CLI (default model `gpt-6-luna`).
+   Setup makes one real call with the chosen model before saving it; if the CLI refuses the
+   model or is not signed in, setup fails with the CLI's own words — relay them and ask for
+   another model or a sign-in.
    Only these two are supported. Do not pick for the user. If they don't care, offer `claude` as a
    neutral default but let them confirm.
 

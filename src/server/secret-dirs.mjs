@@ -14,6 +14,15 @@ export const SECRET_DIR_NAMES = Object.freeze([CREDENTIAL_DIR_NAME, "_sync-confl
 const nameKey = (name) => String(name).normalize("NFC").toLowerCase();
 const pathParts = (path) => String(path ?? "").replace(/\\/gu, "/").replace(/^\.\//u, "").split("/");
 
+/**
+ * The secret directories as ignore-file patterns (the generated `.rgignore` block): no slash, so
+ * a component of that name matches at any depth, and a bracket per letter, so `_Credentials/`
+ * matches as well — the same set `isSecretDirName` names.
+ */
+export function secretDirIgnorePatterns() {
+  return SECRET_DIR_NAMES.map((name) => [...name].map((ch) => (/[a-z]/u.test(ch) ? `[${ch}${ch.toUpperCase()}]` : ch)).join(""));
+}
+
 export function isSecretDirName(name) {
   return SECRET_DIR_NAMES.includes(nameKey(name));
 }

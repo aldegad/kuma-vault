@@ -1,7 +1,9 @@
 // git lock files a killed git leaves behind (`index.lock`, a ref's `.lock`). Every later git
 // call that needs them fails until they go, so the daemon removes one — and logs it — only when
 // it is older than `staleLockMs` (10 min) and no git process has its working directory in
-// this clone. A younger lock, or one with git still running, is somebody's live work.
+// this clone. A younger lock, or one with git still running, is somebody's live work. The rule
+// is applied at the top of every tick and at every retry of an autosave call that waits on a lock
+// (autosave.mjs), so one that turns old during the wait goes then.
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync } from "node:fs";

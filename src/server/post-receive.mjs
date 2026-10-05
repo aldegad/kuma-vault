@@ -7,7 +7,7 @@
 //    checkout wrote them by the umask. What it cannot tighten goes to the pusher (stderr) and
 //    to state/receive-log.jsonl
 //
-// Indexing is not done here: an indexer consumes events.jsonl after its indexedHead.
+// events.jsonl is what `GET /v1/stores/<id>/events` long-polls (the clients' sync daemons).
 
 import { closeSync, existsSync, openSync, readSync, rmSync, statSync, writeSync, fstatSync } from "node:fs";
 import { join } from "node:path";

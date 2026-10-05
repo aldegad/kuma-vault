@@ -97,6 +97,21 @@ describe("loadVaultDeclaration", () => {
     writeDeclaration(root, { profile: "kuma-vault", personaMemoryPages: "domains/nova.md" });
     expect(() => loadVaultDeclaration(root)).toThrow(/array of non-empty strings/u);
   });
+
+  it("accepts enrichExclude as gitignore patterns, defaults it to none, and refuses a negation or a non-list", () => {
+    const declared = ["/decisions.md", "projects/*.project-decisions.md"];
+    writeDeclaration(root, { profile: "kuma-vault", enrichExclude: declared });
+    const profile = resolveDeclaredProfile(loadVaultDeclaration(root));
+    expect(profile.enrichExclude).toEqual(declared);
+    expect(Object.isFrozen(profile.enrichExclude)).toBe(true);
+    expect(VAULT_PROFILE.enrichExclude).toEqual([]);
+    expect(DOCS_PROFILE.enrichExclude).toEqual([]);
+
+    writeDeclaration(root, { profile: "kuma-vault", enrichExclude: ["!decisions.md"] });
+    expect(() => loadVaultDeclaration(root)).toThrow(/"enrichExclude": gitignore negation is not supported/u);
+    writeDeclaration(root, { profile: "kuma-vault", enrichExclude: "decisions.md" });
+    expect(() => loadVaultDeclaration(root)).toThrow(/"enrichExclude" must be an array of non-empty strings/u);
+  });
 });
 
 describe("resolveDeclaredProfile", () => {

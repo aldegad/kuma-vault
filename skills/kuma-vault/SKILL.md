@@ -1,6 +1,6 @@
 ---
 name: kuma-vault
-description: 'Search and research entry point: search, web search, internet search, look up, research, verify, latest, official docs, 검색, 서치, 웹 검색, 인터넷 찾아봐, 조사, 알아봐, 확인해봐, 최신정보, 공식문서, 출처. Search the vault first, then consult official sources when evidence is missing, incomplete, stale or explicitly requested; refresh reusable verified knowledge. Also use for unfamiliar names/acronyms, existence/identity questions, previous work and memory recall, domain/project knowledge, plans, decisions and principles. Routes dynamic or authenticated pages to kuma-computer-use. Modes: search/timeline/get/ingest/curate; web research uses available tools, not a vault web-search CLI.'
+description: 'Search and research entry point: search, web search, internet search, look up, research, verify, latest, official docs, 검색, 서치, 웹 검색, 인터넷 찾아봐, 조사, 알아봐, 확인해봐, 최신정보, 공식문서, 출처. Search the vault first, then consult official sources when evidence is missing, incomplete, stale or explicitly requested; refresh reusable verified knowledge. Also use for unfamiliar names/acronyms, existence/identity questions, previous work and memory recall, domain/project knowledge, plans, decisions and principles. Routes dynamic or authenticated pages to kuma-computer-use. Modes: rg/get/ingest/curate; web research uses available tools, not a vault web-search CLI.'
 ---
 
 # kuma-vault — knowledge serving
@@ -8,8 +8,9 @@ description: 'Search and research entry point: search, web search, internet sear
 CLI: `kuma-vault`, short alias `vault`.
 
 A single entry point for retrieving knowledge, verifying it at its source, and
-updating reusable facts. `vault search` searches every registered vault store;
-the agent uses its own web tools for internet searches. Browser work for dynamic or
+updating reusable facts. The agent searches the vault tree on disk with a scoped
+`rg` and reads pages with `vault get` (which also resolves `<store>:<path>` across
+registered stores); it uses its own web tools for internet searches. Browser work for dynamic or
 signed-in pages belongs to the host's browser skill — in Kuma Studio, `kuma-computer-use`.
 
 ## Search contract — read before answering
@@ -62,13 +63,27 @@ appears, run the retrieval chain immediately — do not reach for chat history f
 1. `<vault>/dispatch-log.md` **tail 20** — episodic ledger
 2. `<vault>/decisions.md` + the current project's `*.project-decisions.md` — latest ~10 entries
 3. Active plans index (if the deployment tracks plans)
-4. Vault retrieval, **3-layer progressive disclosure**: `vault search <q>` (L1: hits only) → `vault timeline <q>` (L2: ±2-line snippets) → `vault get <id|path>` (L3: full text)
+4. Vault retrieval, **3-layer progressive disclosure** — files (L1) → lines around the matches (L2) → one page in full (L3):
+   - **A scoped `rg` over the tree on disk (`~/.kuma/vault`).** Markdown only (`-t md`), a
+     folder when you know one (`domains/`, `projects/`, `plans/`), one pattern with the
+     spellings, aliases and both languages you expect
+     (`rg -i -l -t md 'release.?checklist|릴리스' ~/.kuma/vault/domains`) (L1) → `rg -n -C2` on
+     the files that matter (L2) → read the page, or `vault get <path>` (L3). An unscoped `rg`
+     also reads every binary in the tree and is slow.
+   - **Another registered store** is a tree on disk too (a remote store's clone): `rg` it the
+     same way, and read one of its pages by pointer with `vault get <store>:<path>`. A store
+     with no copy on this machine is cloned first (`vault clone`); there is no index to ask.
 
 Stop expanding vault results at the highest layer that answers, then apply the
 search contract's source and freshness checks. A relevant hit can still require
-external verification. On a miss, simplify the query once and continue to the
-appropriate source; repeated vault-only queries are not a substitute for searching.
-**Invariant:** never dump full text at L1; the order `search → timeline → get` is fixed.
+external verification. On a miss, rewrite the pattern once (a synonym, the other
+language, a shorter stem, a wider folder) and continue to the appropriate source;
+repeated vault-only queries are not a substitute for searching.
+**Invariant:** never dump full text at L1; files before lines before a whole page.
+
+`_credentials/` and `_sync-conflicts/` are skipped by a plain `rg` (the tree's generated
+`.rgignore`). Do not add `--no-ignore`/`-u` in a vault; read a credential
+by its path only when the task needs that credential.
 
 Query shape, the canonical-truth priority and the anti-patterns:
 [docs/info-retrieval.md](docs/info-retrieval.md#query-shape-and-canonical-priority).
@@ -78,19 +93,15 @@ Query shape, the canonical-truth priority and the anti-patterns:
 ```
 vault <path>         Load a page (a file, <path>.md, or <dir>/README.md)
 vault index          List the whole topology (root README)
-vault search <q>     Keyword search (L1) — spans every registered store
-vault timeline <q>   Snippets around matching lines (L2)
-vault get <id>       Load one document's full text (L3; accepts <store>:<path>)
+vault get <id>       Load one document's full text (accepts <store>:<path>)
 vault ingest [args]  Promote a new source into a canonical vault page
-vault graph [--open] Render the vault topology as an interactive HTML graph
 vault lint --mode full --root <absolute-target-tree>   Check the selected declared tree
 ```
 
-On a server-backed store, `search`/`timeline` ask the server and add this copy's
-unpushed and uncommitted changes. If the server cannot be reached the search fails
-and names `--local` (search this copy instead) — say so rather than switching
-silently. A large file may be a small LFS pointer here; `vault get` says so, and
-`vault blob get <path>` fetches it. Details: the engine's `docs/remote-mode.md`.
+`vault search` and `vault timeline` were removed; a scoped `rg` over the tree replaces them.
+On a server-backed store's clone, a large file may be a
+small LFS pointer; `vault get` says so, and `vault blob get <path>` fetches it. Details:
+the engine's `docs/remote-mode.md`.
 
 ## Procedures
 
@@ -98,12 +109,11 @@ Read the relevant document before acting. `curate` is an agent procedure, not an
 
 | Subcommand | Reference doc | Summary |
 |------------|---------------|---------|
-| (none) / path / index / search / timeline / get | this file | read / query paths |
+| (none) / path / index / `rg` / get | this file | read / query paths |
 | search / research / freshness check (agent procedure) | [docs/info-retrieval.md](docs/info-retrieval.md) | vault → authoritative source → verified answer → reusable knowledge refresh |
 | `ingest` | [docs/ingest.md](docs/ingest.md) | promote a new source — canonical-owner-first, explicit promotion, evidence preservation |
 | `curate` | [docs/curate.md](docs/curate.md) | tidy the existing vault — broken links / orphan evidence / duplicate pages / drift |
 | `lint` / file-back / lint cadence | [docs/vault-workflow.md](docs/vault-workflow.md) | what lint checks, when to run it, when an answer is filed back into the vault |
-| `graph` | [docs/graph.md](docs/graph.md) | render the topology as an interactive node-link graph, one toggleable layer per connection type |
 | tree, slots, special files | [docs/layout.md](docs/layout.md) | where each kind of page lives and who may write the special files |
 | storage location / sync policy | [docs/storage-policy.md](docs/storage-policy.md) | where a vault repository lives and what it may push to (P1–P3); no registered store yet → run skill `kuma-vault-setup` first |
 | backup | skill `kuma-vault-remote-backup` | client-encrypted offsite backup of a local-only vault |

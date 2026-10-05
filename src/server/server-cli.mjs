@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 // Server-side CLI: `vault serve` and `vault server <verb>` (docs/server.md).
 //
-// Kept apart from src/cli/cli.mjs on purpose: the server needs no node_modules. The search
-// index reuses the engine's pure search/declaration modules (node built-ins only, `node:sqlite`
-// included); nothing here reaches the sidecar extractors or other npm dependencies.
+// Kept apart from src/cli/cli.mjs on purpose: the server needs no node_modules (node built-ins
+// only); nothing here reaches the sidecar extractors or other npm dependencies.
 
 import { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -16,7 +15,6 @@ import { DEFAULT_SERVER_CONFIG_PATH, generateToken, hashToken, loadServerConfig,
 import { startServe } from "./serve.mjs";
 import { storePaths } from "./store-layout.mjs";
 import { anchorPatternsToTree } from "./gitignore-match.mjs";
-import { ensureIndexed } from "./search-index.mjs";
 import { initServedStore, requireStoreOwnable, serveUserIds } from "./install.mjs";
 
 const USAGE = `Usage:
@@ -31,7 +29,6 @@ const USAGE = `Usage:
   vault server token list|rm --id <id> [--config <path>]
   vault server set-reject --store <id> --from <binaries-reject.json> [--tree-prefix <dir>] [--config <path>]
                                  (--tree-prefix: the list is relative to that tree, e.g. vault)
-  vault server reindex --store <id> [--full] [--config <path>]
   vault server backup <verb> ...  (restic offsite backup — vault server backup --help)
   vault server receive-check     (pre-receive hook)
   vault server post-receive      (post-receive hook)
@@ -250,7 +247,7 @@ export function commandStore(options, { log = (line) => process.stdout.write(`${
     log(`${dir} did not exist; nothing to delete`);
     return;
   }
-  // rename first: from here on serve, the indexer and a late push see no store at the old path
+  // rename first: from here on serve and a late push see no store at the old path
   const target = check.realDir;
   const doomed = join(dirname(target), `.${basename(target)}.removed-${process.pid}`);
   renameSync(target, doomed);
@@ -292,20 +289,9 @@ function commandSetReject(options) {
   process.stdout.write(`store ${id}: binaries.reject = ${reject.length} pattern(s)\n`);
 }
 
-async function commandReindex(options) {
-  const config = loadServerConfig(configPathOf(options));
-  const store = config.stores[options.store];
-  if (!store) throw new Error(`no store ${options.store}`);
-  const result = await ensureIndexed(store.path, { force: options.full === true });
-  process.stdout.write(`${JSON.stringify({ store: options.store, ...result })}\n`);
-  if (result.status === "busy") process.exitCode = 75;
-}
-
 async function commandServe(options) {
   const configPath = configPathOf(options);
-  // KUMA_VAULT_INDEX_INTERVAL_MS: the indexer's batching window (default 5000; 0 turns it off)
-  const interval = process.env.KUMA_VAULT_INDEX_INTERVAL_MS;
-  const handle = await startServe({ configPath, ...(interval !== undefined ? { indexIntervalMs: Number(interval) } : {}) });
+  const handle = await startServe({ configPath });
   const stop = () => {
     handle.close().finally(() => process.exit(0));
   };
@@ -351,9 +337,6 @@ export async function main(argv = process.argv.slice(2)) {
       process.exitCode = await commandBackup(args, { parseFlags, configPathOf });
       return;
     }
-    case "reindex":
-      await commandReindex(options);
-      return;
     case "install": {
       const { commandServerInstall } = await import("./install.mjs");
       await commandServerInstall(options);

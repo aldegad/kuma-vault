@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { formatVaultSyncReport, runVaultSync, vaultSyncExitCode } from "./vault-sync-pipeline.mjs";
+import { formatVaultSyncReport, parseVaultSyncCheckDrift, runVaultSync, vaultSyncExitCode } from "./vault-sync-pipeline.mjs";
 import { ENRICH_FIELDS_ALL } from "./vault-enrich.mjs";
 import { parseFrontmatterDocument } from "./vault-ingest.mjs";
 
@@ -184,47 +184,29 @@ describe("runVaultSync — consumer injection seams", () => {
   });
 });
 
-describe("formatVaultSyncReport — the header must describe what check mode actually does", () => {
-  // The header said "check (no writes)" while the same run healed the out-of-tree `.fts/`
-  // cache. The report is the only surface a reader has for that, so it names both halves:
-  // nothing lands in the tracked tree, the search cache still self-heals.
-  it("says no TREE writes and names the cache that still heals", async () => {
+describe("formatVaultSyncReport — the header says what the run did", () => {
+  it("check mode writes nothing, and no run builds a search cache", async () => {
     const vaultDir = await makeVault();
     const report = await runVaultSync({ vaultDir, check: true });
-    const header = formatVaultSyncReport(report).split("\n")[0];
-
-    expect(header).toContain("no tree writes");
-    expect(header).toContain(".fts");
-    expect(header).not.toBe("vault sync — check (no writes)");
+    expect(formatVaultSyncReport(report).split("\n")[0]).toBe("vault sync — check (no writes)");
+    expect(report).not.toHaveProperty("fts");
+    expect(formatVaultSyncReport(report)).not.toMatch(/^fts:/mu);
+    expect(existsSync(join(vaultDir, ".fts"))).toBe(false);
   });
 
   it("leaves the write-mode header alone", async () => {
     const vaultDir = await makeVault();
     const report = await runVaultSync({ vaultDir });
     expect(formatVaultSyncReport(report).split("\n")[0]).toBe("vault sync — write");
+    expect(existsSync(join(vaultDir, ".fts"))).toBe(false);
   });
 });
 
 describe("vaultSyncExitCode", () => {
-  it("does not gate on the FTS cache in either mode", async () => {
+  it("passes a converged tree in check mode", async () => {
     const vaultDir = await makeVault();
-    // Converge the tree, then confirm a healed cache never contributes to the exit code.
     await runVaultSync({ vaultDir });
-    const report = await runVaultSync({ vaultDir, check: true });
-
-    expect(report.fts).not.toBeNull();
-    expect(vaultSyncExitCode(report)).toBe(0);
-    // The old fork gated on `fts.wouldRebuild`; the healed report has no such field at all.
-    expect(report.fts.wouldRebuild).toBeUndefined();
-  });
-
-  it("fts: false (--no-fts) skips the search cache and keeps the tracked derivations", async () => {
-    const vaultDir = await makeVault();
-    const report = await runVaultSync({ vaultDir, fts: false });
-    expect(report.fts).toBeNull();
-    expect(existsSync(join(vaultDir, ".fts"))).toBe(false);
-    expect(vaultSyncExitCode(report)).toBe(0);
-    expect(vaultSyncExitCode(await runVaultSync({ vaultDir, check: true, fts: false }))).toBe(0);
+    expect(vaultSyncExitCode(await runVaultSync({ vaultDir, check: true }))).toBe(0);
   });
 
   it("still refuses tracked drift in check mode", async () => {
@@ -238,5 +220,48 @@ describe("vaultSyncExitCode", () => {
     const report = await runVaultSync({ vaultDir, check: true });
     expect(report.changedCount).toBeGreaterThan(0);
     expect(vaultSyncExitCode(report)).toBe(1);
+  });
+});
+
+describe("parseVaultSyncCheckDrift — reads the gate's refusal back from the formatter's text", () => {
+  // The sync daemon regenerates and commits again only when the gate refused for tracked drift
+  // alone. It reads that from the gate's text, so the reader is pinned against the formatter.
+  it("names the drifted README of a real check run, created READMEs included", async () => {
+    const vaultDir = await makeVault();
+    await runVaultSync({ vaultDir });
+    await writeFile(join(vaultDir, "domains", "beta.md"), "---\ntitle: Beta\ndescription: beta\n---\n\n# Beta\n", "utf8");
+    await mkdir(join(vaultDir, "domains", "gamma"), { recursive: true });
+    await writeFile(join(vaultDir, "domains", "gamma", "g.md"), "---\ntitle: G\ndescription: g\n---\n\n# G\n", "utf8");
+
+    const report = await runVaultSync({ vaultDir, check: true });
+    const parsed = parseVaultSyncCheckDrift(formatVaultSyncReport(report));
+    expect(parsed.driftOnly).toBe(true);
+    expect(parsed.reasons).toEqual([]); // the stale regions drift leaves are drift, not another refusal
+    expect(parsed.drifted).toEqual(expect.arrayContaining(["domains/README.md", "domains/gamma/README.md"]));
+    expect(parsed.drifted).toHaveLength(report.changedCount);
+    expect(parsed.summary).toBe(`index: ${report.changedCount} drifted / ${report.total} README(s) (${report.unchangedCount} in sync)`);
+  });
+
+  it("an in-sync run, a commit-policy refusal, a failed sidecar or foreign text is not drift", async () => {
+    const vaultDir = await makeVault();
+    await runVaultSync({ vaultDir });
+    const clean = formatVaultSyncReport(await runVaultSync({ vaultDir, check: true }));
+    expect(parseVaultSyncCheckDrift(clean)).toEqual({ driftOnly: false, drifted: [], summary: "", reasons: [] });
+
+    const drift = "index: 1 drifted / 3 README(s) (2 in sync)\n  - [drift] domains/README.md\n";
+    expect(parseVaultSyncCheckDrift(drift)).toEqual({
+      driftOnly: true,
+      drifted: ["domains/README.md"],
+      summary: "index: 1 drifted / 3 README(s) (2 in sync)",
+      reasons: [],
+    });
+    // a path that happens to contain "drift" does not stand in for the count line
+    expect(parseVaultSyncCheckDrift(`vault-dir: /work/autosave-drift/vault\n${drift}`).summary).toBe("index: 1 drifted / 3 README(s) (2 in sync)");
+    expect(parseVaultSyncCheckDrift(`vault gate [freeze] frozen\n${drift}`)).toMatchObject({ driftOnly: false, reasons: ["vault gate [freeze] frozen"] });
+    const failedSidecar = `${drift}sidecars: 0 would (re)generate / 1 binary source(s) (0 in sync)\n  - [fail] a.pdf: broken\n`;
+    expect(parseVaultSyncCheckDrift(failedSidecar)).toMatchObject({ driftOnly: false, reasons: ["- [fail] a.pdf: broken"] });
+    const disagree = "index: 0 drifted / 3 README(s) (3 in sync)\nlint: 1 issue(s) across 1 file(s)\n  stale vault-index regions: 1\n";
+    expect(parseVaultSyncCheckDrift(disagree)).toMatchObject({ driftOnly: false, reasons: ["stale vault-index regions: 1"] });
+    expect(parseVaultSyncCheckDrift("pre-commit: some other hook said no\n")).toEqual({ driftOnly: false, drifted: [], summary: "", reasons: [] });
   });
 });

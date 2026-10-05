@@ -113,5 +113,11 @@ if python3 "$HERE/stage8_compare.py" --old-worktree "$W/snap" --clone "$W/clone"
   echo "selftest: stage 8 did not catch a changed file" >&2; exit 1
 fi
 echo "selftest negative checks: ok"
+# a partial run leaves no df sampler behind (one 2 s loop per invocation, stopped on exit)
+"$HERE/rehearse.sh" "$B/env" mount >/dev/null
+[ ! -e "$W/run/sampler.pid" ] || { echo "selftest: sampler.pid left after a partial run" >&2; exit 1; }
+n1=$(wc -l < "$W/run/df.log"); sleep 3; n2=$(wc -l < "$W/run/df.log")
+[ "$n1" = "$n2" ] || { echo "selftest: df sampler still running after a partial run" >&2; exit 1; }
+echo "selftest partial run: no sampler left"
 "$HERE/rehearse.sh" "$B/env" cleanup
 echo "selftest: PASS"

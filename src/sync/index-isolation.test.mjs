@@ -88,7 +88,7 @@ it("a populated clone checks out cleanly with a checksummed index", async () => 
 
 // A real clean filter pauses status after it read the index, before its optional write.
 // The writer stages a new path and a partial edit in that interval. No timing lottery.
-it.each(["daemon scan", "remote search", "plain status after install"])("%s preserves concurrent staging", async (mode) => {
+it.each(["daemon scan", "plain status after install"])("%s preserves concurrent staging", async (mode) => {
   if (mode === "plain status after install") await main(["sync", "install", "--repo", repo]);
   const entered = join(repo, ".git", "entered");
   const release = join(repo, ".git", "release");
@@ -110,9 +110,7 @@ process.stdin.pipe(process.stdout);
   git("config", "filter.barrier.required", "true");
   const old = new Date(Date.now() - 60000);
   utimesSync(join(repo, "probe.seed"), old, old);
-  const source = mode === "daemon scan"
-    ? `import {scanWorktree} from ${JSON.stringify(new URL("./scan.mjs", import.meta.url).href)}; await scanWorktree(process.argv[1]);`
-    : `import {localChangesSince} from ${JSON.stringify(new URL("../engine/vault-remote.mjs", import.meta.url).href)}; localChangesSince(process.argv[1], null);`;
+  const source = `import {scanWorktree} from ${JSON.stringify(new URL("./scan.mjs", import.meta.url).href)}; await scanWorktree(process.argv[1]);`;
   const child = mode === "plain status after install"
     ? spawn(binary, ["status", "--porcelain=v2"], { cwd: repo, env: { ...env, INDEX_BARRIER: "1" } })
     : spawn(process.execPath, ["--input-type=module", "-e", source, repo], { cwd: repo, env: { ...env, INDEX_BARRIER: "1" } });

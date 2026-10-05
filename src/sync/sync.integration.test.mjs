@@ -74,7 +74,7 @@ function client(name) {
     head: () => world.git(dir, ["rev-parse", "HEAD"]).stdout.trim(),
     /** An agent's commit: regenerate the indexes the gate checks (as the gate tells it to), stage, commit. */
     commit(paths, message, { allowFail = false } = {}) {
-      world.sh(VAULT_BIN, ["sync", "--no-fts", "--root", join(dir, "vault")], { allowFail });
+      world.sh(VAULT_BIN, ["sync", "--root", join(dir, "vault")], { allowFail });
       if (paths.length) world.git(dir, ["add", "-A", "--", ...paths], { allowFail });
       world.git(dir, ["add", "-A", "--", ":(glob)vault/**/README.md", "vault/README.md"], { allowFail });
       const out = world.git(dir, ["commit", "--quiet", "-m", message], { allowFail });
@@ -114,7 +114,7 @@ beforeAll(async () => {
   writeAt(seedDir, "vault/plans/p/x.graph.json", '{"v":0}\n');
   writeAt(seedDir, "vault/img/p1.png", randomBytes(150 * 1024));
   writeAt(seedDir, "vault/img/p2.png", randomBytes(150 * 1024));
-  world.sh(VAULT_BIN, ["sync", "--no-fts", "--root", join(seedDir, "vault")]);
+  world.sh(VAULT_BIN, ["sync", "--root", join(seedDir, "vault")]);
   world.git(seedDir, ["add", "-A"]);
   world.git(seedDir, ["commit", "--quiet", "-m", "fixture"]);
   world.git(seedDir, ["push", "--quiet", "origin", "HEAD:main"]);
@@ -400,6 +400,23 @@ describe.sequential("alarms", { timeout: 600_000 }, () => {
     const later = await a.tick({ now: base + k * 20 * MIN + 25 * 60 * MIN });
     expect(later.status.alerts.growth).toBeNull();
   });
+
+  // last in this block: its 66 MB would lead the growth topDir the tests above assert
+  it("a 33 MiB mesh and a 33 MiB text print job go up as LFS pointers, not uncollected", async () => {
+    const t0 = Date.now();
+    const mesh = randomBytes(33 * MiB);
+    const job = Buffer.from("G1 X0 Y0\n".repeat(Math.ceil((33 * MiB) / 9)));
+    a.write("vault/prints/kit/mesh.ply", mesh);
+    a.write("vault/prints/kit/plate.GCODE", job);
+    const r = await a.tick({ now: t0 + QUIET });
+    expect(a.tracked("vault/prints/kit/mesh.ply")).toBe(true);
+    expect(a.tracked("vault/prints/kit/plate.GCODE")).toBe(true);
+    expect(serverPointer("vault/prints/kit/mesh.ply")).toEqual({ oid: sha256(mesh), size: mesh.length });
+    expect(serverPointer("vault/prints/kit/plate.GCODE")).toEqual({ oid: sha256(job), size: job.length });
+    const later = await a.tick({ now: t0 + 92 * MIN });
+    expect(later.status.alerts.uncollected.count).toBe(0);
+    expect(r.status.ahead).toBe(0);
+  });
 });
 
 describe.sequential("drift scenarios (design 2.7)", { timeout: 300_000 }, () => {
@@ -518,6 +535,76 @@ describe.sequential("drift scenarios (design 2.7)", { timeout: 300_000 }, () => 
     expect(serve.show("main", open[0].copy).stdout).toMatch(/b is typing/);
     expect(b.cli(["sync", "resolve", open[0].id, "--take", "remote"]).code).toBe(0);
     await b.tick({ force: true });
+    await a.tick({ force: true });
+  });
+
+  it("resolving a conflict commits the folder index line of the version taken", async () => {
+    const page = "vault/domains/notes/pick.md";
+    const readme = "vault/domains/notes/README.md";
+    const body = (synopsis) => `---\ntitle: Pick\ndescription: ${synopsis}\n---\n\n# Pick\n`;
+    a.write(page, body("synopsis at base"));
+    a.commit([page], "a adds pick");
+    await a.tick({ force: true });
+    await b.tick({ force: true });
+    a.write(page, body("synopsis from a"));
+    a.commit([page], "a edits pick");
+    b.write(page, body("synopsis from b"));
+    b.commit([page], "b edits pick");
+    await a.tick({ force: true });
+    await b.tick({ force: true });
+    const conflict = readConflicts(await b.ctx()).find((c) => c.status === "open" && c.path === page);
+    expect(conflict).toMatchObject({ class: "general", kept: "remote" });
+    expect(b.read(readme).toString()).toMatch(/synopsis from a/); // the index follows the version at the path
+
+    const resolved = b.cli(["sync", "resolve", conflict.id, "--take", "local"]);
+    expect(resolved.code, resolved.stderr).toBe(0);
+    // the line the taken version gives is in the resolve commit, not left behind in the work tree
+    expect(b.git(["show", "--name-only", "--format=", "HEAD"]).stdout.split("\n")).toContain(readme);
+    expect(b.git(["show", `HEAD:${readme}`]).stdout).toMatch(/synopsis from b/);
+    expect(b.git(["status", "--porcelain", "--", readme]).stdout).toBe("");
+    expect(world.sh(VAULT_BIN, ["sync", "--check", "--root", join(b.dir, "vault")], { allowFail: true }).code).toBe(0);
+    const rb = await b.tick({ force: true });
+    expect(rb.status).toMatchObject({ openConflicts: 0, ahead: 0 });
+    expect(serve.show("main", readme).stdout).toMatch(/synopsis from b/);
+    await a.tick({ force: true });
+  });
+
+  it("resolving a conflict on a binary commits the sidecar regenerated from the version taken", async () => {
+    const pdf = "vault/domains/notes/pick.pdf";
+    const sidecar = `${pdf}.md`;
+    a.write(pdf, tinyPdf("pick at base"));
+    a.commit([pdf, sidecar], "a adds pick.pdf");
+    await a.tick({ force: true });
+    await b.tick({ force: true });
+    a.write(pdf, tinyPdf("pick from a"));
+    a.commit([pdf, sidecar], "a edits pick.pdf");
+    const mine = tinyPdf("pick from b");
+    b.write(pdf, mine);
+    b.commit([pdf, sidecar], "b edits pick.pdf");
+    await a.tick({ force: true });
+    await b.tick({ force: true });
+    // the binary and its sidecar both differ: two records, the server's pair keeps the paths
+    const openOn = async (path) => readConflicts(await b.ctx()).find((c) => c.status === "open" && c.path === path);
+    const onPdf = await openOn(pdf);
+    expect(onPdf).toMatchObject({ class: "general", kept: "remote" });
+    expect(b.read(sidecar).toString()).not.toContain(sha256(mine));
+
+    // the local version was kept as a pointer: its sidecar is extracted from the bytes
+    expect(b.cli(["blob", "get", onPdf.copy]).code).toBe(0);
+    const resolved = b.cli(["sync", "resolve", onPdf.id, "--take", "local"]);
+    expect(resolved.code, resolved.stderr).toBe(0);
+    expect(parseLfsPointer(Buffer.from(b.git(["show", `HEAD:${pdf}`]).stdout))).toMatchObject({ oid: sha256(mine) });
+    // the sidecar stamped with the taken binary is in the same commit
+    expect(b.git(["show", "--name-only", "--format=", "HEAD"]).stdout.split("\n")).toContain(sidecar);
+    expect(b.git(["show", `HEAD:${sidecar}`]).stdout).toContain(sha256(mine));
+    expect(b.git(["status", "--porcelain", "--", sidecar]).stdout).toBe("");
+    const onSidecar = await openOn(sidecar);
+    expect(onSidecar).toMatchObject({ class: "general", kept: "remote" });
+    expect(b.cli(["sync", "resolve", onSidecar.id, "--take", "local"]).code).toBe(0);
+    expect(world.sh(VAULT_BIN, ["sync", "--check", "--root", join(b.dir, "vault")], { allowFail: true }).code).toBe(0);
+    const rb = await b.tick({ force: true });
+    expect(rb.status).toMatchObject({ openConflicts: 0, ahead: 0 });
+    expect(serve.show("main", sidecar).stdout).toContain(sha256(mine));
     await a.tick({ force: true });
   });
 

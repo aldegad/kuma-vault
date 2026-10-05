@@ -134,8 +134,8 @@ and forwards to it; every request except the health check must carry a token.
    kuma-vault setup --storage remote --server https://vault.example.com --token-file ~/.kuma/kuma-main-vault.token
    ```
 
-   Setup copies the token into the clone (`.git/kuma-vault/token`, mode 600), where git,
-   the sync daemon and search read it. Once it is also in your password manager you can
+   Setup copies the token into the clone (`.git/kuma-vault/token`, mode 600), where git
+   and the sync daemon read it. Once it is also in your password manager you can
    delete `~/.kuma/kuma-main-vault.token`.
 
    That file is the clone's only credential for this server. A keychain or other credential

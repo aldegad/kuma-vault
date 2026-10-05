@@ -1,4 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   buildEnrichPrompt,
@@ -27,17 +31,90 @@ describe("createCliDescriptionGenerator", () => {
   });
 
   it("defaults the model per provider when omitted", () => {
-    expect(createCliDescriptionGenerator({ provider: "claude" }).model).toBe("claude-sonnet-5");
-    expect(createCliDescriptionGenerator({ provider: "codex" }).model).toBe("gpt-5.4-mini");
+    // claude: the family alias, which the CLI maps to the latest model; codex: an id its catalog
+    // lists for a ChatGPT sign-in (gpt-5.4-mini is refused there).
+    expect(createCliDescriptionGenerator({ provider: "claude" }).model).toBe("sonnet");
+    expect(createCliDescriptionGenerator({ provider: "codex" }).model).toBe("gpt-6-luna");
   });
 
   it("trims a whitespace-only model down to the provider default", () => {
-    expect(createCliDescriptionGenerator({ provider: "claude", model: "   " }).model).toBe("claude-sonnet-5");
+    expect(createCliDescriptionGenerator({ provider: "claude", model: "   " }).model).toBe("sonnet");
   });
 
   it("throws on an unsupported provider (No Silent Fallback)", () => {
     expect(() => createCliDescriptionGenerator({ provider: "gemini" })).toThrow(/not supported/u);
     expect(() => createCliDescriptionGenerator({})).toThrow(/not supported/u);
+  });
+});
+
+// Stand-ins for the provider CLIs, first on PATH. Each records its argv and answers in the
+// three-line contract. The claude one behaves as `claude --help` documents `--bare`: auth is then
+// ANTHROPIC_API_KEY or an apiKeyHelper only, so a subscription sign-in gets "Not logged in".
+const FAKE_CLAUDE = `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+appendFileSync(process.env.FAKE_CLI_LOG, JSON.stringify({ cli: "claude", args, cwd: process.cwd() }) + "\\n");
+if (args.includes("--bare") && !process.env.ANTHROPIC_API_KEY) {
+  process.stdout.write("Not logged in · Please run /login\\n");
+  process.exit(1);
+}
+process.stdout.write("DESCRIPTION: A synopsis.\\nTAGS: notes\\nALIASES: \\n");
+`;
+const FAKE_CODEX = `#!/usr/bin/env node
+const { appendFileSync, writeFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+appendFileSync(process.env.FAKE_CLI_LOG, JSON.stringify({ cli: "codex", args, cwd: process.cwd() }) + "\\n");
+writeFileSync(args[args.indexOf("--output-last-message") + 1], "DESCRIPTION: A synopsis.\\nTAGS: notes\\nALIASES: \\n");
+`;
+
+describe("the provider CLI call", () => {
+  let dir;
+  const saved = {};
+  const calls = () => readFileSync(join(dir, "calls.jsonl"), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  const page = { relativePath: "domains/a.md", title: "A", body: "a body" };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "kv-adapter-"));
+    mkdirSync(join(dir, "bin"));
+    for (const [name, source] of [["claude", FAKE_CLAUDE], ["codex", FAKE_CODEX]]) {
+      writeFileSync(join(dir, "bin", name), source);
+      chmodSync(join(dir, "bin", name), 0o755);
+    }
+    for (const key of ["PATH", "FAKE_CLI_LOG", "ANTHROPIC_API_KEY"]) saved[key] = process.env[key];
+    process.env.PATH = `${join(dir, "bin")}:${process.env.PATH}`;
+    process.env.FAKE_CLI_LOG = join(dir, "calls.jsonl");
+    delete process.env.ANTHROPIC_API_KEY; // signed in by subscription, as most users are
+  });
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("claude: a subscription sign-in is used, and nothing of the user's setup is loaded", async () => {
+    const result = await createCliDescriptionGenerator({ provider: "claude" })(page);
+    expect(result.description).toBe("A synopsis.");
+    const [call] = calls();
+    expect(call.args).not.toContain("--bare");
+    expect(call.args).toContain("--safe-mode"); // no CLAUDE.md, hooks, MCP servers, skills or plugins
+    expect(call.args[call.args.indexOf("--tools") + 1]).toBe(""); // no tools at all
+    expect(call.args).not.toContain("--dangerously-skip-permissions"); // nothing left to permit
+    expect(call.args).toContain("--no-session-persistence");
+    expect(call.args[call.args.indexOf("--model") + 1]).toBe("sonnet");
+    expect(call.args.at(-1)).toContain("Path: domains/a.md");
+    expect(call.cwd).not.toBe(process.cwd()); // an empty temp dir, never the caller's repo
+  });
+
+  it("codex: the default model is passed, from an empty temp dir", async () => {
+    const result = await createCliDescriptionGenerator({ provider: "codex", effort: "low" })(page);
+    expect(result.description).toBe("A synopsis.");
+    const [call] = calls();
+    expect(call.args[call.args.indexOf("--model") + 1]).toBe("gpt-6-luna");
+    expect(call.args).toContain('model_reasoning_effort="low"');
+    expect(call.cwd).not.toBe(process.cwd());
   });
 });
 
